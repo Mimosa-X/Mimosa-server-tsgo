@@ -87,11 +87,24 @@ func (r *Router) onUsersGetFullUser(ctx context.Context, id tg.InputUserClass) (
 	if _, ok := id.(*tg.InputUserSelf); ok {
 		user = r.tgSelfUser(u)
 	}
+	about := u.About
+	if r.deps.Privacy != nil && u.ID != currentUserID {
+		allowed, err := r.deps.Privacy.CanSee(ctx, u.ID, currentUserID, domain.PrivacyKeyAbout)
+		if err != nil {
+			return nil, internalErr()
+		}
+		if !allowed {
+			about = ""
+		}
+	}
 	full := tg.UserFull{
 		ID:             u.ID,
-		About:          u.About,
+		About:          about,
 		Settings:       tg.PeerSettings{},
 		NotifySettings: *tdesktop.NotifySettings(),
+	}
+	if err := r.fillUserFullPhotos(ctx, currentUserID, u.ID, &full); err != nil {
+		return nil, err
 	}
 	if r.deps.Channels != nil && u.ID != currentUserID {
 		common, err := r.deps.Channels.CommonChannels(ctx, currentUserID, domain.CommonChannelsRequest{
@@ -135,6 +148,62 @@ func (r *Router) onUsersGetSavedMusicByID(ctx context.Context, req *tg.UsersGetS
 		Count:     0,
 		Documents: []tg.DocumentClass{},
 	}, nil
+}
+
+func (r *Router) fillUserFullPhotos(ctx context.Context, viewerUserID, ownerUserID int64, full *tg.UserFull) error {
+	if r.deps.Files == nil || full == nil || ownerUserID == 0 {
+		return nil
+	}
+	if viewerUserID == ownerUserID {
+		if photo, found, err := r.deps.Files.CurrentProfilePhotoKind(ctx, domain.PeerTypeUser, ownerUserID, domain.ProfilePhotoKindProfile); err != nil {
+			return internalErr()
+		} else if found {
+			full.SetProfilePhoto(tgPhoto(photo))
+		}
+		if photo, found, err := r.deps.Files.CurrentProfilePhotoKind(ctx, domain.PeerTypeUser, ownerUserID, domain.ProfilePhotoKindFallback); err != nil {
+			return internalErr()
+		} else if found {
+			full.SetFallbackPhoto(tgPhoto(photo))
+		}
+		return nil
+	}
+	if r.deps.Contacts != nil {
+		refs, err := r.deps.Contacts.PersonalPhotos(ctx, viewerUserID, []int64{ownerUserID})
+		if err != nil {
+			return internalErr()
+		}
+		if ref, ok := refs[ownerUserID]; ok && ref.PhotoID != 0 {
+			photo, found, err := r.deps.Files.GetPhoto(ctx, ref.PhotoID)
+			if err != nil {
+				return internalErr()
+			}
+			if found {
+				full.SetPersonalPhoto(tgPhoto(photo))
+			}
+		}
+	}
+	profileAllowed := true
+	if r.deps.Privacy != nil {
+		var err error
+		profileAllowed, err = r.deps.Privacy.CanSee(ctx, ownerUserID, viewerUserID, domain.PrivacyKeyProfilePhoto)
+		if err != nil {
+			return internalErr()
+		}
+	}
+	if profileAllowed {
+		if photo, found, err := r.deps.Files.CurrentProfilePhotoKind(ctx, domain.PeerTypeUser, ownerUserID, domain.ProfilePhotoKindProfile); err != nil {
+			return internalErr()
+		} else if found {
+			full.SetProfilePhoto(tgPhoto(photo))
+		}
+		return nil
+	}
+	if photo, found, err := r.deps.Files.CurrentProfilePhotoKind(ctx, domain.PeerTypeUser, ownerUserID, domain.ProfilePhotoKindFallback); err != nil {
+		return internalErr()
+	} else if found {
+		full.SetFallbackPhoto(tgPhoto(photo))
+	}
+	return nil
 }
 
 func emptyUserFull() *tg.UsersUserFull {

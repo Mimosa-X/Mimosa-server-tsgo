@@ -60,7 +60,8 @@ DDL 见 [`deploy/migrations/0001_init.up.sql`](../deploy/migrations/0001_init.up
 - **`update_states`** —— `auth_key_id + user_id` 维度的设备状态快照。账号级 pts 以 `user_update_events` 为权威，设备退出/换号只清当前 auth_key 状态，不删除账号事件。
 - **`user_update_events`** —— 按 `user_id` HASH 分区的账号级增量事件队列。承载 `new_message`、`read_history_inbox/read_history_outbox`（私聊与 channel peer）、`edit_message`、`read_message_contents`、`delete_messages`、`contacts_reset`、dialog 置顶/顺序/manual unread/peer settings、dialog filter/order/reload、folder peers、channel 本地清空后的 `channel_available_messages`、当前账号 forum 展示模式 `channel_view_forum_as_messages` 与 allocator gap 的 `noop`，供 `updates.getDifference` 和 outbox worker 补偿错过的推送；设置类事件通过 `UpdateEventStore.AppendWithDispatch` 与 `dispatch_outbox` 同事务写入，并持久化 `event_peers` / `peer_settings` / `message_ids` / `dialog_filter` / `filter_order` / `folder_peers` 负载，避免状态只存在在线 push 中。account difference 中的 `updateChannelTooLong` channel nudge 是按 channel events + request date 计算出来的提示，不写入本表、不消耗账号 pts。
 - **`contacts`** —— 当前账号通讯录关系与 owner 视角联系人资料。`contact_phone/contact_first_name/contact_last_name/note/note_entities` 均只属于 `(user_id, contact_user_id)`，同一个全局 user 在不同 owner 的通讯录中可以有不同姓名、电话和备注；`mutual` 由双方是否互存维护，删除一方联系人会清理对方 reverse mutual。
-- **`contact_blocks`** —— 当前账号 blocklist，按 `owner_user_id` HASH 分区；`(owner_user_id, blocked_user_id)` 唯一，按 `date DESC, blocked_user_id DESC` 返回 `contacts.getBlocked`。当前 full privacy keys 未接入，私聊 send/edit/delete 的拒绝来源仅为这张表。
+- **`contact_blocks`** —— 当前账号 blocklist，按 `owner_user_id` HASH 分区；`(owner_user_id, blocked_user_id)` 唯一，按 `date DESC, blocked_user_id DESC` 返回 `contacts.getBlocked`。私聊 send/edit/delete 的拒绝来源仍是这张表；完整 account privacy keys 已由 `account_privacy_rules` 承载，用于资料投影与手机号分享例外。
+- **`account_privacy_rules`** —— 当前账号 privacy key 规则，`(owner_user_id, privacy_key)` 唯一，`rules` 为 domain PrivacyRule JSONB。无记录时由 app/privacy 计算默认规则：PhoneNumber=DisallowAll、Birthday=AllowContacts、其它=AllowAll；Premium/Bot/Stars/SavedMusic 等产品只保存/返回规则，不扩展商业模型。
 - **`private_messages`** —— 共享私聊消息主体，按 `sender_user_id` HASH 分区；`sender_user_id + random_id` 唯一保证 `messages.sendMessage/forwardMessages` 幂等；文本编辑更新共享 body/entities/edit_date；silent/noforwards/reply_to/fwd_from 元数据随消息持久化。
 - **`message_boxes`** —— owner 视角消息盒，按 `owner_user_id` HASH 分区；每个账号看到自己的 `box_id`、peer、outgoing、pts、edit_date、`media_unread/reaction_unread` 与删除状态，历史/搜索走该表索引。删除只软删 owner 视角 message_box，`revoke` 通过 `(message_sender_id, private_message_id)` 定位其它 owner 视角并软删；编辑会同步所有可见 owner 视角盒子。`messages.readMessageContents` 只锁定当前 owner exact ids 且仅清理 unread 状态为 true 的行，有变化才写 `read_message_contents` durable event。该反向定位与分区键不一致，规划会展开全部 owner 分区，后续应增加 unpartitioned box 映射或先推导 owner_user_id 后再按 owner 分区点查。
 - **`dialogs`** —— 当前账号会话摘要，按 `user_id` HASH 分区；只允许 `user` peer，支持 top message、置顶过滤、folder_id=0/1 主列表/归档与 offset 分页，并保存当前 owner 的 `pinned_order`、manual `unread_mark` 与 `hidden_peer_settings_bar`。列表查询 join `contacts` 时优先返回当前 owner 保存的联系人姓名/电话，避免不同账号看同一 peer 串备注；相关状态变化会写入账号级 durable update log，离线设备可通过 `updates.getDifference` 恢复。
@@ -146,7 +147,7 @@ internal/store/
 - **P4.3 删除消息/清空历史**：`messages.deleteMessages/deleteHistory` 已支持 owner 视角软删除、`revoke` 对端清理、dialog top 重算/删除/`just_clear` 保留空 dialog、`updateDeleteMessages` durable payload（`message_ids` + `pts_count=len(message_ids)`）与 outbox 投递；后续新消息会正常重建被删除的 dialog。—— ✅
 - **P4.4 Dialog 分组/归档**：`messages.getDialogFilters/updateDialogFilter/updateDialogFiltersOrder/toggleDialogFilterTags` 与 `folders.editPeerFolders` 已接入 PG-backed 服务；集成测试覆盖 folder_id 0/1 主列表/归档、自定义 filter、tags 和归档还原。—— ✅
 - **P4.5 TDesktop 搜索入口**：`contacts.search` 已支持联系人/非联系人用户搜索，`contacts.getSponsoredPeers` 返回空 sponsored peers，`messages.searchGlobal` 接当前 owner 私聊文本搜索；查询保护与索引设计参考实现，避免客户端搜索框卡在 Loading。—— ✅
-- **P4.6 内容已读与 blocklist privacy gate**：`message_boxes.media_unread/reaction_unread`、`user_update_events(read_message_contents)`、`contact_blocks` 已落地；`messages.readMessageContents` 只在实际清理 unread 内容状态时分配 pts 并 durable 推送，被 block 后私聊 send 只写 sender outbox，edit/revoke delete 会返回 forbidden。—— ✅
+- **P4.6 内容已读、blocklist gate 与 account privacy**：`message_boxes.media_unread/reaction_unread`、`user_update_events(read_message_contents)`、`contact_blocks`、`account_privacy_rules` 已落地；`messages.readMessageContents` 只在实际清理 unread 内容状态时分配 pts 并 durable 推送，被 block 后私聊 send 只写 sender outbox，edit/revoke delete 会返回 forbidden；account privacy 用于用户资料/头像/手机号分享投影。—— ✅
 
 ## 7. 与铁律的关系
 
@@ -164,9 +165,10 @@ internal/store/
 - `documents.id` 持久化为 telesrv-owned 正数 id；外部导出资源的 source id 只在 seed 扫描文件名/JSON 时使用，进入 `documents` / `file_blobs` / `sticker_sets` / `available_reactions` 前已归一为服务端 id。RPC、`InputDocument` 与 `inputDocumentFileLocation` 均直接使用该 id。
 - `sticker_sets`：贴纸 / 自定义 emoji 集（含有序 `document_ids`、`packs`、`system_key` 路由系统集）。
 - `available_reactions`：reaction 目录（引用真实文档 id）。
-- `profile_photos`（owner_peer_type+id+photo_id）：用户/频道头像历史，current=active 中 sort_order 最大者。
+- `profile_photos`（owner_peer_type+id+kind+photo_id）：用户/频道头像历史，`kind=profile|fallback`，current=active 中 sort_order 最大者；`photos.getUserPhotos/deletePhotos` 只操作 profile kind。
+- `contacts.personal_photo_id/personal_photo_date`：viewer 对某个 contact 的私有头像引用；`userprojection` 优先于 profile/fallback 使用，并输出 `userProfilePhoto.personal=true`。
 - 消息表（`private_messages`/`message_boxes`/`channel_messages`）新增 `media` JSONB 快照列；放宽 body 非空 CHECK 为「body 非空 OR media 非空（OR channel action）」，支持「仅媒体」消息。
-- 头像反范式：`users.photo_*`（migration 0057 用户表无需改，富化在 users 服务）与 `channels.photo_*`（migration `0059`）。
+- 头像投影：用户头像当前值从 `contacts.personal_photo_id` 与 `profile_photos(kind=profile|fallback)` 批量查询，在 app 层 `userprojection` 按 viewer privacy 富化到 `domain.User.PhotoID/PhotoDCID/PhotoStripped/PhotoPersonal`；channel 头像仍反范式在 `channels.photo_*`（migration `0059`）。
 - `app_configs` 增 `reactions_default` 等（migration `0058`）。
 
 blob backend：`internal/app/files`（`BlobBackend` 接口 + `LocalFS` 本地磁盘实现，内容寻址 sha256 两级 fanout 去重，默认 `data/blobs`）。`MediaStore`（PG）只管元数据 + `file_blobs` 索引；字节由 backend 按 `object_key` 读写。

@@ -13,6 +13,7 @@ import (
 func (r *Router) registerPhotos(d *tg.ServerDispatcher) {
 	d.OnPhotosUploadProfilePhoto(r.onPhotosUploadProfilePhoto)
 	d.OnPhotosUpdateProfilePhoto(r.onPhotosUpdateProfilePhoto)
+	d.OnPhotosUploadContactProfilePhoto(r.onPhotosUploadContactProfilePhoto)
 	d.OnPhotosGetUserPhotos(r.onPhotosGetUserPhotos)
 	d.OnPhotosDeletePhotos(r.onPhotosDeletePhotos)
 }
@@ -28,16 +29,23 @@ func (r *Router) onPhotosUploadProfilePhoto(ctx context.Context, req *tg.PhotosU
 	if !ok || userID == 0 {
 		return nil, photoInvalidErr()
 	}
+	if bot, hasBot := req.GetBot(); hasBot && bot != nil {
+		return nil, inputConstructorInvalidErr()
+	}
 	file, hasFile := req.GetFile()
 	if !hasFile {
-		// 仅 fallback / video / emoji markup 等本阶段不支持的头像变体。
+		// video / emoji markup 等头像变体本阶段不支持。
 		return nil, photoInvalidErr()
 	}
 	ref, ok := uploadedFileRef(userID, file)
 	if !ok {
 		return nil, fileReferenceInvalidErr()
 	}
-	photo, err := r.deps.Files.UploadProfilePhoto(ctx, domain.PeerTypeUser, userID, ref, int(r.clock.Now().Unix()))
+	kind := domain.ProfilePhotoKindProfile
+	if req.GetFallback() {
+		kind = domain.ProfilePhotoKindFallback
+	}
+	photo, err := r.deps.Files.UploadProfilePhotoKind(ctx, domain.PeerTypeUser, userID, kind, ref, int(r.clock.Now().Unix()))
 	if err != nil {
 		return nil, photoUploadErr(err)
 	}
@@ -55,9 +63,16 @@ func (r *Router) onPhotosUpdateProfilePhoto(ctx context.Context, req *tg.PhotosU
 	if !ok || userID == 0 {
 		return nil, photoInvalidErr()
 	}
+	if bot, hasBot := req.GetBot(); hasBot && bot != nil {
+		return nil, inputConstructorInvalidErr()
+	}
+	kind := domain.ProfilePhotoKindProfile
+	if req.GetFallback() {
+		kind = domain.ProfilePhotoKindFallback
+	}
 	switch in := req.ID.(type) {
 	case *tg.InputPhoto:
-		photo, found, err := r.deps.Files.SetCurrentProfilePhoto(ctx, domain.PeerTypeUser, userID, in.ID, int(r.clock.Now().Unix()))
+		photo, found, err := r.deps.Files.SetCurrentProfilePhotoKind(ctx, domain.PeerTypeUser, userID, kind, in.ID, int(r.clock.Now().Unix()))
 		if err != nil {
 			return nil, internalErr()
 		}
@@ -67,11 +82,58 @@ func (r *Router) onPhotosUpdateProfilePhoto(ctx context.Context, req *tg.PhotosU
 		return r.photosPhotoForSelf(ctx, userID, photo), nil
 	default:
 		// InputPhotoEmpty：移除当前头像（停用现有当前照片）。
-		if cur, found, err := r.deps.Files.CurrentProfilePhoto(ctx, domain.PeerTypeUser, userID); err == nil && found {
-			_, _ = r.deps.Files.DeleteProfilePhotos(ctx, domain.PeerTypeUser, userID, []int64{cur.ID})
+		if cur, found, err := r.deps.Files.CurrentProfilePhotoKind(ctx, domain.PeerTypeUser, userID, kind); err == nil && found {
+			_, _ = r.deps.Files.DeleteProfilePhotosKind(ctx, domain.PeerTypeUser, userID, kind, []int64{cur.ID})
 		}
 		return r.photosPhotoForSelf(ctx, userID, domain.Photo{}), nil
 	}
+}
+
+func (r *Router) onPhotosUploadContactProfilePhoto(ctx context.Context, req *tg.PhotosUploadContactProfilePhotoRequest) (*tg.PhotosPhoto, error) {
+	if r.deps.Files == nil || r.deps.Contacts == nil {
+		return nil, notImplementedErr()
+	}
+	userID, ok, err := r.currentUserID(ctx)
+	if err != nil {
+		return nil, internalErr()
+	}
+	if !ok || userID == 0 {
+		return nil, photoInvalidErr()
+	}
+	target, found, err := r.userFromInput(ctx, userID, req.UserID)
+	if err != nil {
+		return nil, internalErr()
+	}
+	if !found || target.ID == 0 || target.ID == userID {
+		return nil, userIDInvalidErr()
+	}
+	file, hasFile := req.GetFile()
+	if !hasFile {
+		if req.GetSave() {
+			if _, err := r.deps.Contacts.ClearPersonalPhoto(ctx, userID, target.ID, int(r.clock.Now().Unix())); err != nil {
+				return nil, contactErr(err)
+			}
+			return r.photosPhotoForUser(ctx, userID, target.ID, domain.Photo{}), nil
+		}
+		return nil, photoInvalidErr()
+	}
+	ref, ok := uploadedFileRef(userID, file)
+	if !ok {
+		return nil, fileReferenceInvalidErr()
+	}
+	photo, err := r.deps.Files.CreateAvatarFromUpload(ctx, ref)
+	if err != nil {
+		return nil, photoUploadErr(err)
+	}
+	if req.GetSuggest() {
+		// TODO: add private MessageActionSuggestProfilePhoto once private service-message
+		// actions exist in the domain message model.
+		return r.photosPhotoForUser(ctx, userID, target.ID, photo), nil
+	}
+	if _, err := r.deps.Contacts.SetPersonalPhoto(ctx, userID, target.ID, photo, int(r.clock.Now().Unix())); err != nil {
+		return nil, contactErr(err)
+	}
+	return r.photosPhotoForUser(ctx, userID, target.ID, photo), nil
 }
 
 func (r *Router) onPhotosGetUserPhotos(ctx context.Context, req *tg.PhotosGetUserPhotosRequest) (tg.PhotosPhotosClass, error) {
@@ -155,6 +217,19 @@ func (r *Router) photosPhotoForSelf(ctx context.Context, userID int64, photo dom
 	}
 	out.Users = append(out.Users, r.tgSelfUser(self))
 	r.pushSelfPhotoUpdate(ctx, self)
+	return out
+}
+
+func (r *Router) photosPhotoForUser(ctx context.Context, viewerUserID, targetUserID int64, photo domain.Photo) *tg.PhotosPhoto {
+	out := &tg.PhotosPhoto{Photo: tgPhoto(photo), Users: []tg.UserClass{}}
+	if r.deps.Users == nil {
+		return out
+	}
+	user, found, err := r.deps.Users.ByID(ctx, viewerUserID, targetUserID)
+	if err != nil || !found {
+		return out
+	}
+	out.Users = append(out.Users, r.tgUser(user))
 	return out
 }
 

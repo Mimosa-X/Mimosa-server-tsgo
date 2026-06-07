@@ -112,7 +112,7 @@ func tgUserProfilePhoto(u domain.User) tg.UserProfilePhotoClass {
 	if u.PhotoID == 0 {
 		return nil
 	}
-	photo := &tg.UserProfilePhoto{PhotoID: u.PhotoID, DCID: u.PhotoDCID}
+	photo := &tg.UserProfilePhoto{PhotoID: u.PhotoID, DCID: u.PhotoDCID, Personal: u.PhotoPersonal}
 	if len(u.PhotoStripped) > 0 {
 		photo.SetStrippedThumb(u.PhotoStripped)
 	}

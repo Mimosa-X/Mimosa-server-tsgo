@@ -96,6 +96,10 @@ func pollAnswerInvalidErr() error { return tgerr.New(400, "POLL_ANSWER_INVALID")
 
 func reactionInvalidErr() error { return tgerr.New(400, "REACTION_INVALID") }
 
+func privacyKeyInvalidErr() error { return tgerr.New(400, "PRIVACY_KEY_INVALID") }
+
+func privacyValueInvalidErr() error { return tgerr.New(400, "PRIVACY_VALUE_INVALID") }
+
 func todoItemsEmptyErr() error { return tgerr.New(400, "TODO_ITEMS_EMPTY") }
 
 func todoNotModifiedErr() error { return tgerr.New(400, "TODO_NOT_MODIFIED") }

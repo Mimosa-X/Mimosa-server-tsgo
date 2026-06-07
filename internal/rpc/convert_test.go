@@ -29,3 +29,35 @@ func TestTGMessagesMessagesMarksViewerSelfAndKeepsProjectedPhone(t *testing.T) {
 		t.Fatalf("peer user = %+v ok=%v, want projected non-self without phone", full.Users[1], ok)
 	}
 }
+
+func TestTGMessagesDialogsIncludesUserProfilePhoto(t *testing.T) {
+	const viewerID int64 = 1001
+	const peerID int64 = 1002
+	res := tgMessagesDialogs(viewerID, domain.DialogList{
+		Dialogs: []domain.Dialog{{
+			Peer:           domain.Peer{Type: domain.PeerTypeUser, ID: peerID},
+			TopMessage:     1,
+			TopMessageDate: 10,
+		}},
+		Users: []domain.User{{
+			ID:            peerID,
+			AccessHash:    22,
+			FirstName:     "Alice A",
+			PhotoID:       9301,
+			PhotoDCID:     2,
+			PhotoStripped: []byte{9, 10},
+		}},
+	})
+	full, ok := res.(*tg.MessagesDialogs)
+	if !ok {
+		t.Fatalf("result = %T, want *tg.MessagesDialogs", res)
+	}
+	peer, ok := full.Users[0].(*tg.User)
+	if !ok {
+		t.Fatalf("user = %T, want *tg.User", full.Users[0])
+	}
+	photo, ok := peer.Photo.(*tg.UserProfilePhoto)
+	if !ok || photo.PhotoID != 9301 || photo.DCID != 2 || string(photo.StrippedThumb) != string([]byte{9, 10}) {
+		t.Fatalf("photo = %+v ok=%v, want userProfilePhoto 9301/2/[9 10]", peer.Photo, ok)
+	}
+}

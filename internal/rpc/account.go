@@ -35,9 +35,8 @@ func (r *Router) registerAccount(d *tg.ServerDispatcher) {
 	d.OnAccountUpdateNotifySettings(func(ctx context.Context, req *tg.AccountUpdateNotifySettingsRequest) (bool, error) {
 		return true, nil
 	})
-	d.OnAccountGetPrivacy(func(ctx context.Context, key tg.InputPrivacyKeyClass) (*tg.AccountPrivacyRules, error) {
-		return tdesktop.PrivacyRules(key), nil
-	})
+	d.OnAccountGetPrivacy(r.onAccountGetPrivacy)
+	d.OnAccountSetPrivacy(r.onAccountSetPrivacy)
 	d.OnAccountGetAuthorizations(func(ctx context.Context) (*tg.AccountAuthorizations, error) {
 		return tdesktop.Authorizations(), nil
 	})
@@ -80,6 +79,60 @@ func (r *Router) registerAccount(d *tg.ServerDispatcher) {
 	d.OnAccountUpdateStatus(r.onAccountUpdateStatus)
 }
 
+func (r *Router) onAccountGetPrivacy(ctx context.Context, key tg.InputPrivacyKeyClass) (*tg.AccountPrivacyRules, error) {
+	userID, _, err := r.currentUserID(ctx)
+	if err != nil {
+		return nil, internalErr()
+	}
+	domainKey, ok := domainPrivacyKeyFromInput(key)
+	if !ok {
+		return nil, privacyKeyInvalidErr()
+	}
+	if r.deps.Privacy == nil {
+		return tdesktop.PrivacyRules(key), nil
+	}
+	rules, err := r.deps.Privacy.GetRules(ctx, userID, domainKey)
+	if err != nil {
+		return nil, privacyErr(err)
+	}
+	return r.tgAccountPrivacyRules(ctx, userID, rules)
+}
+
+func (r *Router) onAccountSetPrivacy(ctx context.Context, req *tg.AccountSetPrivacyRequest) (*tg.AccountPrivacyRules, error) {
+	userID, _, err := r.currentUserID(ctx)
+	if err != nil {
+		return nil, internalErr()
+	}
+	domainKey, ok := domainPrivacyKeyFromInput(req.Key)
+	if !ok {
+		return nil, privacyKeyInvalidErr()
+	}
+	rules, err := r.domainPrivacyRulesFromInput(ctx, userID, req.Rules)
+	if err != nil {
+		return nil, err
+	}
+	if r.deps.Privacy == nil {
+		return &tg.AccountPrivacyRules{Rules: tgPrivacyRules(rules), Users: []tg.UserClass{}, Chats: []tg.ChatClass{}}, nil
+	}
+	saved, err := r.deps.Privacy.SetRules(ctx, userID, domainKey, rules)
+	if err != nil {
+		return nil, privacyErr(err)
+	}
+	out, err := r.tgAccountPrivacyRules(ctx, userID, saved)
+	if err != nil {
+		return nil, err
+	}
+	r.pushUserUpdates(ctx, userID, &tg.Updates{
+		Updates: []tg.UpdateClass{&tg.UpdatePrivacy{
+			Key:   tgPrivacyKey(saved.Key),
+			Rules: tgPrivacyRules(saved.Rules),
+		}},
+		Users: []tg.UserClass{},
+		Chats: []tg.ChatClass{},
+	})
+	return out, nil
+}
+
 func (r *Router) onAccountGetAccountTTL(ctx context.Context) (*tg.AccountDaysTTL, error) {
 	if _, _, err := r.currentUserID(ctx); err != nil {
 		return nil, internalErr()
@@ -98,6 +151,218 @@ func (r *Router) onAccountUpdateStatus(ctx context.Context, offline bool) (bool,
 	status := r.setPresenceFromContext(ctx, userID, offline)
 	r.pushUserStatus(ctx, userID, status)
 	return true, nil
+}
+
+func (r *Router) tgAccountPrivacyRules(ctx context.Context, viewerUserID int64, rules domain.PrivacyRules) (*tg.AccountPrivacyRules, error) {
+	userIDs := privacyRuleUserIDs(rules.Rules)
+	users := []domain.User{}
+	if r.deps.Users != nil && len(userIDs) > 0 {
+		var err error
+		users, err = r.deps.Users.ByIDs(ctx, viewerUserID, userIDs)
+		if err != nil {
+			return nil, internalErr()
+		}
+	}
+	return &tg.AccountPrivacyRules{
+		Rules: tgPrivacyRules(rules.Rules),
+		Users: tgUsers(users),
+		Chats: []tg.ChatClass{},
+	}, nil
+}
+
+func (r *Router) domainPrivacyRulesFromInput(ctx context.Context, userID int64, in []tg.InputPrivacyRuleClass) ([]domain.PrivacyRule, error) {
+	out := make([]domain.PrivacyRule, 0, len(in))
+	for _, rule := range in {
+		switch v := rule.(type) {
+		case *tg.InputPrivacyValueAllowContacts:
+			out = append(out, domain.PrivacyRule{Kind: domain.PrivacyRuleAllowContacts})
+		case *tg.InputPrivacyValueAllowAll:
+			out = append(out, domain.PrivacyRule{Kind: domain.PrivacyRuleAllowAll})
+		case *tg.InputPrivacyValueAllowUsers:
+			ids, err := r.privacyUserIDsFromInput(ctx, userID, v.Users)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, domain.PrivacyRule{Kind: domain.PrivacyRuleAllowUsers, UserIDs: ids})
+		case *tg.InputPrivacyValueDisallowContacts:
+			out = append(out, domain.PrivacyRule{Kind: domain.PrivacyRuleDisallowContacts})
+		case *tg.InputPrivacyValueDisallowAll:
+			out = append(out, domain.PrivacyRule{Kind: domain.PrivacyRuleDisallowAll})
+		case *tg.InputPrivacyValueDisallowUsers:
+			ids, err := r.privacyUserIDsFromInput(ctx, userID, v.Users)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, domain.PrivacyRule{Kind: domain.PrivacyRuleDisallowUsers, UserIDs: ids})
+		case *tg.InputPrivacyValueAllowChatParticipants:
+			out = append(out, domain.PrivacyRule{Kind: domain.PrivacyRuleAllowChatParticipants, ChatIDs: append([]int64(nil), v.Chats...)})
+		case *tg.InputPrivacyValueDisallowChatParticipants:
+			out = append(out, domain.PrivacyRule{Kind: domain.PrivacyRuleDisallowChatParticipants, ChatIDs: append([]int64(nil), v.Chats...)})
+		case *tg.InputPrivacyValueAllowCloseFriends:
+			out = append(out, domain.PrivacyRule{Kind: domain.PrivacyRuleAllowCloseFriends})
+		case *tg.InputPrivacyValueAllowPremium:
+			out = append(out, domain.PrivacyRule{Kind: domain.PrivacyRuleAllowPremium})
+		case *tg.InputPrivacyValueAllowBots:
+			out = append(out, domain.PrivacyRule{Kind: domain.PrivacyRuleAllowBots})
+		case *tg.InputPrivacyValueDisallowBots:
+			out = append(out, domain.PrivacyRule{Kind: domain.PrivacyRuleDisallowBots})
+		default:
+			return nil, privacyValueInvalidErr()
+		}
+	}
+	return out, nil
+}
+
+func (r *Router) privacyUserIDsFromInput(ctx context.Context, currentUserID int64, inputs []tg.InputUserClass) ([]int64, error) {
+	out := make([]int64, 0, len(inputs))
+	seen := make(map[int64]struct{}, len(inputs))
+	for _, input := range inputs {
+		u, found, err := r.userFromInput(ctx, currentUserID, input)
+		if err != nil {
+			return nil, internalErr()
+		}
+		if !found || u.ID == 0 {
+			return nil, userIDInvalidErr()
+		}
+		if _, ok := seen[u.ID]; ok {
+			continue
+		}
+		seen[u.ID] = struct{}{}
+		out = append(out, u.ID)
+	}
+	return out, nil
+}
+
+func domainPrivacyKeyFromInput(key tg.InputPrivacyKeyClass) (domain.PrivacyKey, bool) {
+	switch key.(type) {
+	case *tg.InputPrivacyKeyStatusTimestamp:
+		return domain.PrivacyKeyStatusTimestamp, true
+	case *tg.InputPrivacyKeyChatInvite:
+		return domain.PrivacyKeyChatInvite, true
+	case *tg.InputPrivacyKeyPhoneCall:
+		return domain.PrivacyKeyPhoneCall, true
+	case *tg.InputPrivacyKeyPhoneP2P:
+		return domain.PrivacyKeyPhoneP2P, true
+	case *tg.InputPrivacyKeyForwards:
+		return domain.PrivacyKeyForwards, true
+	case *tg.InputPrivacyKeyProfilePhoto:
+		return domain.PrivacyKeyProfilePhoto, true
+	case *tg.InputPrivacyKeyPhoneNumber:
+		return domain.PrivacyKeyPhoneNumber, true
+	case *tg.InputPrivacyKeyAddedByPhone:
+		return domain.PrivacyKeyAddedByPhone, true
+	case *tg.InputPrivacyKeyVoiceMessages:
+		return domain.PrivacyKeyVoiceMessages, true
+	case *tg.InputPrivacyKeyAbout:
+		return domain.PrivacyKeyAbout, true
+	case *tg.InputPrivacyKeyBirthday:
+		return domain.PrivacyKeyBirthday, true
+	case *tg.InputPrivacyKeyStarGiftsAutoSave:
+		return domain.PrivacyKeyStarGiftsAutoSave, true
+	case *tg.InputPrivacyKeyNoPaidMessages:
+		return domain.PrivacyKeyNoPaidMessages, true
+	case *tg.InputPrivacyKeySavedMusic:
+		return domain.PrivacyKeySavedMusic, true
+	default:
+		return "", false
+	}
+}
+
+func tgPrivacyKey(key domain.PrivacyKey) tg.PrivacyKeyClass {
+	switch key {
+	case domain.PrivacyKeyStatusTimestamp:
+		return &tg.PrivacyKeyStatusTimestamp{}
+	case domain.PrivacyKeyChatInvite:
+		return &tg.PrivacyKeyChatInvite{}
+	case domain.PrivacyKeyPhoneCall:
+		return &tg.PrivacyKeyPhoneCall{}
+	case domain.PrivacyKeyPhoneP2P:
+		return &tg.PrivacyKeyPhoneP2P{}
+	case domain.PrivacyKeyForwards:
+		return &tg.PrivacyKeyForwards{}
+	case domain.PrivacyKeyProfilePhoto:
+		return &tg.PrivacyKeyProfilePhoto{}
+	case domain.PrivacyKeyPhoneNumber:
+		return &tg.PrivacyKeyPhoneNumber{}
+	case domain.PrivacyKeyAddedByPhone:
+		return &tg.PrivacyKeyAddedByPhone{}
+	case domain.PrivacyKeyVoiceMessages:
+		return &tg.PrivacyKeyVoiceMessages{}
+	case domain.PrivacyKeyAbout:
+		return &tg.PrivacyKeyAbout{}
+	case domain.PrivacyKeyBirthday:
+		return &tg.PrivacyKeyBirthday{}
+	case domain.PrivacyKeyStarGiftsAutoSave:
+		return &tg.PrivacyKeyStarGiftsAutoSave{}
+	case domain.PrivacyKeyNoPaidMessages:
+		return &tg.PrivacyKeyNoPaidMessages{}
+	case domain.PrivacyKeySavedMusic:
+		return &tg.PrivacyKeySavedMusic{}
+	default:
+		return &tg.PrivacyKeyStatusTimestamp{}
+	}
+}
+
+func tgPrivacyRules(rules []domain.PrivacyRule) []tg.PrivacyRuleClass {
+	out := make([]tg.PrivacyRuleClass, 0, len(rules))
+	for _, rule := range rules {
+		switch rule.Kind {
+		case domain.PrivacyRuleAllowContacts:
+			out = append(out, &tg.PrivacyValueAllowContacts{})
+		case domain.PrivacyRuleAllowAll:
+			out = append(out, &tg.PrivacyValueAllowAll{})
+		case domain.PrivacyRuleAllowUsers:
+			out = append(out, &tg.PrivacyValueAllowUsers{Users: append([]int64(nil), rule.UserIDs...)})
+		case domain.PrivacyRuleDisallowContacts:
+			out = append(out, &tg.PrivacyValueDisallowContacts{})
+		case domain.PrivacyRuleDisallowAll:
+			out = append(out, &tg.PrivacyValueDisallowAll{})
+		case domain.PrivacyRuleDisallowUsers:
+			out = append(out, &tg.PrivacyValueDisallowUsers{Users: append([]int64(nil), rule.UserIDs...)})
+		case domain.PrivacyRuleAllowChatParticipants:
+			out = append(out, &tg.PrivacyValueAllowChatParticipants{Chats: append([]int64(nil), rule.ChatIDs...)})
+		case domain.PrivacyRuleDisallowChatParticipants:
+			out = append(out, &tg.PrivacyValueDisallowChatParticipants{Chats: append([]int64(nil), rule.ChatIDs...)})
+		case domain.PrivacyRuleAllowCloseFriends:
+			out = append(out, &tg.PrivacyValueAllowCloseFriends{})
+		case domain.PrivacyRuleAllowPremium:
+			out = append(out, &tg.PrivacyValueAllowPremium{})
+		case domain.PrivacyRuleAllowBots:
+			out = append(out, &tg.PrivacyValueAllowBots{})
+		case domain.PrivacyRuleDisallowBots:
+			out = append(out, &tg.PrivacyValueDisallowBots{})
+		}
+	}
+	return out
+}
+
+func privacyRuleUserIDs(rules []domain.PrivacyRule) []int64 {
+	seen := map[int64]struct{}{}
+	out := make([]int64, 0)
+	for _, rule := range rules {
+		for _, id := range rule.UserIDs {
+			if id == 0 {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func privacyErr(err error) error {
+	switch {
+	case errors.Is(err, domain.ErrPrivacyKeyInvalid):
+		return privacyKeyInvalidErr()
+	case errors.Is(err, domain.ErrPrivacyRuleInvalid):
+		return privacyValueInvalidErr()
+	default:
+		return internalErr()
+	}
 }
 
 type accountReactionSettingsService interface {
