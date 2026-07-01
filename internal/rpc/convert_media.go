@@ -578,6 +578,8 @@ func tgStickerSet(set domain.StickerSet) tg.StickerSet {
 		Official:   set.Official,
 		Masks:      set.Masks,
 		Emojis:     set.Emojis,
+		TextColor:  set.TextColor,
+		Creator:    set.Creator,
 		ID:         set.ID,
 		AccessHash: set.AccessHash,
 		Title:      set.Title,
@@ -633,12 +635,23 @@ func tgStickerPacks(packs []domain.StickerPack) []tg.StickerPack {
 	return out
 }
 
+func tgStickerKeywords(keywords []domain.StickerKeyword) []tg.StickerKeyword {
+	out := make([]tg.StickerKeyword, 0, len(keywords))
+	for _, kw := range keywords {
+		if kw.DocumentID == 0 || len(kw.Keywords) == 0 {
+			continue
+		}
+		out = append(out, tg.StickerKeyword{DocumentID: kw.DocumentID, Keyword: append([]string(nil), kw.Keywords...)})
+	}
+	return out
+}
+
 // tgMessagesStickerSet 构造完整 messages.stickerSet（set + packs + documents）。
 func tgMessagesStickerSet(set domain.StickerSet, docs []domain.Document) *tg.MessagesStickerSet {
 	return &tg.MessagesStickerSet{
 		Set:       tgStickerSet(set),
 		Packs:     tgStickerPacks(set.Packs),
-		Keywords:  []tg.StickerKeyword{},
+		Keywords:  tgStickerKeywords(set.Keywords),
 		Documents: tgDocuments(docs),
 	}
 }

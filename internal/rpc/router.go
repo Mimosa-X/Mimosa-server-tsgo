@@ -169,6 +169,7 @@ func New(cfg Config, deps Deps, log *zap.Logger, clk clock.Clock) *Router {
 	r.registerUpdates(d)
 	r.registerAccount(d)
 	r.registerMessages(d)
+	r.registerStickers(d)
 	r.registerChannels(d)
 	r.registerUpload(d)
 	r.registerPhotos(d)

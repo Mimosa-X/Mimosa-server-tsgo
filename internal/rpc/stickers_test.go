@@ -26,6 +26,21 @@ func TestStickerSetsCatalogHashMatchesTDesktopFormula(t *testing.T) {
 	}
 }
 
+func TestFeaturedStickerSetsHashMatchesTDesktopFormula(t *testing.T) {
+	sets := []domain.StickerSet{
+		{ID: 10, Hash: 123},
+		{ID: 11, Hash: 456},
+	}
+	got := featuredStickerSetsHash(sets)
+	const want int64 = 365072220181
+	if got != want {
+		t.Fatalf("featuredStickerSetsHash() = %d, want %d", got, want)
+	}
+	if catalog := stickerSetsCatalogHash(sets); catalog == got {
+		t.Fatalf("test fixture no longer distinguishes featured hash from catalog hash: %d", got)
+	}
+}
+
 func TestMessagesGetAllStickersUsesTDesktopHashForNotModified(t *testing.T) {
 	ctx := context.Background()
 	files := &fakeFiles{
