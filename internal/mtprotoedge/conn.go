@@ -25,13 +25,31 @@ type outboundWriter interface {
 	Send(context.Context, *bin.Buffer) error
 }
 
+type connLifecycle uint32
+
+const (
+	// The zero value is deliberately provisional so test/embedded Conn values start
+	// outside every SessionManager index until they complete activation.
+	connLifecycleProvisional connLifecycle = iota
+	connLifecycleClaiming
+	connLifecycleActive
+	// retired is terminal and irreversible. A physical connection that lost an
+	// activation claim must never become visible again, even if its read goroutine
+	// was already between preflight and publish when a replacement arrived.
+	connLifecycleRetired
+)
+
 type Conn struct {
-	transport    transport.Conn
-	writer       outboundWriter
-	cipher       crypto.Cipher
-	msgID        *proto.MessageIDGen
-	writeTimeout time.Duration
-	metrics      Metrics
+	transport transport.Conn
+	// transportLease owns exactly one generation of the physical transport.
+	// It is nil only for directly constructed test/embedded Conns that retain
+	// the legacy raw-transport close fallback.
+	transportLease *physicalTransportLease
+	writer         outboundWriter
+	cipher         crypto.Cipher
+	msgID          *proto.MessageIDGen
+	writeTimeout   time.Duration
+	metrics        Metrics
 
 	authKeyID [8]byte
 	// authKeyHex 是 authKeyID 的 hex 缓存：每条 RPC 的结构化日志都会带它，
@@ -46,27 +64,54 @@ type Conn struct {
 	outboundStop    chan struct{}
 	outboundDone    chan struct{}
 	outboundClose   sync.Once
+	// outboundEnqueueMu orders producer registration against terminal close. Close
+	// flips closing under this lock before waiting, so no WaitGroup Add can race Wait.
+	outboundEnqueueMu sync.Mutex
+	outboundEnqueueWG sync.WaitGroup
+	outboundClosing   bool
+	// Queue backing is intentionally small and bounded per Conn; control has a separate queue
+	// and strict actor priority. Server-created connections share outboundTrackedBudget.
+	outboundQueueSize        int
+	outboundControlQueueSize int
+	outboundTrackedBudget    *outboundTrackedBudget
+	outboundBudgetOnce       sync.Once
+	// Encoded MTProto service frames and control vectors use independent headroom: pong,
+	// new_session_created, bad_msg and msgs_ack must remain admissible when the body budget is
+	// full. Content-related control frames keep this budget while pending for resend.
+	outboundControlTrackedBudget *outboundTrackedBudget
+	outboundControlBudgetOnce    sync.Once
+	outboundScratchPool          *outboundScratchPool
+	outboundScratchOnce          sync.Once
+	// lifecycle is the sole monotonic activation/retirement state machine.
+	// retired never transitions back to claiming/active; one atomic state avoids
+	// contradictory activation and shutdown observations.
+	lifecycle      atomic.Uint32
+	transportClose sync.Once
 
-	rpcQueue   chan inboundRPC
-	rpcStop    chan struct{}
-	rpcCancel  context.CancelFunc
-	rpcClose   sync.Once
-	rpcWG      sync.WaitGroup
-	rpcTimeout time.Duration
+	rpcScheduler *inboundRPCScheduler
+	rpcCancel    context.CancelFunc
+	rpcClose     sync.Once
+	rpcMu        sync.Mutex
+	rpcWG        sync.WaitGroup
+	// rpcReservationWG 跟踪 Copy 前预算到 commit/abort 的短窗口，使 Close 返回时
+	// 全局/单连接预算都已归还或转交给明确的 queued/running task。
+	rpcReservationWG sync.WaitGroup
+	rpcTimeout       time.Duration
+	rpcQueue         []inboundRPC
+	rpcQueueSize     int
+	rpcReserved      int
+	rpcRunning       int
+	rpcReady         bool
+	rpcClosed        bool
 	// inflightRPCBytes 跟踪已入队未完成的 inbound RPC body 总字节，配合 maxInflightRPCBytes
 	// 给 RPC 队列设字节预算（不止限条数），防对抗客户端发大请求撑内存。
 	inflightRPCBytes atomic.Int64
-	// RPC worker 懒启动：首个 RPC 入队时才起 worker（ensureInboundRPCWorkers），
-	// 避免握手后静默 / 纯推送目标连接白白钉住 rpcMaxInflight 个 goroutine。
+	// 单连接只保留并发配额；实际 worker 来自 Server 共享池，避免每连接预留 goroutine。
 	rpcRootCtx     context.Context
 	rpcMaxInflight int
-	rpcWorkersOnce sync.Once
 
 	// sentContentMessages 只由 outbound actor 访问，用于生成 MTProto seq_no。
 	sentContentMessages int32
-	// outboundPlain/outboundWire 只由 outbound actor 访问，用于复用出站加密缓冲。
-	outboundPlain bin.Buffer
-	outboundWire  bin.Buffer
 	// outboundRand 只由 outbound actor 访问：对 cipher 随机源的缓冲预读，
 	// 把每帧 padding 的 getrandom syscall 摊薄成 ~1KiB 一次。
 	outboundRand *bufio.Reader
@@ -90,18 +135,88 @@ type Conn struct {
 	membershipGen atomic.Int64
 	// createdAt 是连接建立时刻，供同 auth_key session 数触顶时驱逐真正最旧的连接。
 	createdAt time.Time
-	// keyDestroyed 标记本连接的 auth_key 已被 destroy_auth_key 删除。serveConn 对已建立
-	// 连接复用缓存密钥跳过每帧 AuthKeyStore 回查；置位后强制回落到 Get→AuthKeyNotFound，
-	// 维持「destroy_auth_key 发起连接下一帧自然失效」契约。只由 destroy_auth_key 处理器置位。
-	keyDestroyed atomic.Bool
-	// lastSessionSaveUnix 是上次把本连接 session 持久化到 SessionStore 的 unix 秒，用于把
-	// 每帧 Save 去抖到固定间隔——session 持久化是软状态（生产无热读路径，仅观测/未来用）。
-	// 只由单连接的读循环 goroutine 访问。
-	lastSessionSaveUnix atomic.Int64
 	// clientLayer 是本连接协商的 TL layer（invokeWithLayer/initConnection），由 handleRPC
 	// 在每次 Dispatch 后从 RPC 注册表刷新。出站(rpc_result/push)按此把 227 对象降级给老客户端；
 	// 0 表示尚未协商，按 canonical(227) 处理=不降级。
 	clientLayer atomic.Int32
+}
+
+func (c *Conn) lifecycleState() connLifecycle {
+	if c == nil {
+		return connLifecycleRetired
+	}
+	return connLifecycle(c.lifecycle.Load())
+}
+
+func (c *Conn) isRetired() bool {
+	return c == nil || c.lifecycleState() == connLifecycleRetired
+}
+
+// retire irreversibly fences the logical connection. The caller that wins the
+// transition may additionally own one-shot physical cleanup.
+func (c *Conn) retire() bool {
+	if c == nil {
+		return false
+	}
+	for {
+		state := c.lifecycle.Load()
+		if connLifecycle(state) == connLifecycleRetired {
+			return false
+		}
+		if c.lifecycle.CompareAndSwap(state, uint32(connLifecycleRetired)) {
+			return true
+		}
+	}
+}
+
+func (c *Conn) beginActivationClaim() bool {
+	if c == nil || !c.isPhysicalTransportCurrentOpen() {
+		return false
+	}
+	if !c.lifecycle.CompareAndSwap(uint32(connLifecycleProvisional), uint32(connLifecycleClaiming)) {
+		return false
+	}
+	// Physical close can win after the pre-check but before the lifecycle CAS.
+	// Do not let a doomed claimant enter SessionManager and retire a healthy old
+	// owner for the same logical session.
+	if c.lifecycleState() != connLifecycleClaiming || !c.isPhysicalTransportCurrentOpen() {
+		c.retire()
+		return false
+	}
+	return true
+}
+
+func (c *Conn) publishActivation() bool {
+	if c == nil || !c.isPhysicalTransportCurrentOpen() {
+		return false
+	}
+	if !c.lifecycle.CompareAndSwap(uint32(connLifecycleClaiming), uint32(connLifecycleActive)) {
+		return false
+	}
+	// A concurrent transport failure can retire the Conn between the first
+	// physical check and the CAS. Never let that intermediate active value escape.
+	if c.lifecycleState() != connLifecycleActive || !c.isPhysicalTransportCurrentOpen() {
+		c.retire()
+		return false
+	}
+	return true
+}
+
+func (c *Conn) isActive() bool {
+	return c != nil && c.lifecycleState() == connLifecycleActive && c.isPhysicalTransportCurrentOpen()
+}
+
+// transferTransportOwnership hands this Conn's physical socket to the next
+// logical generation. The caller must have fenced and drained the old writer.
+func (c *Conn) transferTransportOwnership() (*physicalTransportLease, bool) {
+	if c == nil || c.transportLease == nil {
+		return nil, false
+	}
+	return c.transportLease.Transfer()
+}
+
+func (c *Conn) isPhysicalTransportCurrentOpen() bool {
+	return c != nil && (c.transportLease == nil || c.transportLease.IsCurrentOpen())
 }
 
 // ClientLayer 返回连接协商的 TL layer；未协商时返回 canonical layer（227，不降级）。

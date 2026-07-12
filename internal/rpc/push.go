@@ -14,17 +14,9 @@ func (r *Router) pushUserMessage(ctx context.Context, userID int64, logMessage s
 	}
 	sessionID, _ := SessionIDFrom(ctx)
 	if timeout := r.cfg.OutboundPushTimeout; timeout > 0 {
-		authKeyID, _ := AuthKeyIDFrom(ctx)
-		if scoped, ok := r.deps.Sessions.(ScopedBestEffortSessionBinder); ok {
-			if sent, err := scoped.PushToUserExceptAuthKeySessionBestEffort(ctx, userID, authKeyID, sessionID, proto.MessageFromServer, msg, timeout); err != nil {
-				r.log.Debug(logMessage, zap.Int64("user_id", userID), zap.Int("sent", sent), zap.Duration("timeout", timeout), zap.Error(err))
-				return sent
-			} else {
-				return sent
-			}
-		}
+		authKeyID := rawAuthKeyIDForOrigin(ctx)
 		if bestEffort, ok := r.deps.Sessions.(BestEffortSessionBinder); ok {
-			if sent, err := bestEffort.PushToUserExceptSessionBestEffort(ctx, userID, sessionID, proto.MessageFromServer, msg, timeout); err != nil {
+			if sent, err := bestEffort.PushToUserExceptAuthKeySessionBestEffort(ctx, userID, authKeyID, sessionID, proto.MessageFromServer, msg, timeout); err != nil {
 				r.log.Debug(logMessage, zap.Int64("user_id", userID), zap.Int("sent", sent), zap.Duration("timeout", timeout), zap.Error(err))
 				return sent
 			} else {
@@ -32,16 +24,8 @@ func (r *Router) pushUserMessage(ctx context.Context, userID int64, logMessage s
 			}
 		}
 	}
-	if scoped, ok := r.scopedSessions(); ok {
-		authKeyID, _ := AuthKeyIDFrom(ctx)
-		if sent, err := scoped.PushToUserExceptAuthKeySession(ctx, userID, authKeyID, sessionID, proto.MessageFromServer, msg); err != nil {
-			r.log.Debug(logMessage, zap.Int64("user_id", userID), zap.Int("sent", sent), zap.Error(err))
-			return sent
-		} else {
-			return sent
-		}
-	}
-	if sent, err := r.deps.Sessions.PushToUserExceptSession(ctx, userID, sessionID, proto.MessageFromServer, msg); err != nil {
+	authKeyID := rawAuthKeyIDForOrigin(ctx)
+	if sent, err := r.deps.Sessions.PushToUserExceptAuthKeySession(ctx, userID, authKeyID, sessionID, proto.MessageFromServer, msg); err != nil {
 		r.log.Debug(logMessage, zap.Int64("user_id", userID), zap.Int("sent", sent), zap.Error(err))
 		return sent
 	} else {
@@ -58,7 +42,7 @@ func (r *Router) pushUserMessageTransient(ctx context.Context, userID int64, log
 	}
 	if transient, ok := r.deps.Sessions.(TransientSessionBinder); ok {
 		sessionID, _ := SessionIDFrom(ctx)
-		authKeyID, _ := AuthKeyIDFrom(ctx)
+		authKeyID := rawAuthKeyIDForOrigin(ctx)
 		sent, err := transient.PushToUserTransientExceptAuthKeySession(ctx, userID, authKeyID, sessionID, proto.MessageFromServer, msg, r.cfg.OutboundPushTimeout)
 		if err != nil {
 			r.log.Debug(logMessage, zap.Int64("user_id", userID), zap.Int("sent", sent), zap.Error(err))
@@ -76,17 +60,7 @@ func (r *Router) pushCurrentSessionMessage(ctx context.Context, logMessage strin
 	if !ok {
 		return
 	}
-	if scoped, ok := r.scopedSessions(); ok {
-		rawAuthKeyID, ok := RawAuthKeyIDFrom(ctx)
-		if !ok {
-			return
-		}
-		if err := scoped.PushToSessionForAuthKey(ctx, rawAuthKeyID, sessionID, proto.MessageFromServer, msg); err != nil {
-			r.log.Debug(logMessage, zap.Int64("session_id", sessionID), zap.Error(err))
-		}
-		return
-	}
-	if err := r.deps.Sessions.PushToSession(ctx, sessionID, proto.MessageFromServer, msg); err != nil {
+	if err := r.deps.Sessions.PushToSessionForAuthKey(ctx, rawAuthKeyIDForOrigin(ctx), sessionID, proto.MessageFromServer, msg); err != nil {
 		r.log.Debug(logMessage, zap.Int64("session_id", sessionID), zap.Error(err))
 	}
 }

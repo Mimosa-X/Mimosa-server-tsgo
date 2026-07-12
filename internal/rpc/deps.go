@@ -49,35 +49,26 @@ type AuthService interface {
 }
 
 // SessionBinder 抽象登录后 session 与 user 的在线绑定。
+//
+// MTProto session 的完整身份是 raw auth_key_id + session_id。所有定位单个 session
+// 的方法都必须携带这两个值；禁止退回只按 session_id 查询，否则不同 auth key 复用
+// 同一随机 session_id 时会产生跨账号绑定、排除或推送歧义。
 type SessionBinder interface {
-	BindAuthKey(sessionID int64, authKeyID [8]byte)
-	AuthKeyID(sessionID int64) ([8]byte, bool)
-	BindUser(sessionID, userID int64)
-	UserID(sessionID int64) (int64, bool)
-	UserIDResolved(sessionID int64) (userID int64, resolved bool)
-	UnbindAuthKey(authKeyID [8]byte) int
-	SetReceivesUpdates(sessionID int64, receives bool)
-	PushToSession(ctx context.Context, sessionID int64, t proto.MessageType, msg bin.Encoder) error
-	PushToUserExceptSession(ctx context.Context, userID, excludeSessionID int64, t proto.MessageType, msg bin.Encoder) (int, error)
-}
-
-// ScopedSessionBinder 是 SessionBinder 的精确版本：所有定位都带 raw auth_key_id + session_id。
-// 生产 mtprotoedge.SessionManager 实现它；测试替身和旧实现可以只实现 SessionBinder。
-type ScopedSessionBinder interface {
 	BindAuthKeyForSession(rawAuthKeyID [8]byte, sessionID int64, authKeyID [8]byte)
 	AuthKeyIDForSession(rawAuthKeyID [8]byte, sessionID int64) ([8]byte, bool)
 	BindUserForAuthKey(rawAuthKeyID [8]byte, sessionID, userID int64)
-	UserIDForAuthKey(rawAuthKeyID [8]byte, sessionID int64) (int64, bool)
 	UserIDResolvedForAuthKey(rawAuthKeyID [8]byte, sessionID int64) (userID int64, resolved bool)
+	UnbindAuthKey(authKeyID [8]byte) int
 	SetReceivesUpdatesForAuthKey(rawAuthKeyID [8]byte, sessionID int64, receives bool)
 	PushToSessionForAuthKey(ctx context.Context, rawAuthKeyID [8]byte, sessionID int64, t proto.MessageType, msg bin.Encoder) error
+	// excludeAuthKeyID/excludeSessionID 必须同时为零（不排除）或同时非零（精确排除）。
 	PushToUserExceptAuthKeySession(ctx context.Context, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64, t proto.MessageType, msg bin.Encoder) (int, error)
 }
 
-// ScopedImmediateSessionPusher 是可选的登录前信号直推能力。
+// ImmediateSessionPusher 是可选的登录前信号直推能力。
 // 它绕过登录后 updates-ready 队列，只能用于会解锁登录流程本身的握手消息，
 // 例如 updateLoginToken。
-type ScopedImmediateSessionPusher interface {
+type ImmediateSessionPusher interface {
 	PushToSessionForAuthKeyImmediate(ctx context.Context, rawAuthKeyID [8]byte, sessionID int64, t proto.MessageType, msg bin.Encoder) error
 }
 
@@ -109,13 +100,9 @@ type RawSessionTerminator interface {
 	CloseSessionsForRawAuthKeyExcept(authKeyID [8]byte, exceptSessionID int64) int
 }
 
-// BestEffortSessionBinder 是 updates fanout 的短超时推送接口；不用于 RPC result/ack。
+// BestEffortSessionBinder 是带 raw auth_key_id 精确排除当前设备的短超时推送接口；
+// 不用于 RPC result/ack。
 type BestEffortSessionBinder interface {
-	PushToUserExceptSessionBestEffort(ctx context.Context, userID, excludeSessionID int64, t proto.MessageType, msg bin.Encoder, timeout time.Duration) (int, error)
-}
-
-// ScopedBestEffortSessionBinder 是带 raw auth_key_id 精确排除当前设备的 best-effort 版本。
-type ScopedBestEffortSessionBinder interface {
 	PushToUserExceptAuthKeySessionBestEffort(ctx context.Context, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64, t proto.MessageType, msg bin.Encoder, timeout time.Duration) (int, error)
 }
 
@@ -156,6 +143,21 @@ type OnlineUserProvider interface {
 // （type-assert 失败时跳过 nudge，不影响完整 payload 投递）。
 type ChannelNudgeProvider interface {
 	OnlineChannelMemberUserIDsExcluding(channelID int64, exclude map[int64]struct{}, limit int) []int64
+}
+
+// ChannelFanoutRecoverySessionProvider snapshots the process-local online joined-channel index in
+// stable channel-id order. It is used only after every keyed fan-out mailbox is saturated. The
+// fixed recovery actor accepts the temporary 8*C id slice so one sweep never repeatedly scans the
+// SessionManager index or holds its global lock while sorting/database work runs.
+type ChannelFanoutRecoverySessionProvider interface {
+	OnlineChannelIDsSnapshot() []int64
+}
+
+// ChannelFanoutRecoveryPtsProvider reloads the authoritative channel pts after in-memory fan-out
+// saturation. Production channels.Service implements it through the channel store; keeping this
+// separate from ChannelsService avoids burdening lightweight RPC fakes that never run the worker.
+type ChannelFanoutRecoveryPtsProvider interface {
+	MaxChannelPtsBatch(ctx context.Context, channelIDs []int64) (map[int64]int, error)
 }
 
 // RateLimiter 抽象 RPC 高频写操作限流。
@@ -254,6 +256,8 @@ type UserPremiumStatusService interface {
 
 // AccountService 抽象账号设置查询。
 type AccountService interface {
+	SendChangePhoneCode(ctx context.Context, userID int64, authKeyID [8]byte, sessionID int64, phone string) (string, domain.AuthCodeDelivery, error)
+	ChangePhone(ctx context.Context, userID int64, authKeyID, originRawAuthKeyID [8]byte, sessionID int64, phone, phoneCodeHash, code string, date int) (domain.PhoneChangeResult, error)
 	GetPassword(ctx context.Context, userID int64) (domain.PasswordSettings, error)
 	GetPasswordSettings(ctx context.Context, userID int64, check domain.PasswordCheck) (domain.PrivatePasswordSettings, error)
 	UpdatePasswordSettings(ctx context.Context, userID int64, check domain.PasswordCheck, input domain.PasswordInputSettings) error
@@ -268,10 +272,9 @@ type AccountService interface {
 	SendLoginEmailCode(ctx context.Context, userID int64, phone, phoneCodeHash, email string, setup bool) (string, int, error)
 	VerifyLoginEmail(ctx context.Context, userID int64, phone, phoneCodeHash, code string, setup bool) (string, error)
 	SetLoginEmail(ctx context.Context, userID int64, email string) error
-	SetLoginEmailByPhone(ctx context.Context, phone, email string) error
 	LoginEmail(ctx context.Context, userID int64) (string, bool, error)
 	LoginEmailByPhone(ctx context.Context, phone string) (string, bool, error)
-	ClearLoginEmailByPhone(ctx context.Context, phone string) error
+	ClearLoginEmail(ctx context.Context, userID int64) error
 	ResetPassword(ctx context.Context, userID int64) (domain.PasswordResetResult, error)
 	DeclinePasswordReset(ctx context.Context, userID int64) error
 	SaveMusic(ctx context.Context, userID int64, req domain.SaveMusicRequest) (bool, error)
@@ -328,35 +331,36 @@ type HelpService interface {
 type UpdatesService interface {
 	GetState(ctx context.Context, authKeyID [8]byte, userID int64) (domain.UpdateState, error)
 	CurrentState(ctx context.Context, userID int64) (domain.UpdateState, error)
+	ConfirmedState(ctx context.Context, authKeyID [8]byte, userID int64) (domain.UpdateState, bool, error)
 	AcknowledgeCurrentState(ctx context.Context, authKeyID [8]byte, userID int64) (domain.UpdateState, error)
 	GetDifference(ctx context.Context, authKeyID [8]byte, userID int64, from domain.UpdateState) (domain.UpdateDifference, error)
 	ClearAuthKey(ctx context.Context, authKeyID [8]byte) error
 	RecordNewMessage(ctx context.Context, authKeyID [8]byte, userID int64, msg domain.Message) (domain.UpdateEvent, domain.UpdateState, error)
 	PublishNewMessage(ctx context.Context, userID int64, msg domain.Message) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordStory(ctx context.Context, authKeyID [8]byte, userID int64, story domain.Story, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordStory(ctx context.Context, stateAuthKeyID [8]byte, userID int64, story domain.Story, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
 	RecordStoryFanout(ctx context.Context, userID int64, story domain.Story) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordReadStories(ctx context.Context, authKeyID [8]byte, userID int64, read domain.StoryReadResult, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordSentStoryReaction(ctx context.Context, authKeyID [8]byte, userID int64, reaction domain.StoryReactionResult, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordNewStoryReaction(ctx context.Context, authKeyID [8]byte, ownerUserID int64, reaction domain.StoryReactionResult, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordQuickReplyMutation(ctx context.Context, authKeyID [8]byte, userID int64, mutation domain.QuickReplyMutation, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordReadHistory(ctx context.Context, authKeyID [8]byte, userID int64, read domain.ReadHistoryResult, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordContactsReset(ctx context.Context, authKeyID [8]byte, userID int64, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordChannelState(ctx context.Context, authKeyID [8]byte, userID, channelID int64, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordDialogPinned(ctx context.Context, authKeyID [8]byte, userID int64, peer domain.Peer, pinned bool, folderID int, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordPinnedDialogs(ctx context.Context, authKeyID [8]byte, userID int64, folderID int, order []domain.Peer, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordSavedDialogPinned(ctx context.Context, authKeyID [8]byte, userID int64, peer domain.Peer, pinned bool, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordPinnedSavedDialogs(ctx context.Context, authKeyID [8]byte, userID int64, order []domain.Peer, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordDialogUnreadMark(ctx context.Context, authKeyID [8]byte, userID int64, peer domain.Peer, unread bool, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordPeerSettings(ctx context.Context, authKeyID [8]byte, userID int64, peer domain.Peer, settings domain.PeerSettings, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordPeerStoryBlocked(ctx context.Context, authKeyID [8]byte, userID int64, peer domain.Peer, blocked bool, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordDialogFilter(ctx context.Context, authKeyID [8]byte, userID int64, folderID int, folder *domain.DialogFolder, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordDialogFilterOrder(ctx context.Context, authKeyID [8]byte, userID int64, order []int, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordDialogFiltersReload(ctx context.Context, authKeyID [8]byte, userID int64, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordFolderPeers(ctx context.Context, authKeyID [8]byte, userID int64, peers []domain.FolderPeerUpdate, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordChannelAvailableMessages(ctx context.Context, authKeyID [8]byte, userID, channelID int64, availableMinID int, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordChannelViewForumAsMessages(ctx context.Context, authKeyID [8]byte, userID, channelID int64, enabled bool, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordChannelDiscussionInbox(ctx context.Context, authKeyID [8]byte, userID, channelID int64, topicID, maxID int, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
-	RecordDraftMessage(ctx context.Context, authKeyID [8]byte, userID int64, peer domain.Peer, topMsgID int, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordReadStories(ctx context.Context, stateAuthKeyID [8]byte, userID int64, read domain.StoryReadResult, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordSentStoryReaction(ctx context.Context, stateAuthKeyID [8]byte, userID int64, reaction domain.StoryReactionResult, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordNewStoryReaction(ctx context.Context, stateAuthKeyID [8]byte, ownerUserID int64, reaction domain.StoryReactionResult, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordQuickReplyMutation(ctx context.Context, stateAuthKeyID [8]byte, userID int64, mutation domain.QuickReplyMutation, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordReadHistory(ctx context.Context, stateAuthKeyID [8]byte, userID int64, read domain.ReadHistoryResult, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordContactsReset(ctx context.Context, stateAuthKeyID [8]byte, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordChannelState(ctx context.Context, stateAuthKeyID [8]byte, userID, channelID int64, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordDialogPinned(ctx context.Context, stateAuthKeyID [8]byte, userID int64, peer domain.Peer, pinned bool, folderID int, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordPinnedDialogs(ctx context.Context, stateAuthKeyID [8]byte, userID int64, folderID int, order []domain.Peer, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordSavedDialogPinned(ctx context.Context, stateAuthKeyID [8]byte, userID int64, peer domain.Peer, pinned bool, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordPinnedSavedDialogs(ctx context.Context, stateAuthKeyID [8]byte, userID int64, order []domain.Peer, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordDialogUnreadMark(ctx context.Context, stateAuthKeyID [8]byte, userID int64, peer domain.Peer, unread bool, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordPeerSettings(ctx context.Context, stateAuthKeyID [8]byte, userID int64, peer domain.Peer, settings domain.PeerSettings, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordPeerStoryBlocked(ctx context.Context, stateAuthKeyID [8]byte, userID int64, peer domain.Peer, blocked bool, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordDialogFilter(ctx context.Context, stateAuthKeyID [8]byte, userID int64, folderID int, folder *domain.DialogFolder, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordDialogFilterOrder(ctx context.Context, stateAuthKeyID [8]byte, userID int64, order []int, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordDialogFiltersReload(ctx context.Context, stateAuthKeyID [8]byte, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordFolderPeers(ctx context.Context, stateAuthKeyID [8]byte, userID int64, peers []domain.FolderPeerUpdate, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordChannelAvailableMessages(ctx context.Context, stateAuthKeyID [8]byte, userID, channelID int64, availableMinID int, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordChannelViewForumAsMessages(ctx context.Context, stateAuthKeyID [8]byte, userID, channelID int64, enabled bool, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordChannelDiscussionInbox(ctx context.Context, stateAuthKeyID [8]byte, userID, channelID int64, topicID, maxID int, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
+	RecordDraftMessage(ctx context.Context, stateAuthKeyID [8]byte, userID int64, peer domain.Peer, topMsgID int, excludeAuthKeyID [8]byte, excludeSessionID int64) (domain.UpdateEvent, domain.UpdateState, error)
 }
 
 // ContactsService 抽象通讯录查询。
@@ -450,6 +454,21 @@ type MessagesService interface {
 	ToggleSavedDialogPin(ctx context.Context, userID int64, peer domain.Peer, pinned bool) (bool, error)
 	ReorderPinnedSavedDialogs(ctx context.Context, userID int64, order []domain.Peer, force bool) error
 	DeleteSavedHistory(ctx context.Context, userID int64, req domain.DeleteSavedHistoryRequest) (domain.DeleteSavedHistoryResult, error)
+}
+
+// TranslationService owns read-only translation and the durable per-account
+// peer preference. It only exposes domain values to the RPC edge.
+type TranslationService interface {
+	Translate(ctx context.Context, req domain.TranslationRequest) (domain.TranslationResult, error)
+	SetPeerDisabled(ctx context.Context, userID int64, peer domain.Peer, disabled bool) (bool, error)
+	PeerDisabled(ctx context.Context, userID int64, peer domain.Peer) (bool, error)
+}
+
+// AlbumGroupService 是 MessagesService 的可选、生产必备能力：sendMultiMedia 在
+// 解析任何媒体或落第一条消息前，持久预留整批 random_id 的 grouped_id。
+// 单独定义可避免让不触发 sendMultiMedia 的轻量测试替身实现无关方法。
+type AlbumGroupService interface {
+	ReserveAlbumGroup(ctx context.Context, userID int64, req domain.AlbumGroupReservationRequest) (int64, error)
 }
 
 // StoriesService 抽象 story 读取、已读、观看与 reaction 状态。
@@ -715,10 +734,12 @@ type Deps struct {
 	Users            UsersService
 	Updates          UpdatesService
 	BootstrapUpdates store.BootstrapUpdateJobStore
+	BotAPIUpdates    store.BotAPIUpdateStore
 	Contacts         ContactsService
 	Dialogs          DialogsService
 	Chatlists        ChatlistsService
 	Messages         MessagesService
+	Translation      TranslationService
 	Stories          StoriesService
 	Channels         ChannelsService
 	Files            FilesService

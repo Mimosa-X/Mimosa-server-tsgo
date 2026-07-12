@@ -1,6 +1,7 @@
 package mtprotoedge
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -40,25 +41,72 @@ func TestEncryptedPingPong(t *testing.T) {
 	}
 }
 
-// TestDuplicateMsgIDIdempotent 验证 M4：相同 msg_id 的重复 content 请求被幂等处理，
-// server 重发已缓存的 rpc_result，并重新 ack，不重复执行业务。
+// TestDuplicateMsgIDIdempotent 验证相同物理连接上的重复 content 请求只重新 ACK，
+// 原 owner 仍是唯一 rpc_result 发送者。若每次重复都重放完整结果，Android 的
+// bad_server_salt 全量重试会把一个启动批次放大成 N 轮孤儿结果并饿死新 request id。
 func TestDuplicateMsgIDIdempotent(t *testing.T) {
 	const dc = 2
-	addr, pub, _ := startTestServer(t, Options{DC: dc})
+	handler := &admissionCountingRPC{}
+	addr, pub, _ := startTestServer(t, Options{DC: dc, RPC: handler})
 	conn, auth, cipher := dialHandshake(t, addr, dc, pub)
 
 	clientMsgID := proto.NewMessageIDGen(time.Now)
 	msgID := clientMsgID.New(proto.MessageFromClient)
 
-	sendEncrypted(t, conn, cipher, auth, msgID, &mt.RPCDropAnswerRequest{ReqMsgID: msgID - 4})
-	first := collectReplies(t, conn, cipher, auth.AuthKey, mt.MsgsAckTypeID)
-	mustHave(t, first, proto.ResultTypeID, "first rpc_result")
+	sendEncrypted(t, conn, cipher, auth, msgID, &tg.HelpGetConfigRequest{})
+	collectReplyFrames(t, conn, cipher, auth.AuthKey, map[uint32]int{
+		proto.ResultTypeID: 1,
+		mt.MsgsAckTypeID:   1,
+	})
+	waitForAtomicCalls(t, &handler.calls, 1)
 
-	// 相同 msg_id —— 幂等：重发已有 rpc_result，并重新 ack。
-	sendEncrypted(t, conn, cipher, auth, msgID, &mt.RPCDropAnswerRequest{ReqMsgID: msgID - 4})
-	second := collectReplies(t, conn, cipher, auth.AuthKey, mt.MsgsAckTypeID)
-	mustHave(t, second, proto.ResultTypeID, "resent rpc_result")
-	mustHave(t, second, mt.MsgsAckTypeID, "second ack")
+	// 用一个小型重试风暴覆盖完成后的 duplicate 路径。TCP 仍存活时原结果已在同一
+	// 可靠字节流上；每个 duplicate 只需 ACK，不应产生第二个 rpc_result。
+	const duplicateCount = 16
+	for i := 0; i < duplicateCount; i++ {
+		sendEncrypted(t, conn, cipher, auth, msgID, &tg.HelpGetConfigRequest{})
+	}
+	frames := collectReplyFrames(t, conn, cipher, auth.AuthKey, map[uint32]int{
+		mt.MsgsAckTypeID: duplicateCount,
+	})
+	for _, frame := range frames {
+		if frame.TypeID == proto.ResultTypeID {
+			t.Fatalf("same-connection duplicate emitted an extra rpc_result")
+		}
+	}
+	if got := handler.calls.Load(); got != 1 {
+		t.Fatalf("same-connection duplicate business calls = %d, want 1", got)
+	}
+}
+
+func TestServiceDuplicateCannotReplaceOriginallyAdmittedPayload(t *testing.T) {
+	const dc = 2
+	addr, pub, _ := startTestServer(t, Options{DC: dc})
+	conn, auth, cipher := dialHandshake(t, addr, dc, pub)
+
+	ids := proto.NewMessageIDGen(time.Now)
+	msgID := ids.New(proto.MessageFromClient)
+	sendEncryptedWithSeq(t, conn, cipher, auth, msgID, 1, &mt.PingRequest{PingID: 11})
+	collectReplyFrames(t, conn, cipher, auth.AuthKey, map[uint32]int{
+		mt.PongTypeID:    1,
+		mt.MsgsAckTypeID: 1,
+	})
+
+	// Same id/seq/content parity but a destructive replacement body. Duplicate
+	// handling must use the original committed request class and never execute it.
+	sendEncryptedWithSeq(t, conn, cipher, auth, msgID, 1, &destroyAuthKeyRequest{})
+	collectReplyFrames(t, conn, cipher, auth.AuthKey, map[uint32]int{mt.MsgsAckTypeID: 1})
+
+	freshID := ids.New(proto.MessageFromClient)
+	sendEncryptedWithSeq(t, conn, cipher, auth, freshID, 3, &mt.PingRequest{PingID: 22})
+	replies := collectReplies(t, conn, cipher, auth.AuthKey, mt.PongTypeID)
+	var pong mt.Pong
+	if err := pong.Decode(mustHave(t, replies, mt.PongTypeID, "pong after replacement attempt")); err != nil {
+		t.Fatalf("decode pong: %v", err)
+	}
+	if pong.MsgID != freshID || pong.PingID != 22 {
+		t.Fatalf("pong after replacement = %+v, want msg=%d ping=22", pong, freshID)
+	}
 }
 
 // TestGetFutureSalts 验证 MTProto service message get_future_salts 由连接层直接响应，
@@ -268,6 +316,14 @@ func TestOldMessageInFreshContainerAccepted(t *testing.T) {
 	})
 
 	replies := collectReplies(t, conn, cipher, auth.AuthKey, mt.PongTypeID)
+	createdBuf := mustHave(t, replies, mt.NewSessionCreatedTypeID, "new_session_created")
+	var created mt.NewSessionCreated
+	if err := created.Decode(createdBuf); err != nil {
+		t.Fatalf("decode new_session_created: %v", err)
+	}
+	if created.FirstMsgID != oldPingMsgID {
+		t.Fatalf("new_session_created.first_msg_id = %d, want accepted inner msg_id %d", created.FirstMsgID, oldPingMsgID)
+	}
 	buf := mustHave(t, replies, mt.PongTypeID, "pong")
 	var pong mt.Pong
 	if err := pong.Decode(buf); err != nil {
@@ -359,7 +415,7 @@ func TestPingDelayDisconnectOddSeqAccepted(t *testing.T) {
 // 避免 TDesktop 清理旧 key 时落到业务 RPC fallback。
 func TestDestroyAuthKey(t *testing.T) {
 	const dc = 2
-	addr, pub, _ := startTestServer(t, Options{DC: dc})
+	addr, pub, srv := startTestServer(t, Options{DC: dc})
 	conn, auth, cipher := dialHandshake(t, addr, dc, pub)
 
 	clientMsgID := proto.NewMessageIDGen(time.Now)
@@ -368,6 +424,15 @@ func TestDestroyAuthKey(t *testing.T) {
 
 	replies := collectReplies(t, conn, cipher, auth.AuthKey, destroyAuthKeyOkTypeID)
 	mustHave(t, replies, destroyAuthKeyOkTypeID, "destroy_auth_key_ok")
+	if _, found, err := srv.authKeys.Get(context.Background(), auth.AuthKey.ID); err != nil || found {
+		t.Fatalf("auth key after destroy: found=%v err=%v", found, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var frame bin.Buffer
+	if err := conn.Recv(ctx, &frame); err == nil {
+		t.Fatal("destroy_auth_key requester remained readable after required ok")
+	}
 }
 
 // TestBadServerSalt 验证客户端带错 server_salt 时 server 返回 bad_server_salt，
@@ -382,8 +447,10 @@ func TestBadServerSalt(t *testing.T) {
 	wrongSalt := auth.ServerSalt + 1
 	sendEncryptedWithSalt(t, conn, cipher, auth, wrongSalt, reqMsgID, &mt.PingRequest{PingID: 1})
 
-	replies := collectReplies(t, conn, cipher, auth.AuthKey, mt.BadServerSaltTypeID)
-	buf := mustHave(t, replies, mt.BadServerSaltTypeID, "bad_server_salt")
+	envelope, typeID, buf := readServerMessage(t, conn, cipher, auth.AuthKey)
+	if typeID != mt.BadServerSaltTypeID {
+		t.Fatalf("bad salt reply type = %#x, want %#x", typeID, mt.BadServerSaltTypeID)
+	}
 
 	var bad mt.BadServerSalt
 	if err := bad.Decode(buf); err != nil {
@@ -397,6 +464,11 @@ func TestBadServerSalt(t *testing.T) {
 	}
 	if bad.NewServerSalt != auth.ServerSalt {
 		t.Fatalf("bad_server_salt.new_server_salt = %#x, want %#x", bad.NewServerSalt, auth.ServerSalt)
+	}
+	// DrKLO stores the salt from the encrypted envelope, not only the TL payload.
+	// A mismatch makes every correction ineffective and re-enters the resend storm.
+	if envelope.Salt != bad.NewServerSalt {
+		t.Fatalf("bad_server_salt envelope salt = %#x, payload = %#x", envelope.Salt, bad.NewServerSalt)
 	}
 }
 
@@ -470,7 +542,7 @@ func TestBadMsgSeqTooHigh(t *testing.T) {
 
 func TestSessionChangeResetsClientSeqState(t *testing.T) {
 	const dc = 2
-	addr, pub, _ := startTestServer(t, Options{DC: dc})
+	addr, pub, srv := startTestServer(t, Options{DC: dc})
 	conn, auth, cipher := dialHandshake(t, addr, dc, pub)
 
 	clientMsgID := proto.NewMessageIDGen(time.Now)
@@ -492,6 +564,19 @@ func TestSessionChangeResetsClientSeqState(t *testing.T) {
 	}
 	mustHave(t, replies, mt.NewSessionCreatedTypeID, "new_session_created after session change")
 	mustHave(t, replies, mt.MsgsAckTypeID, "msgs_ack after session change")
+
+	oldKey := sessionKey{authKeyID: auth.AuthKey.ID, sessionID: auth.SessionID}
+	newKey := sessionKey{authKeyID: auth.AuthKey.ID, sessionID: nextSessionID}
+	srv.conns.mu.RLock()
+	_, oldVisible := srv.conns.bySession[oldKey]
+	newConn := srv.conns.bySession[newKey]
+	claims := len(srv.conns.claims)
+	online := len(srv.conns.bySession)
+	srv.conns.mu.RUnlock()
+	if oldVisible || newConn == nil || !newConn.isActive() || claims != 0 || online != 1 {
+		t.Fatalf("same-transport switch state: old=%v new=%p active=%v claims=%d online=%d",
+			oldVisible, newConn, newConn != nil && newConn.isActive(), claims, online)
+	}
 }
 
 func readBadMsgNotification(t *testing.T, conn transport.Conn, cipher crypto.Cipher, key crypto.AuthKey) mt.BadMsgNotification {

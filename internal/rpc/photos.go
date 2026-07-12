@@ -318,7 +318,6 @@ func (r *Router) sendSuggestedProfilePhotoMessage(ctx context.Context, userID, t
 	if err != nil {
 		return domain.SendPrivateTextResult{}, err
 	}
-	authKeyID, _ := AuthKeyIDFrom(ctx)
 	sessionID, _ := SessionIDFrom(ctx)
 	photoCopy := photo
 	res, err := r.deps.Messages.SendPrivateText(ctx, userID, domain.SendPrivateTextRequest{
@@ -333,7 +332,7 @@ func (r *Router) sendSuggestedProfilePhotoMessage(ctx context.Context, userID, t
 			},
 		},
 		Date:             int(r.clock.Now().Unix()),
-		OriginAuthKeyID:  authKeyID,
+		OriginAuthKeyID:  rawAuthKeyIDForOrigin(ctx),
 		OriginSessionID:  sessionID,
 		RecipientBlocked: recipientBlocked,
 	})
@@ -568,20 +567,11 @@ func (r *Router) pushSelfPhotoUpdateToCurrentSession(ctx context.Context, update
 	if !ok {
 		return
 	}
-	rawAuthKeyID, hasRawAuthKeyID := RawAuthKeyIDFrom(ctx)
+	rawAuthKeyID := rawAuthKeyIDForOrigin(ctx)
 	push := func() {
 		pushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if scoped, ok := r.scopedSessions(); ok {
-			if !hasRawAuthKeyID {
-				return
-			}
-			if err := scoped.PushToSessionForAuthKey(pushCtx, rawAuthKeyID, sessionID, proto.MessageFromServer, updates); err != nil {
-				r.log.Debug("push self photo update to current session", zap.Int64("session_id", sessionID), zap.Error(err))
-			}
-			return
-		}
-		if err := r.deps.Sessions.PushToSession(pushCtx, sessionID, proto.MessageFromServer, updates); err != nil {
+		if err := r.deps.Sessions.PushToSessionForAuthKey(pushCtx, rawAuthKeyID, sessionID, proto.MessageFromServer, updates); err != nil {
 			r.log.Debug("push self photo update to current session", zap.Int64("session_id", sessionID), zap.Error(err))
 		}
 	}

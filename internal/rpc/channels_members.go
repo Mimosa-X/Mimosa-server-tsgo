@@ -206,7 +206,7 @@ func (r *Router) onChannelsGetParticipant(ctx context.Context, req *tg.ChannelsG
 	}
 	member, err := r.deps.Channels.GetParticipant(ctx, userID, channelID, peer.ID)
 	if err != nil {
-		return nil, channelInvalidErr(err)
+		return nil, channelParticipantErr(err)
 	}
 	participant := tgChannelParticipant(userID, member)
 	users := r.tgUsersForIDs(ctx, userID, channelParticipantUserRefs(participant))
@@ -215,6 +215,13 @@ func (r *Router) onChannelsGetParticipant(ctx context.Context, req *tg.ChannelsG
 		Participant: participant,
 		Users:       users,
 	}, nil
+}
+
+func channelParticipantErr(err error) error {
+	if errors.Is(err, domain.ErrUserNotParticipant) {
+		return tgerr400("USER_NOT_PARTICIPANT")
+	}
+	return channelInvalidErr(err)
 }
 
 func channelParticipantUserRefs(participant tg.ChannelParticipantClass) []int64 {
@@ -369,7 +376,11 @@ func (r *Router) recordChannelStateForUser(ctx context.Context, userID, channelI
 		authKeyID, _ = AuthKeyIDFrom(ctx)
 		excludeSessionID, _ = SessionIDFrom(ctx)
 	}
-	event, _, err := r.deps.Updates.RecordChannelState(ctx, authKeyID, userID, channelID, excludeSessionID)
+	excludeAuthKeyID := [8]byte{}
+	if excludeCurrent {
+		excludeAuthKeyID = rawAuthKeyIDForOrigin(ctx)
+	}
+	event, _, err := r.deps.Updates.RecordChannelState(ctx, authKeyID, userID, channelID, excludeAuthKeyID, excludeSessionID)
 	if err != nil {
 		return
 	}

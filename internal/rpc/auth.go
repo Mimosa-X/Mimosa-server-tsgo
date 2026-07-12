@@ -77,12 +77,7 @@ func (r *Router) onAuthBindTempAuthKey(ctx context.Context, req *tg.AuthBindTemp
 		r.tempKeyResolveCache.Delete(id)
 	}
 	if r.deps.Sessions != nil {
-		if scoped, ok := r.scopedSessions(); ok {
-			rawAuthKeyID, _ := RawAuthKeyIDFrom(ctx)
-			scoped.BindAuthKeyForSession(rawAuthKeyID, sessionID, authKeyIDFromInt64(req.PermAuthKeyID))
-		} else {
-			r.deps.Sessions.BindAuthKey(sessionID, authKeyIDFromInt64(req.PermAuthKeyID))
-		}
+		r.deps.Sessions.BindAuthKeyForSession(id, sessionID, authKeyIDFromInt64(req.PermAuthKeyID))
 	}
 	r.invalidateAuthUserCache(id)
 	return true, nil
@@ -192,14 +187,8 @@ func (r *Router) bindLoginTokenTarget(target loginTokenTarget, userID int64) {
 	if r.deps.Sessions == nil || target.sessionID == 0 {
 		return
 	}
-	if scoped, ok := r.scopedSessions(); ok && target.rawAuthKeyID != ([8]byte{}) {
-		scoped.BindAuthKeyForSession(target.rawAuthKeyID, target.sessionID, target.authKeyID)
-		scoped.BindUserForAuthKey(target.rawAuthKeyID, target.sessionID, userID)
-		r.announceSessionOnline(loginTokenTargetContext(target, userID), userID)
-		return
-	}
-	r.deps.Sessions.BindAuthKey(target.sessionID, target.authKeyID)
-	r.deps.Sessions.BindUser(target.sessionID, userID)
+	r.deps.Sessions.BindAuthKeyForSession(target.rawAuthKeyID, target.sessionID, target.authKeyID)
+	r.deps.Sessions.BindUserForAuthKey(target.rawAuthKeyID, target.sessionID, userID)
 	r.announceSessionOnline(loginTokenTargetContext(target, userID), userID)
 }
 
@@ -220,19 +209,13 @@ func (r *Router) pushLoginTokenAccepted(ctx context.Context, target loginTokenTa
 		Update: &tg.UpdateLoginToken{},
 		Date:   int(r.clock.Now().Unix()),
 	}
-	if immediate, ok := r.deps.Sessions.(ScopedImmediateSessionPusher); ok && target.rawAuthKeyID != ([8]byte{}) {
+	if immediate, ok := r.deps.Sessions.(ImmediateSessionPusher); ok {
 		if err := immediate.PushToSessionForAuthKeyImmediate(ctx, target.rawAuthKeyID, target.sessionID, proto.MessageFromServer, updates); err != nil {
 			r.log.Debug("push login token accepted immediate", zap.Int64("session_id", target.sessionID), zap.Error(err))
 		}
 		return
 	}
-	if scoped, ok := r.scopedSessions(); ok && target.rawAuthKeyID != ([8]byte{}) {
-		if err := scoped.PushToSessionForAuthKey(ctx, target.rawAuthKeyID, target.sessionID, proto.MessageFromServer, updates); err != nil {
-			r.log.Debug("push login token accepted", zap.Int64("session_id", target.sessionID), zap.Error(err))
-		}
-		return
-	}
-	if err := r.deps.Sessions.PushToSession(ctx, target.sessionID, proto.MessageFromServer, updates); err != nil {
+	if err := r.deps.Sessions.PushToSessionForAuthKey(ctx, target.rawAuthKeyID, target.sessionID, proto.MessageFromServer, updates); err != nil {
 		r.log.Debug("push login token accepted", zap.Int64("session_id", target.sessionID), zap.Error(err))
 	}
 }
@@ -241,6 +224,9 @@ func (r *Router) pushLoginTokenAccepted(ctx context.Context, target loginTokenTa
 // 若该手机号账号设置了登录邮箱，验证码改投递到邮箱，返回 sentCodeTypeEmailCode
 // （客户端据此进入"输入邮箱验证码"界面，随后用 auth.signIn 的 email_verification 完成登录）。
 func (r *Router) onAuthSendCode(ctx context.Context, req *tg.AuthSendCodeRequest) (tg.AuthSentCodeClass, error) {
+	if err := r.checkAuthCodeRateLimit(ctx, req.PhoneNumber); err != nil {
+		return nil, err
+	}
 	r.rememberClientAPIID(ctx, req.APIID)
 	hash, err := r.deps.Auth.SendCode(ctx, req.PhoneNumber)
 	if err != nil {
@@ -263,6 +249,16 @@ func tgSentCodeWithLength(hash string, length int) tg.AuthSentCodeClass {
 	}
 	return &tg.AuthSentCode{
 		Type:          &tg.AuthSentCodeTypeApp{Length: length},
+		PhoneCodeHash: hash,
+	}
+}
+
+func tgSMSSentCode(hash string, length int) tg.AuthSentCodeClass {
+	if length <= 0 {
+		length = devCodeLength
+	}
+	return &tg.AuthSentCode{
+		Type:          &tg.AuthSentCodeTypeSMS{Length: length},
 		PhoneCodeHash: hash,
 	}
 }
@@ -303,6 +299,8 @@ func (r *Router) tgSentCodeForHash(ctx context.Context, hash string) (tg.AuthSen
 		return nil, signInErr(auth.ErrCodeExpired)
 	}
 	switch delivery.Kind {
+	case domain.AuthCodeDeliverySMS:
+		return tgSMSSentCode(hash, delivery.Length), nil
 	case domain.AuthCodeDeliveryEmail:
 		return tgEmailSentCode(hash, delivery.EmailPattern, delivery.Length), nil
 	case domain.AuthCodeDeliveryEmailSetupRequired:
@@ -316,25 +314,21 @@ func (r *Router) tgSentCodeForHash(ctx context.Context, hash string) (tg.AuthSen
 // 带 email_verification 时走登录邮箱路径（验证码来自邮箱而非短信）。
 func (r *Router) onAuthSignIn(ctx context.Context, req *tg.AuthSignInRequest) (tg.AuthAuthorizationClass, error) {
 	var (
-		u            domain.User
-		loginMessage domain.Message
-		needSignUp   bool
-		err          error
+		u          domain.User
+		needSignUp bool
+		err        error
 	)
 	if verification, ok := req.GetEmailVerification(); ok {
-		u, loginMessage, needSignUp, err = r.deps.Auth.SignInWithEmail(ctx, r.authzFromCtx(ctx), req.PhoneNumber, req.PhoneCodeHash, emailVerificationCode(verification))
+		u, _, needSignUp, err = r.deps.Auth.SignInWithEmail(ctx, r.authzFromCtx(ctx), req.PhoneNumber, req.PhoneCodeHash, emailVerificationCode(verification))
 	} else {
-		u, loginMessage, needSignUp, err = r.deps.Auth.SignIn(ctx, r.authzFromCtx(ctx), req.PhoneNumber, req.PhoneCodeHash, req.PhoneCode)
+		u, _, needSignUp, err = r.deps.Auth.SignIn(ctx, r.authzFromCtx(ctx), req.PhoneNumber, req.PhoneCodeHash, req.PhoneCode)
 	}
-	return r.finishAuthSignIn(ctx, u, loginMessage, needSignUp, err)
+	return r.finishAuthSignIn(ctx, u, needSignUp, err)
 }
 
-func (r *Router) finishAuthSignIn(ctx context.Context, u domain.User, loginMessage domain.Message, needSignUp bool, err error) (tg.AuthAuthorizationClass, error) {
+func (r *Router) finishAuthSignIn(ctx context.Context, u domain.User, needSignUp bool, err error) (tg.AuthAuthorizationClass, error) {
 	if err != nil {
 		if errors.Is(err, domain.ErrSessionPasswordNeeded) && u.ID != 0 {
-			if err := r.clearAuthKeyStateOnUserChange(ctx, u.ID); err != nil {
-				return nil, internalErr()
-			}
 			// 两步验证未完成：绝不能把 auth_key/session 标记为已登录，否则客户端忽略
 			// SESSION_PASSWORD_NEEDED、直接调用业务 RPC 即可绕过 2FA。失效缓存并把 session
 			// 置为未授权，让后续鉴权重新读到 password_pending 并拒绝；待 checkPassword 通过后再授权。
@@ -348,20 +342,28 @@ func (r *Router) finishAuthSignIn(ctx context.Context, u domain.User, loginMessa
 	if needSignUp {
 		return &tg.AuthAuthorizationSignUpRequired{}, nil
 	}
-	if err := r.clearAuthKeyStateOnUserChange(ctx, u.ID); err != nil {
-		return nil, internalErr()
-	}
 	if id, ok := AuthKeyIDFrom(ctx); ok {
 		r.setAuthUserCache(id, u.ID, true)
 	}
 	r.bindSessionUser(ctx, u.ID)
-	r.enqueueLoginMessageBootstrap(ctx, loginMessage)
 	r.pushSignInServiceNotificationToOthers(ctx, u)
 	return &tg.AuthAuthorization{User: r.tgSelfUser(u)}, nil
 }
 
 func (r *Router) onAuthResendCode(ctx context.Context, req *tg.AuthResendCodeRequest) (tg.AuthSentCodeClass, error) {
-	hash, err := r.deps.Auth.ResendCode(ctx, req.PhoneNumber, req.PhoneCodeHash)
+	if err := r.checkAuthCodeRateLimit(ctx, req.PhoneNumber); err != nil {
+		return nil, err
+	}
+	var hash string
+	var err error
+	if scoped, ok := r.deps.Auth.(interface {
+		ResendCodeForAuthKey(context.Context, [8]byte, string, string) (string, error)
+	}); ok {
+		authKeyID, _ := AuthKeyIDFrom(ctx)
+		hash, err = scoped.ResendCodeForAuthKey(ctx, authKeyID, req.PhoneNumber, req.PhoneCodeHash)
+	} else {
+		hash, err = r.deps.Auth.ResendCode(ctx, req.PhoneNumber, req.PhoneCodeHash)
+	}
 	if err != nil {
 		return nil, signInErr(err)
 	}
@@ -369,7 +371,16 @@ func (r *Router) onAuthResendCode(ctx context.Context, req *tg.AuthResendCodeReq
 }
 
 func (r *Router) onAuthCancelCode(ctx context.Context, req *tg.AuthCancelCodeRequest) (bool, error) {
-	if err := r.deps.Auth.CancelCode(ctx, req.PhoneNumber, req.PhoneCodeHash); err != nil {
+	var err error
+	if scoped, ok := r.deps.Auth.(interface {
+		CancelCodeForAuthKey(context.Context, [8]byte, string, string) error
+	}); ok {
+		authKeyID, _ := AuthKeyIDFrom(ctx)
+		err = scoped.CancelCodeForAuthKey(ctx, authKeyID, req.PhoneNumber, req.PhoneCodeHash)
+	} else {
+		err = r.deps.Auth.CancelCode(ctx, req.PhoneNumber, req.PhoneCodeHash)
+	}
+	if err != nil {
 		return false, signInErr(err)
 	}
 	return true, nil
@@ -515,15 +526,34 @@ func (r *Router) completePendingPasswordSignIn(ctx context.Context, authKeyID [8
 
 // onAuthResetLoginEmail 处理 auth.resetLoginEmail：用户登录设备时无法访问登录邮箱时
 // 清除登录邮箱，改回手机验证码登录，返回一个新的手机 sentCode 供其继续。
+type loginEmailResetConsumer interface {
+	ConsumeLoginEmailReset(ctx context.Context, phone, phoneCodeHash string) (userID int64, err error)
+	SendPhoneCodeAfterLoginEmailReset(ctx context.Context, phone string, expectedUserID int64) (string, error)
+}
+
 func (r *Router) onAuthResetLoginEmail(ctx context.Context, req *tg.AuthResetLoginEmailRequest) (tg.AuthSentCodeClass, error) {
 	if r.deps.Account == nil || r.deps.Auth == nil {
 		return nil, internalErr()
 	}
-	if err := r.deps.Account.ClearLoginEmailByPhone(ctx, req.PhoneNumber); err != nil {
+	if err := r.checkAuthCodeRateLimit(ctx, req.PhoneNumber); err != nil {
+		return nil, err
+	}
+	resetConsumer, ok := r.deps.Auth.(loginEmailResetConsumer)
+	if !ok {
 		return nil, internalErr()
 	}
-	hash, err := r.deps.Auth.SendCode(ctx, req.PhoneNumber)
+	resetUserID, err := resetConsumer.ConsumeLoginEmailReset(ctx, req.PhoneNumber, req.PhoneCodeHash)
 	if err != nil {
+		return nil, signInErr(err)
+	}
+	if err := r.deps.Account.ClearLoginEmail(ctx, resetUserID); err != nil {
+		return nil, internalErr()
+	}
+	hash, err := resetConsumer.SendPhoneCodeAfterLoginEmailReset(ctx, req.PhoneNumber, resetUserID)
+	if err != nil {
+		if errors.Is(err, auth.ErrCodeExpired) || errors.Is(err, auth.ErrCodeInvalid) {
+			return nil, signInErr(err)
+		}
 		if errors.Is(err, auth.ErrPhoneNumberInvalid) ||
 			errors.Is(err, auth.ErrSystemUserLoginForbidden) {
 			return nil, phoneNumberInvalidErr()
@@ -534,7 +564,7 @@ func (r *Router) onAuthResetLoginEmail(ctx context.Context, req *tg.AuthResetLog
 }
 
 // emailVerificationCode 从 emailVerification 取出可校验的字符串（验证码 / Google·Apple
-// 令牌）。开发环境一律按"任意非空即通过"处理，故三者等价取值。
+// 令牌）；最终必须由 auth service 对签发记录精确校验。
 // onAuthInitPasskeyLogin 处理 auth.initPasskeyLogin：生成一次性断言挑战（discoverable），
 // 以 DataJSON（顶层含 publicKey）返回。免授权（登录前）。
 func (r *Router) onAuthInitPasskeyLogin(ctx context.Context, req *tg.AuthInitPasskeyLoginRequest) (*tg.AuthPasskeyLoginOptions, error) {
@@ -549,7 +579,8 @@ func (r *Router) onAuthInitPasskeyLogin(ctx context.Context, req *tg.AuthInitPas
 }
 
 // onAuthFinishPasskeyLogin 处理 auth.finishPasskeyLogin：验证登录断言并绑定 auth_key。
-// 收尾与 signIn 同构（清水位→授权缓存→session 绑定）；passkey 是强因子，直接完全授权
+// 收尾与 signIn 同构（Bind 原子切换 update baseline → 授权缓存 → session 绑定）；
+// passkey 是强因子，直接完全授权
 // （不走 SESSION_PASSWORD_NEEDED）。FromDCID/FromAuthKeyID 为多 DC 重路由用，本单 DC 忽略。
 func (r *Router) onAuthFinishPasskeyLogin(ctx context.Context, req *tg.AuthFinishPasskeyLoginRequest) (tg.AuthAuthorizationClass, error) {
 	if r.deps.Passkey == nil || r.deps.Auth == nil {
@@ -566,9 +597,6 @@ func (r *Router) onAuthFinishPasskeyLogin(ctx context.Context, req *tg.AuthFinis
 	u, err := r.deps.Auth.BindVerifiedLogin(ctx, r.authzFromCtx(ctx), userID)
 	if err != nil {
 		return nil, passkeyErr(err)
-	}
-	if err := r.clearAuthKeyStateOnUserChange(ctx, u.ID); err != nil {
-		return nil, internalErr()
 	}
 	if id, ok := AuthKeyIDFrom(ctx); ok {
 		r.setAuthUserCache(id, u.ID, true)
@@ -591,7 +619,7 @@ func emailVerificationCode(v tg.EmailVerificationClass) string {
 
 // onAuthImportBotAuthorization 处理 auth.importBotAuthorization：bot 程序凭 token
 // 登录为 bot 账号。api_id/api_hash 与现有 sendCode 行为一致不校验（无 app 注册表）。
-// 收尾与 signIn 同构（清水位→授权缓存→session 绑定），但不写登录消息、不推
+// 收尾与 signIn 同构（Bind 原子切换 update baseline → 授权缓存 → session 绑定），但不写登录消息、不推
 // signIn 服务通知——那是手机登录语义。
 func (r *Router) onAuthImportBotAuthorization(ctx context.Context, req *tg.AuthImportBotAuthorizationRequest) (tg.AuthAuthorizationClass, error) {
 	if r.deps.Auth == nil {
@@ -600,9 +628,6 @@ func (r *Router) onAuthImportBotAuthorization(ctx context.Context, req *tg.AuthI
 	u, err := r.deps.Auth.SignInBot(ctx, r.authzFromCtx(ctx), req.BotAuthToken)
 	if err != nil {
 		return nil, importBotAuthorizationErr(err)
-	}
-	if err := r.clearAuthKeyStateOnUserChange(ctx, u.ID); err != nil {
-		return nil, internalErr()
 	}
 	if id, ok := AuthKeyIDFrom(ctx); ok {
 		r.setAuthUserCache(id, u.ID, true)
@@ -616,9 +641,6 @@ func (r *Router) onAuthSignUp(ctx context.Context, req *tg.AuthSignUpRequest) (t
 	u, loginMessage, err := r.deps.Auth.SignUp(ctx, r.authzFromCtx(ctx), req.PhoneNumber, req.PhoneCodeHash, req.FirstName, req.LastName)
 	if err != nil {
 		return nil, signInErr(err)
-	}
-	if err := r.clearAuthKeyStateOnUserChange(ctx, u.ID); err != nil {
-		return nil, internalErr()
 	}
 	if id, ok := AuthKeyIDFrom(ctx); ok {
 		r.setAuthUserCache(id, u.ID, true)
@@ -659,18 +681,6 @@ func (r *Router) onAuthLogOut(ctx context.Context) (*tg.AuthLoggedOut, error) {
 	return &tg.AuthLoggedOut{}, nil
 }
 
-func (r *Router) clearAuthKeyStateOnUserChange(ctx context.Context, newUserID int64) error {
-	oldUserID, ok := UserIDFrom(ctx)
-	if !ok || oldUserID == 0 || oldUserID == newUserID {
-		return nil
-	}
-	id, ok := AuthKeyIDFrom(ctx)
-	if !ok {
-		return nil
-	}
-	return r.clearAuthKeyState(ctx, id)
-}
-
 func (r *Router) clearAuthKeyState(ctx context.Context, authKeyID [8]byte) error {
 	if r.deps.Updates == nil {
 		return nil
@@ -686,13 +696,7 @@ func (r *Router) bindSessionUser(ctx context.Context, userID int64) {
 	if !ok {
 		return
 	}
-	if scoped, ok := r.scopedSessions(); ok {
-		rawAuthKeyID, _ := RawAuthKeyIDFrom(ctx)
-		scoped.BindUserForAuthKey(rawAuthKeyID, sessionID, userID)
-		r.announceSessionOnline(ctx, userID)
-		return
-	}
-	r.deps.Sessions.BindUser(sessionID, userID)
+	r.deps.Sessions.BindUserForAuthKey(rawAuthKeyIDForOrigin(ctx), sessionID, userID)
 	r.announceSessionOnline(ctx, userID)
 }
 
@@ -740,21 +744,16 @@ func (r *Router) pushSignInServiceNotificationToOthers(ctx context.Context, u do
 		return
 	}
 	authKeyID, hasAuthKeyID := AuthKeyIDFrom(ctx)
+	rawAuthKeyID, hasRawAuthKeyID := RawAuthKeyIDFrom(ctx)
 	sessionID, hasSessionID := SessionIDFrom(ctx)
-	if !hasAuthKeyID || !hasSessionID {
+	if !hasAuthKeyID || !hasRawAuthKeyID || !hasSessionID {
 		return
 	}
 	notification := r.tgSignInServiceNotification(ctx, u, authKeyID)
 	go func() {
 		pushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if scoped, ok := r.scopedSessions(); ok {
-			if sent, err := scoped.PushToUserExceptAuthKeySession(pushCtx, u.ID, authKeyID, sessionID, proto.MessageFromServer, notification); err != nil {
-				r.log.Debug("push sign-in service notification", zap.Int64("user_id", u.ID), zap.Int("sent", sent), zap.Error(err))
-			}
-			return
-		}
-		if sent, err := r.deps.Sessions.PushToUserExceptSession(pushCtx, u.ID, sessionID, proto.MessageFromServer, notification); err != nil {
+		if sent, err := r.deps.Sessions.PushToUserExceptAuthKeySession(pushCtx, u.ID, rawAuthKeyID, sessionID, proto.MessageFromServer, notification); err != nil {
 			r.log.Debug("push sign-in service notification", zap.Int64("user_id", u.ID), zap.Int("sent", sent), zap.Error(err))
 		}
 	}()

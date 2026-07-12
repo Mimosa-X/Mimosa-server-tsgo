@@ -118,11 +118,15 @@ func (r *Router) onChannelsGetFullChannel(ctx context.Context, input tg.InputCha
 			return nil, channelInvalidErr(domain.ErrChannelPrivate)
 		}
 		full := cached.full
+		if err := r.applyTranslationDisabledToChannelFull(ctx, userID, ref.ID, &full); err != nil {
+			return nil, err
+		}
 		r.applyStarGiftsCountToChannelFull(ctx, ref.ID, &full)
 		r.applyStoriesPinnedAvailableToChannelFull(ctx, userID, ref.ID, &full)
 		r.applyNotifySettingsToChannelFull(ctx, userID, ref.ID, &full)
 		r.applyAndroidChannelReactionEditorCompat(ctx, &full, cached.canChangeInfo)
 		chats := append([]tg.ChatClass(nil), cached.chats...)
+		chats = r.appendLinkedDiscussionChat(ctx, userID, ref.ID, chats)
 		r.trackChannelInterest(ctx, userID, ref.ID)
 		r.applyStoryMaxIDsToPeerObjects(ctx, userID, nil, chats)
 		return &tg.MessagesChatFull{
@@ -148,6 +152,7 @@ func (r *Router) onChannelsGetFullChannel(ctx context.Context, input tg.InputCha
 	}
 	r.trackChannelInterest(ctx, userID, view.Channel.ID)
 	chats := []tg.ChatClass{tgChannelChatForView(userID, view)}
+	chats = r.appendLinkedDiscussionChat(ctx, userID, view.Channel.ID, chats)
 	if mono, ok := r.linkedMonoforumForChannelState(ctx, userID, view.Channel); ok {
 		chats = appendUniqueTGChats(chats, tgChannelChat(userID, mono, nil))
 	}
@@ -162,6 +167,9 @@ func (r *Router) onChannelsGetFullChannel(ctx context.Context, input tg.InputCha
 		chats:         append([]tg.ChatClass(nil), chats...),
 		userIDs:       userIDs,
 	}, loadEpoch)
+	if err := r.applyTranslationDisabledToChannelFull(ctx, userID, view.Channel.ID, full); err != nil {
+		return nil, err
+	}
 	r.applyStoriesPinnedAvailableToChannelFull(ctx, userID, view.Channel.ID, full)
 	r.applyNotifySettingsToChannelFull(ctx, userID, view.Channel.ID, full)
 	r.applyAndroidChannelReactionEditorCompat(ctx, full, canChangeInfo)

@@ -30,6 +30,46 @@ func TestServiceSendMessageHonorsSendPermissionGate(t *testing.T) {
 	}
 }
 
+func TestServiceChannelReplayPrecedesCurrentSendPermissionGate(t *testing.T) {
+	ctx := context.Background()
+	channels := memory.NewChannelStore()
+	created, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
+		CreatorUserID: 1001,
+		Title:         "replay gate",
+		Megagroup:     true,
+		Date:          1_700_000_000,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel: %v", err)
+	}
+	req := domain.SendChannelMessageRequest{
+		ChannelID: created.Channel.ID,
+		RandomID:  92,
+		Message:   "committed before restriction",
+		Date:      1_700_000_001,
+	}
+	allowed := NewService(channels)
+	first, err := allowed.SendMessage(ctx, 1001, req)
+	if err != nil {
+		t.Fatalf("first SendMessage: %v", err)
+	}
+
+	denied := NewService(channels, WithSendPermissionChecker(channelDenySendChecker{}))
+	req.Date++
+	replay, err := denied.SendMessage(ctx, 1001, req)
+	if err != nil {
+		t.Fatalf("replay through denied gate: %v", err)
+	}
+	if !replay.Duplicate || replay.Message.ID != first.Message.ID {
+		t.Fatalf("replay = %+v, want committed duplicate %d", replay, first.Message.ID)
+	}
+
+	req.Message = "different intent"
+	if _, err := denied.SendMessage(ctx, 1001, req); !errors.Is(err, domain.ErrMessageRandomIDDuplicate) {
+		t.Fatalf("conflicting replay err=%v, want ErrMessageRandomIDDuplicate before send gate", err)
+	}
+}
+
 func TestServiceSendMonoforumMessageHonorsSendPermissionGate(t *testing.T) {
 	ctx := context.Background()
 	svc := NewService(memory.NewChannelStore(), WithSendPermissionChecker(channelDenySendChecker{}))
@@ -41,6 +81,52 @@ func TestServiceSendMonoforumMessageHonorsSendPermissionGate(t *testing.T) {
 		Message:      "blocked",
 	}); !errors.Is(err, domain.ErrUserSendRestricted) {
 		t.Fatalf("SendMonoforumMessage err=%v, want ErrUserSendRestricted", err)
+	}
+}
+
+func TestServiceMonoforumReplayPrecedesCurrentSendPermissionGate(t *testing.T) {
+	ctx := context.Background()
+	channels := memory.NewChannelStore()
+	parent, err := channels.CreateChannel(ctx, domain.CreateChannelRequest{
+		CreatorUserID: 1001,
+		Title:         "direct messages",
+		Broadcast:     true,
+		Date:          1_700_000_010,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel: %v", err)
+	}
+	enabled, err := channels.SetPaidMessagesPrice(ctx, 1001, parent.Channel.ID, 0, true)
+	if err != nil {
+		t.Fatalf("SetPaidMessagesPrice: %v", err)
+	}
+	req := domain.SendMonoforumMessageRequest{
+		MonoforumID:  enabled.Channel.LinkedMonoforumID,
+		SenderUserID: 1002,
+		SavedPeer:    domain.Peer{Type: domain.PeerTypeUser, ID: 1002},
+		RandomID:     93,
+		Message:      "committed direct message",
+		Date:         1_700_000_011,
+	}
+	allowed := NewService(channels)
+	first, err := allowed.SendMonoforumMessage(ctx, req)
+	if err != nil {
+		t.Fatalf("first SendMonoforumMessage: %v", err)
+	}
+
+	denied := NewService(channels, WithSendPermissionChecker(channelDenySendChecker{}))
+	req.Date++
+	replay, err := denied.SendMonoforumMessage(ctx, req)
+	if err != nil {
+		t.Fatalf("monoforum replay through denied gate: %v", err)
+	}
+	if !replay.Duplicate || replay.Message.ID != first.Message.ID {
+		t.Fatalf("monoforum replay = %+v, want committed duplicate %d", replay, first.Message.ID)
+	}
+
+	req.Message = "different intent"
+	if _, err := denied.SendMonoforumMessage(ctx, req); !errors.Is(err, domain.ErrMessageRandomIDDuplicate) {
+		t.Fatalf("conflicting monoforum replay err=%v, want ErrMessageRandomIDDuplicate before send gate", err)
 	}
 }
 
@@ -57,15 +143,16 @@ func (p testBotProfiles) BotInfo(_ context.Context, botUserID int64) (domain.Bot
 
 type countingChannelStore struct {
 	*memory.ChannelStore
-	mu                  sync.Mutex
-	getChannelCalls     int
-	resolveChannelCalls int
-	countMediaCalls     int
-	getParticipantCalls int
-	listActiveIDsCalls  int
-	resolveStarted      chan struct{}
-	resolveRelease      <-chan struct{}
-	resolveStartOnce    sync.Once
+	mu                       sync.Mutex
+	getChannelCalls          int
+	resolveChannelCalls      int
+	countMediaCalls          int
+	getParticipantCalls      int
+	listActiveIDsCalls       int
+	listActiveMemberIDsCalls int
+	resolveStarted           chan struct{}
+	resolveRelease           <-chan struct{}
+	resolveStartOnce         sync.Once
 }
 
 func (s *countingChannelStore) GetChannel(ctx context.Context, viewerUserID, channelID int64) (domain.ChannelView, error) {
@@ -100,6 +187,11 @@ func (s *countingChannelStore) GetParticipants(ctx context.Context, viewerUserID
 func (s *countingChannelStore) ListActiveChannelIDsForUser(ctx context.Context, userID, afterChannelID int64, limit int) ([]int64, error) {
 	s.listActiveIDsCalls++
 	return s.ChannelStore.ListActiveChannelIDsForUser(ctx, userID, afterChannelID, limit)
+}
+
+func (s *countingChannelStore) ListActiveChannelMemberIDs(ctx context.Context, viewerUserID, channelID int64, limit int) ([]int64, error) {
+	s.listActiveMemberIDsCalls++
+	return s.ChannelStore.ListActiveChannelMemberIDs(ctx, viewerUserID, channelID, limit)
 }
 
 type fakeReadModelVersions struct {
@@ -340,6 +432,102 @@ func TestActiveChannelIDsForUserCachesEmptyMissingReadModelHash(t *testing.T) {
 	}
 	if base.listActiveIDsCalls != 2 {
 		t.Fatalf("ListActiveChannelIDsForUser calls after second post-write read = %d, want 2", base.listActiveIDsCalls)
+	}
+}
+
+func TestActiveBotMemberIDsCachesAndInvalidatesOnMembershipWrite(t *testing.T) {
+	ctx := context.Background()
+	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	bots := testBotProfiles{
+		1003: {BotUserID: 1003},
+		1004: {BotUserID: 1004},
+	}
+	service := NewService(base, WithBotProfileResolver(bots))
+	created, err := service.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
+		Title:         "Bot Cache",
+		MemberUserIDs: []int64{1002, 1003},
+		Date:          1700004115,
+	})
+	if err != nil {
+		t.Fatalf("CreateMegagroupFromCreateChat: %v", err)
+	}
+	channelID := created.Channel.ID
+
+	first, err := service.ActiveBotMemberIDs(ctx, 1001, channelID, domain.MaxSynchronousChannelDialogFanout)
+	if err != nil {
+		t.Fatalf("ActiveBotMemberIDs first: %v", err)
+	}
+	if want := []int64{1003}; !slices.Equal(first, want) {
+		t.Fatalf("ActiveBotMemberIDs first = %v, want %v", first, want)
+	}
+	first[0] = 9999
+	second, err := service.ActiveBotMemberIDs(ctx, 1001, channelID, domain.MaxSynchronousChannelDialogFanout)
+	if err != nil {
+		t.Fatalf("ActiveBotMemberIDs second: %v", err)
+	}
+	if want := []int64{1003}; !slices.Equal(second, want) {
+		t.Fatalf("ActiveBotMemberIDs cached = %v, want %v", second, want)
+	}
+	if base.listActiveMemberIDsCalls != 1 {
+		t.Fatalf("ListActiveChannelMemberIDs calls = %d, want 1 after cache hit", base.listActiveMemberIDsCalls)
+	}
+
+	if _, err := service.InviteToChannel(ctx, 1001, channelID, []int64{1004}, 1700004116); err != nil {
+		t.Fatalf("InviteToChannel bot: %v", err)
+	}
+	third, err := service.ActiveBotMemberIDs(ctx, 1001, channelID, domain.MaxSynchronousChannelDialogFanout)
+	if err != nil {
+		t.Fatalf("ActiveBotMemberIDs after invite: %v", err)
+	}
+	if want := []int64{1003, 1004}; !slices.Equal(third, want) {
+		t.Fatalf("ActiveBotMemberIDs after invite = %v, want %v", third, want)
+	}
+	if base.listActiveMemberIDsCalls != 2 {
+		t.Fatalf("ListActiveChannelMemberIDs calls = %d, want reload after invalidation", base.listActiveMemberIDsCalls)
+	}
+}
+
+func TestActiveBotMemberIDsReloadsOnReadModelHashChange(t *testing.T) {
+	ctx := context.Background()
+	base := &countingChannelStore{ChannelStore: memory.NewChannelStore()}
+	bots := testBotProfiles{1003: {BotUserID: 1003}}
+	creator := NewService(base, WithBotProfileResolver(bots))
+	created, err := creator.CreateMegagroupFromCreateChat(ctx, 1001, domain.CreateChannelRequest{
+		Title:         "Bot Hash",
+		MemberUserIDs: []int64{1002, 1003},
+		Date:          1700004117,
+	})
+	if err != nil {
+		t.Fatalf("CreateMegagroupFromCreateChat: %v", err)
+	}
+	channelID := created.Channel.ID
+	peer := domain.Peer{Type: domain.PeerTypeChannel, ID: channelID}
+	baseKey := store.ReadModelKey{Model: readmodel.ModelChannelBase, OwnerUserID: 0, PeerType: peer.Type, PeerID: peer.ID}
+	participantsKey := store.ReadModelKey{Model: readmodel.ModelChannelParticipants, OwnerUserID: 0, PeerType: peer.Type, PeerID: peer.ID}
+	memberKey := store.ReadModelKey{Model: readmodel.ModelChannelMember, OwnerUserID: 1001, PeerType: peer.Type, PeerID: peer.ID}
+	versions := &fakeReadModelVersions{hashes: map[store.ReadModelKey]int64{
+		baseKey:         401,
+		participantsKey: 402,
+		memberKey:       403,
+	}}
+	service := NewService(base, WithBotProfileResolver(bots), WithReadModelVersions(versions))
+
+	if _, err := service.ActiveBotMemberIDs(ctx, 1001, channelID, domain.MaxSynchronousChannelDialogFanout); err != nil {
+		t.Fatalf("ActiveBotMemberIDs first: %v", err)
+	}
+	if _, err := service.ActiveBotMemberIDs(ctx, 1001, channelID, domain.MaxSynchronousChannelDialogFanout); err != nil {
+		t.Fatalf("ActiveBotMemberIDs cached: %v", err)
+	}
+	if base.listActiveMemberIDsCalls != 1 {
+		t.Fatalf("ListActiveChannelMemberIDs calls = %d, want 1 before hash change", base.listActiveMemberIDsCalls)
+	}
+
+	versions.hashes[participantsKey] = 404
+	if _, err := service.ActiveBotMemberIDs(ctx, 1001, channelID, domain.MaxSynchronousChannelDialogFanout); err != nil {
+		t.Fatalf("ActiveBotMemberIDs after hash change: %v", err)
+	}
+	if base.listActiveMemberIDsCalls != 2 {
+		t.Fatalf("ListActiveChannelMemberIDs calls = %d, want reload after hash change", base.listActiveMemberIDsCalls)
 	}
 }
 
@@ -711,7 +899,8 @@ func TestCreateChatCreatesMegagroupWithChannelPts(t *testing.T) {
 	duplicate, err := service.SendMessage(ctx, 1001, domain.SendChannelMessageRequest{
 		ChannelID: created.Channel.ID,
 		RandomID:  99,
-		Message:   "hello again",
+		Message:   "hello",
+		ViaBotID:  1003,
 		Date:      12,
 	})
 	if err != nil {
@@ -1930,12 +2119,12 @@ func TestChannelEditDeleteAndLocalClearUseChannelPts(t *testing.T) {
 	if edited.Event.Type != domain.ChannelUpdateEditMessage || edited.Event.Pts != 4 || edited.Event.PtsCount != 1 {
 		t.Fatalf("edit event = %+v, want channel edit pts=4 count=1", edited.Event)
 	}
-	duplicate, err := service.SendMessage(ctx, 1002, domain.SendChannelMessageRequest{ChannelID: created.Channel.ID, RandomID: 2, Message: "two retry", Date: 13})
+	duplicate, err := service.SendMessage(ctx, 1002, domain.SendChannelMessageRequest{ChannelID: created.Channel.ID, RandomID: 2, Message: "two", Date: 13})
 	if err != nil {
 		t.Fatalf("duplicate SendMessage after edit: %v", err)
 	}
-	if !duplicate.Duplicate || duplicate.Event.Type != domain.ChannelUpdateNewMessage || duplicate.Message.Body != "two" || duplicate.Event.Message.Body != "two" {
-		t.Fatalf("duplicate after edit = %+v, want original new-message snapshot", duplicate)
+	if !duplicate.Duplicate || duplicate.Event.Type != domain.ChannelUpdateNewMessage || duplicate.Message.Body != "two edited" || duplicate.Event.Message.Body != "two edited" {
+		t.Fatalf("duplicate after edit = %+v, want current message in new-message replay", duplicate)
 	}
 
 	deleted, err := service.DeleteMessages(ctx, 1001, domain.DeleteChannelMessagesRequest{

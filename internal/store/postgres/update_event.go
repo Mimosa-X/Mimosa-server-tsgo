@@ -122,7 +122,7 @@ func (s *UpdateEventStore) appendInTx(ctx context.Context, db sqlcgen.DBTX, q *s
 		return domain.UpdateEvent{}, fmt.Errorf("append update event: %w", err)
 	}
 	if dispatch {
-		if err := q.EnqueueDispatch(ctx, sqlcgen.EnqueueDispatchParams{
+		if err := enqueueDispatch(ctx, q, sqlcgen.EnqueueDispatchParams{
 			TargetUserID:     userID,
 			Pts:              int32(event.Pts),
 			EventType:        string(event.Type),
@@ -218,6 +218,7 @@ func appendUserUpdateEvent(ctx context.Context, db sqlcgen.DBTX, q *sqlcgen.Quer
 		Date:             int32(event.Date),
 		EventType:        string(event.Type),
 		EventBool:        event.Bool,
+		EventPhone:       event.Phone,
 		EventPeers:       peers,
 		PeerSettings:     settings,
 		MessageIds:       messageIDs,
@@ -406,6 +407,7 @@ func (s *UpdateEventStore) ListAfter(ctx context.Context, userID int64, pts, lim
 			Story:            story,
 			Peers:            peers,
 			Bool:             row.EventBool,
+			Phone:            row.EventPhone,
 			Settings:         settings,
 			MessageIDs:       messageIDs,
 			MaxID:            int(row.MaxID),
@@ -599,6 +601,7 @@ func (s *UpdateEventStore) BatchByCursor(ctx context.Context, cursors []store.Ev
 			Story:            story,
 			Peers:            peers,
 			Bool:             row.EventBool,
+			Phone:            row.EventPhone,
 			Settings:         settings,
 			MessageIDs:       messageIDs,
 			MaxID:            int(row.MaxID),

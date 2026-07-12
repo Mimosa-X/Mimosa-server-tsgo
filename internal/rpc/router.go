@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -53,6 +54,12 @@ type Config struct {
 	OutboundPushTimeout time.Duration
 	SendRateLimit       int
 	SendRateWindow      time.Duration
+	// AuthCode*RateLimit protects the unauthenticated sendCode/resendCode write path.
+	// The phone budget is keyed by SHA-256(normalized phone), never by the plaintext phone;
+	// the second budget is keyed by the physical connection's raw auth_key_id.
+	AuthCodePhoneRateLimit   int
+	AuthCodeAuthKeyRateLimit int
+	AuthCodeRateWindow       time.Duration
 	// CatchupRateLimit/CatchupRateWindow 限制 difference 类 catch-up RPC（getChannelDifference /
 	// getPeerDialogs）的每用户频率（设计 Phase 2 / §10.3）：nudge 被消费后客户端会触发这两类
 	// catch-up，放开大群 nudge 全速前需 FLOOD_WAIT 兜底防风暴打爆 PG。两类各自独立计数、共用同一
@@ -107,8 +114,12 @@ type Router struct {
 	inlines          *inlineRegistry
 	webviews         *webViewRegistry
 	loginTokens      *loginTokenRegistry
+	botAPIUpdates    *botAPIUpdateNotifier
 	instanceID       string
 	channelFanout    *channelFanoutDispatcher
+	// botAPIEnqueueQueue 把 user→bot 私聊消息的 bot_api_updates 写入移出发送者 RPC 同步
+	// 路径（性能审计 H2）；队列满同步回退，绝不丢（队列行是 Bot API 投递真值）。
+	botAPIEnqueueQueue *botAPIEnqueueDispatcher
 
 	// presenceCandidateCache 缓存 presence fan-out 的候选 peer 集合（联系人 ∪ 私聊对端，
 	// online 过滤前），按 userID 短 TTL；零值 sync.Map 即可用，无需构造器初始化。候选集变动
@@ -170,8 +181,9 @@ func New(cfg Config, deps Deps, log *zap.Logger, clk clock.Clock) *Router {
 	if instanceID == "" {
 		instanceID = fmt.Sprintf("%016x", randomNonZeroInt64())
 	}
-	r := &Router{cfg: cfg, log: log, clock: clk, deps: deps, presence: newPresenceTracker(), callbacks: newCallbackRegistry(), inlines: newInlineRegistry(botInlineQueryTTL, deps.Inline), webviews: newWebViewRegistry(webViewSessionTTL, deps.Inline), loginTokens: newLoginTokenRegistry(), tempKeyResolveCache: newTempKeyResolveCache(cfg.TempKeyResolveCacheMaxEntries), storyProjectionCache: newStoryProjectionCache(clk.Now), storyPinnedCache: newStoryPinnedAvailableCache(clk.Now), storyPinnedListCache: newStoryPinnedStoriesCache(clk.Now), channelFullBotCache: newChannelFullBotInfoCache(clk.Now), userFullProjectionCache: newUserFullProjectionCache(clk.Now), peerSettingsProjectionCache: newPeerSettingsProjectionCache(clk.Now), channelFullProjectionCache: newChannelFullProjectionCache(clk.Now), emojiStickers: newEmojiStickerIndex(clk.Now), notifySettings: newNotifySettingsCache(clk.Now), stickerCatalog: newStickerCatalogCache(clk.Now), accountSettings: newAccountSettingsCache(clk.Now), instanceID: instanceID}
+	r := &Router{cfg: cfg, log: log, clock: clk, deps: deps, presence: newPresenceTracker(), callbacks: newCallbackRegistry(), inlines: newInlineRegistry(botInlineQueryTTL, deps.Inline), webviews: newWebViewRegistry(webViewSessionTTL, deps.Inline), loginTokens: newLoginTokenRegistry(), botAPIUpdates: newBotAPIUpdateNotifier(), tempKeyResolveCache: newTempKeyResolveCache(cfg.TempKeyResolveCacheMaxEntries), storyProjectionCache: newStoryProjectionCache(clk.Now), storyPinnedCache: newStoryPinnedAvailableCache(clk.Now), storyPinnedListCache: newStoryPinnedStoriesCache(clk.Now), channelFullBotCache: newChannelFullBotInfoCache(clk.Now), userFullProjectionCache: newUserFullProjectionCache(clk.Now), peerSettingsProjectionCache: newPeerSettingsProjectionCache(clk.Now), channelFullProjectionCache: newChannelFullProjectionCache(clk.Now), emojiStickers: newEmojiStickerIndex(clk.Now), notifySettings: newNotifySettingsCache(clk.Now), stickerCatalog: newStickerCatalogCache(clk.Now), accountSettings: newAccountSettingsCache(clk.Now), instanceID: instanceID}
 	r.channelFanout = newChannelFanoutDispatcher(r, defaultChannelFanoutShards, defaultChannelFanoutBuffer)
+	r.botAPIEnqueueQueue = newBotAPIEnqueueDispatcher(log, defaultBotAPIEnqueueBuffer)
 	r.webPageResolveSem = make(chan struct{}, webPageResolveConcurrency)
 	r.selfPhotoEchoPushDelay = defaultSelfPhotoEchoPushDelay
 	if cfg.DC > 0 {
@@ -211,6 +223,7 @@ func New(cfg Config, deps Deps, log *zap.Logger, clk clock.Clock) *Router {
 // 再按 TypeID 路由到 typed handler。满足 mtprotoedge.RPCHandler。
 func (r *Router) Dispatch(ctx context.Context, authKeyID [8]byte, sessionID int64, b *bin.Buffer) (bin.Encoder, error) {
 	preStart := r.clock.Now()
+	ctx = withInboundRPCBytes(ctx, b.Len())
 	ctx = WithRawAuthKeyID(ctx, authKeyID)
 	effectiveAuthKeyID, err := r.effectiveAuthKeyID(ctx, authKeyID, sessionID)
 	if err != nil {
@@ -295,12 +308,7 @@ func (r *Router) effectiveAuthKeyID(ctx context.Context, rawAuthKeyID [8]byte, s
 		hasCached bool
 	)
 	if r.deps.Sessions != nil {
-		if scoped, ok := r.deps.Sessions.(ScopedSessionBinder); ok {
-			if id, ok := scoped.AuthKeyIDForSession(rawAuthKeyID, sessionID); ok {
-				cached = id
-				hasCached = true
-			}
-		} else if id, ok := r.deps.Sessions.AuthKeyID(sessionID); ok {
+		if id, ok := r.deps.Sessions.AuthKeyIDForSession(rawAuthKeyID, sessionID); ok {
 			cached = id
 			hasCached = true
 		}
@@ -368,39 +376,22 @@ func (r *Router) effectiveAuthKeyID(ctx context.Context, rawAuthKeyID [8]byte, s
 
 func (r *Router) bindEffectiveAuthKey(rawAuthKeyID [8]byte, sessionID int64, effective [8]byte) {
 	if r.deps.Sessions != nil {
-		if scoped, ok := r.deps.Sessions.(ScopedSessionBinder); ok {
-			scoped.BindAuthKeyForSession(rawAuthKeyID, sessionID, effective)
-		} else {
-			r.deps.Sessions.BindAuthKey(sessionID, effective)
-		}
+		r.deps.Sessions.BindAuthKeyForSession(rawAuthKeyID, sessionID, effective)
 	}
 }
 
 func (r *Router) effectiveUserID(ctx context.Context, rawAuthKeyID, authKeyID [8]byte, sessionID int64) (int64, bool, error) {
 	if userID, ok := UserIDFrom(ctx); ok {
-		if scoped, ok := r.scopedSessions(); ok {
-			scoped.BindUserForAuthKey(rawAuthKeyID, sessionID, userID)
-		} else if r.deps.Sessions != nil {
-			r.deps.Sessions.BindUser(sessionID, userID)
+		if r.deps.Sessions != nil {
+			r.deps.Sessions.BindUserForAuthKey(rawAuthKeyID, sessionID, userID)
 		}
 		return userID, true, nil
 	}
 	if r.deps.Sessions != nil {
-		if scoped, ok := r.deps.Sessions.(ScopedSessionBinder); ok {
-			if userID, resolved := scoped.UserIDResolvedForAuthKey(rawAuthKeyID, sessionID); resolved {
-				if userID == 0 {
-					if cachedUserID, ok := r.positiveCachedAuthUser(authKeyID); ok {
-						scoped.BindUserForAuthKey(rawAuthKeyID, sessionID, cachedUserID)
-						r.announceSessionOnline(ctx, cachedUserID)
-						return cachedUserID, true, nil
-					}
-				}
-				return userID, userID != 0, nil
-			}
-		} else if userID, resolved := r.deps.Sessions.UserIDResolved(sessionID); resolved {
+		if userID, resolved := r.deps.Sessions.UserIDResolvedForAuthKey(rawAuthKeyID, sessionID); resolved {
 			if userID == 0 {
 				if cachedUserID, ok := r.positiveCachedAuthUser(authKeyID); ok {
-					r.deps.Sessions.BindUser(sessionID, cachedUserID)
+					r.deps.Sessions.BindUserForAuthKey(rawAuthKeyID, sessionID, cachedUserID)
 					r.announceSessionOnline(ctx, cachedUserID)
 					return cachedUserID, true, nil
 				}
@@ -421,32 +412,16 @@ func (r *Router) effectiveUserID(ctx context.Context, rawAuthKeyID, authKeyID [8
 		return 0, false, err
 	}
 	if r.deps.Sessions != nil {
-		if scoped, ok := r.deps.Sessions.(ScopedSessionBinder); ok {
-			if cachedUserID, resolved := scoped.UserIDResolvedForAuthKey(rawAuthKeyID, sessionID); resolved {
-				if cachedUserID != 0 || !found {
-					return cachedUserID, cachedUserID != 0, nil
-				}
-			}
-		} else {
-			if cachedUserID, resolved := r.deps.Sessions.UserIDResolved(sessionID); resolved {
-				if cachedUserID != 0 || !found {
-					return cachedUserID, cachedUserID != 0, nil
-				}
+		if cachedUserID, resolved := r.deps.Sessions.UserIDResolvedForAuthKey(rawAuthKeyID, sessionID); resolved {
+			if cachedUserID != 0 || !found {
+				return cachedUserID, cachedUserID != 0, nil
 			}
 		}
 		if found {
-			if scoped, ok := r.deps.Sessions.(ScopedSessionBinder); ok {
-				scoped.BindUserForAuthKey(rawAuthKeyID, sessionID, userID)
-			} else {
-				r.deps.Sessions.BindUser(sessionID, userID)
-			}
+			r.deps.Sessions.BindUserForAuthKey(rawAuthKeyID, sessionID, userID)
 			r.announceSessionOnline(ctx, userID)
 		} else {
-			if scoped, ok := r.deps.Sessions.(ScopedSessionBinder); ok {
-				scoped.BindUserForAuthKey(rawAuthKeyID, sessionID, 0)
-			} else {
-				r.deps.Sessions.BindUser(sessionID, 0)
-			}
+			r.deps.Sessions.BindUserForAuthKey(rawAuthKeyID, sessionID, 0)
 		}
 	}
 	return userID, found, nil
@@ -519,14 +494,6 @@ func (r *Router) invalidateAuthUserCache(authKeyID [8]byte) {
 	r.authUserSF.Forget(authKeyClientInfoSingleflightPrefix + key)
 }
 
-func (r *Router) scopedSessions() (ScopedSessionBinder, bool) {
-	if r.deps.Sessions == nil {
-		return nil, false
-	}
-	scoped, ok := r.deps.Sessions.(ScopedSessionBinder)
-	return scoped, ok
-}
-
 func (r *Router) dispatch(ctx context.Context, b *bin.Buffer, depth int) (bin.Encoder, error) {
 	if depth > maxWrapperDepth {
 		return nil, wrapperTooDeepErr()
@@ -574,8 +541,8 @@ func (r *Router) dispatch(ctx context.Context, b *bin.Buffer, depth int) (bin.En
 		if err != nil {
 			return nil, fmt.Errorf("decode invokeAfterMsgs msg_ids: %w", err)
 		}
-		if msgIDs > maxInvokeAfterMsgIDs {
-			return nil, fmt.Errorf("decode invokeAfterMsgs msg_ids: too many ids %d", msgIDs)
+		if msgIDs < 0 || msgIDs > maxInvokeAfterMsgIDs {
+			return nil, fmt.Errorf("decode invokeAfterMsgs msg_ids: invalid count %d", msgIDs)
 		}
 		for i := 0; i < msgIDs; i++ {
 			if _, err := b.Long(); err != nil {
@@ -639,6 +606,16 @@ func (r *Router) dispatch(ctx context.Context, b *bin.Buffer, depth int) (bin.En
 				}
 			}
 		}
+		knownRequest, structuralErr := layerwire.ValidateRoutableRequest(b.Buf)
+		if !knownRequest {
+			if structuralErr != nil {
+				return nil, mapLayerwirePreflightError(structuralErr)
+			}
+			// Unknown methods are opaque after the bounded/alignment check above: no generated
+			// decoder will touch their body. Route them directly to the compatibility fallback
+			// so every unknown constructor is traced, including pre-login probes.
+			return r.fallback(ctx, b)
+		}
 		if r.deps.Auth != nil {
 			if _, ok := UserIDFrom(ctx); !ok && !rpcAllowedWithoutAuthorization(id) {
 				fields := append([]zap.Field{
@@ -648,6 +625,16 @@ func (r *Router) dispatch(ctx context.Context, b *bin.Buffer, depth int) (bin.En
 				r.log.Info("RPC rejected before authorization", fields...)
 				return nil, authKeyUnregisteredErr()
 			}
+		}
+		if err := preflightRPCRequest(id, b); err != nil {
+			return nil, err
+		}
+		// Run the same allocation-free schema walker used by layer aliases/DrKLO transforms on
+		// every canonical request before gotd's generated decoder materializes vectors/bytes.
+		// Method-specific caps above preserve exact existing RPC errors; this generic budget
+		// closes variable-offset/nested-object paths and malformed constructor recursion.
+		if structuralErr != nil {
+			return nil, mapLayerwirePreflightError(structuralErr)
 		}
 		// 任何未包 invokeWithoutUpdates 的已登录 RPC 都把当前 session 视为 updates
 		// 接收者。仅靠 updates.getState/getDifference 置位会漏掉 DrKLO 热恢复：
@@ -675,6 +662,13 @@ func (r *Router) dispatch(ctx context.Context, b *bin.Buffer, depth int) (bin.En
 		}
 		return enc, err
 	}
+}
+
+func mapLayerwirePreflightError(err error) error {
+	if errors.Is(err, layerwire.ErrResourceLimit) {
+		return inputRequestTooLongErr()
+	}
+	return inputRequestInvalidErr()
 }
 
 func tlTypeName(id uint32) string {

@@ -100,6 +100,9 @@ func stickersetInvalidErr() error { return tgerr.New(406, "STICKERSET_INVALID") 
 // stickerInvalidErr 表示输入文档不是合法贴纸/GIF（faveSticker/saveRecentSticker/saveGif）。
 func stickerInvalidErr() error { return tgerr.New(400, "STICKER_DOCUMENT_INVALID") }
 
+// gifIDInvalidErr 表示 messages.saveGif 引用的文档不存在或不是规范 GIFv。
+func gifIDInvalidErr() error { return tgerr.New(400, "GIF_ID_INVALID") }
+
 func mediaCaptionTooLongErr() error { return tgerr.New(400, "MEDIA_CAPTION_TOO_LONG") }
 
 func replyMarkupInvalidErr() error { return tgerr.New(400, "REPLY_MARKUP_INVALID") }
@@ -271,6 +274,16 @@ func chatForwardsRestrictedErr() error { return tgerr.New(400, "CHAT_FORWARDS_RE
 
 func inputRequestInvalidErr() error { return tgerr.New(400, "INPUT_REQUEST_INVALID") }
 
+func inputRequestTooLongErr() error { return tgerr.New(400, "INPUT_REQUEST_TOO_LONG") }
+
+func inputTextEmptyErr() error            { return tgerr.New(400, "INPUT_TEXT_EMPTY") }
+func inputTextTooLongErr() error          { return tgerr.New(400, "INPUT_TEXT_TOO_LONG") }
+func toLangInvalidErr() error             { return tgerr.New(400, "TO_LANG_INVALID") }
+func translateReqFailedErr() error        { return tgerr.New(500, "TRANSLATE_REQ_FAILED") }
+func translateReqQuotaExceededErr() error { return tgerr.New(400, "TRANSLATE_REQ_QUOTA_EXCEEDED") }
+func translationsDisabledErr() error      { return tgerr.New(406, "TRANSLATIONS_DISABLED") }
+func translationTimeoutErr() error        { return tgerr.New(500, "TRANSLATION_TIMEOUT") }
+
 func persistentTimestampInvalidErr() error { return tgerr.New(400, "PERSISTENT_TIMESTAMP_INVALID") }
 
 func channelForumMissingErr() error { return tgerr.New(400, "CHANNEL_FORUM_MISSING") }
@@ -280,6 +293,10 @@ func topicIDInvalidErr() error  { return tgerr.New(400, "TOPIC_ID_INVALID") }
 
 // randomIDEmptyErr 表示发送消息缺少 random_id。
 func randomIDEmptyErr() error { return tgerr.New(400, "RANDOM_ID_EMPTY") }
+
+// randomIDDuplicateErr 表示同一发送者重复使用 random_id，但请求载荷与首次
+// 成功发送不一致。Layer 227 为该错误定义的 code 是 500。
+func randomIDDuplicateErr() error { return tgerr.New(500, "RANDOM_ID_DUPLICATE") }
 
 // scheduleDateInvalidErr 表示当前阶段不支持定时消息。
 func scheduleDateInvalidErr() error { return tgerr.New(400, "SCHEDULE_DATE_INVALID") }
@@ -295,8 +312,35 @@ func floodWaitErr(seconds int) error {
 // phoneNumberInvalidErr 表示手机号为空或格式非法（auth.sendCode/signIn/signUp）。
 func phoneNumberInvalidErr() error { return tgerr.New(406, "PHONE_NUMBER_INVALID") }
 
+func phoneNumberOccupiedErr() error { return tgerr.New(400, "PHONE_NUMBER_OCCUPIED") }
+func phoneCodeEmptyErr() error      { return tgerr.New(400, "PHONE_CODE_EMPTY") }
+func phoneCodeInvalidErr() error    { return tgerr.New(400, "PHONE_CODE_INVALID") }
+func phoneCodeExpiredErr() error    { return tgerr.New(400, "PHONE_CODE_EXPIRED") }
+
+func phoneChangeErr(err error) error {
+	switch {
+	case errors.Is(err, domain.ErrPhoneNumberInvalid):
+		return phoneNumberInvalidErr()
+	case errors.Is(err, domain.ErrPhoneNumberOccupied):
+		return phoneNumberOccupiedErr()
+	case errors.Is(err, domain.ErrPhoneCodeEmpty):
+		return phoneCodeEmptyErr()
+	case errors.Is(err, domain.ErrPhoneCodeInvalid):
+		return phoneCodeInvalidErr()
+	case errors.Is(err, domain.ErrPhoneCodeExpired):
+		return phoneCodeExpiredErr()
+	case errors.Is(err, domain.ErrPhoneChangeAuthInvalid):
+		return authKeyUnregisteredErr()
+	case errors.Is(err, domain.ErrPhoneChangeForbidden):
+		return tgerr.New(400, "BOT_METHOD_INVALID")
+	default:
+		return internalErr()
+	}
+}
+
 // authKeyUnregisteredErr 表示请求要求登录态而当前连接未授权。
 func authKeyUnregisteredErr() error { return tgerr.New(401, "AUTH_KEY_UNREGISTERED") }
+func botMethodInvalidErr() error    { return tgerr.New(400, "BOT_METHOD_INVALID") }
 
 // 私聊通话（phone.*）错误；触发点见 internal/rpc/phone_calls.go 与 app/phone 错误映射。
 func callPeerInvalidErr() error     { return tgerr.New(400, "CALL_PEER_INVALID") }

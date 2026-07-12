@@ -379,8 +379,14 @@ ORDER BY id`, channel.ID, id32)
 	deleted32 := int32s(deleted)
 	if _, err := tx.Exec(ctx, `
 UPDATE channel_messages
-SET deleted = true, pts = $3, updated_at = now()
-WHERE channel_id = $1 AND id = ANY($2::int[])`, channel.ID, deleted32, pts); err != nil {
+SET deleted = true,
+    pts = $3,
+    delete_pts = $3,
+    delete_pts_count = $4,
+    delete_date = $5,
+    delete_message_ids = to_jsonb($2::int[]),
+    updated_at = now()
+WHERE channel_id = $1 AND id = ANY($2::int[])`, channel.ID, deleted32, pts, len(deleted), date); err != nil {
 		return nil, domain.ChannelUpdateEvent{}, channel, fmt.Errorf("soft delete channel messages: %w", err)
 	}
 	if err := deleteChannelUnreadMentionsTx(ctx, tx, channel.ID, deleted); err != nil {
@@ -411,9 +417,8 @@ RETURNING pinned_message_id`, channel.ID, topID, pts).Scan(&latestPinned); err !
 	channel.TopMessageID = topID
 	channel.Pts = pts
 	channel.PinnedMessageID = latestPinned
-	if err := refreshChannelDialogsAfterDeleteTx(ctx, tx, channel); err != nil {
-		return nil, domain.ChannelUpdateEvent{}, channel, err
-	}
+	// 删除后不再对全员刷新 channel_dialogs 缓存行（性能审计 H4a）：unread 读时由
+	// 可见 incoming 消息动态派生（deleted 自动出列），top 由 channels.top_message_id 提供。
 	event := domain.ChannelUpdateEvent{
 		ChannelID:    channel.ID,
 		Type:         domain.ChannelUpdateDeleteMessages,

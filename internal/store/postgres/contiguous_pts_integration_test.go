@@ -169,7 +169,7 @@ func TestDispatchOutboxLifecycleKeepsDurableEvents(t *testing.T) {
 			Peer:     domain.Peer{Type: domain.PeerTypeUser, ID: owner.ID + int64(pts)},
 			Bool:     pts%2 == 0,
 		}
-		if _, err := events.AppendAllocatedWithDispatch(ctx, owner.ID, event, [8]byte{}, sessionID); err != nil {
+		if _, err := events.AppendAllocatedWithDispatch(ctx, owner.ID, event, [8]byte{1}, sessionID); err != nil {
 			t.Fatalf("AppendAllocatedWithDispatch pts=%d: %v", pts, err)
 		}
 		if _, err := tx.Exec(ctx, `
@@ -217,7 +217,7 @@ func TestDispatchOutboxLifecycleKeepsDurableEvents(t *testing.T) {
 	if len(claimed) != 1 || claimed[0].TargetUserID != owner.ID || claimed[0].Pts != 1 || claimed[0].Attempts != 1 || claimed[0].ExcludeSessionID != 101 {
 		t.Fatalf("claimed first = %+v, want owner pts=1 attempts=1", claimed)
 	}
-	if err := outbox.MarkDelivered(ctx, owner.ID, claimed[0].ID); err != nil {
+	if err := outbox.MarkDelivered(ctx, claimed[0]); err != nil {
 		t.Fatalf("MarkDelivered: %v", err)
 	}
 	if got := outboxRows(1); got != 0 {
@@ -246,7 +246,7 @@ func TestDispatchOutboxLifecycleKeepsDurableEvents(t *testing.T) {
 	if len(claimed) != 1 || claimed[0].TargetUserID != owner.ID || claimed[0].Pts != 2 || claimed[0].Attempts != 2 {
 		t.Fatalf("claimed stale = %+v, want owner pts=2 attempts=2", claimed)
 	}
-	if err := outbox.MarkFailed(ctx, owner.ID, claimed[0].ID, "temporary"); err != nil {
+	if err := outbox.MarkFailed(ctx, claimed[0], "temporary"); err != nil {
 		t.Fatalf("MarkFailed temporary: %v", err)
 	}
 	var status string
@@ -275,7 +275,8 @@ func TestDispatchOutboxLifecycleKeepsDurableEvents(t *testing.T) {
 	`, owner.ID, claimed[0].ID); err != nil {
 		t.Fatalf("prepare terminal failure: %v", err)
 	}
-	if err := outbox.MarkFailed(ctx, owner.ID, claimed[0].ID, "permanent"); err != nil {
+	claimed[0].Attempts = 5
+	if err := outbox.MarkFailed(ctx, claimed[0], "permanent"); err != nil {
 		t.Fatalf("MarkFailed permanent: %v", err)
 	}
 	if err := tx.QueryRow(ctx, `

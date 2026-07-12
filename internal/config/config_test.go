@@ -22,6 +22,15 @@ func TestLoadDefaultsAdvertiseIPToLoopback(t *testing.T) {
 	if cfg.PublicBaseURL != "https://telesrv.net" {
 		t.Fatalf("PublicBaseURL = %q, want https://telesrv.net", cfg.PublicBaseURL)
 	}
+	if cfg.PublicAppScheme != "telesrv" {
+		t.Fatalf("PublicAppScheme = %q, want telesrv", cfg.PublicAppScheme)
+	}
+	if cfg.PublicWebBaseURL != "https://web.telesrv.net" {
+		t.Fatalf("PublicWebBaseURL = %q, want https://web.telesrv.net", cfg.PublicWebBaseURL)
+	}
+	if cfg.PublicAppName != "telesrv" {
+		t.Fatalf("PublicAppName = %q, want telesrv", cfg.PublicAppName)
+	}
 }
 
 func TestLoadUsesExplicitAdvertiseIP(t *testing.T) {
@@ -34,6 +43,62 @@ func TestLoadUsesExplicitAdvertiseIP(t *testing.T) {
 	}
 	if cfg.AdvertiseIP != "203.0.113.10" {
 		t.Fatalf("AdvertiseIP = %q, want explicit env", cfg.AdvertiseIP)
+	}
+}
+
+func TestLoadMTProtoAdmissionAndRPCBudgets(t *testing.T) {
+	disableDefaultConfigFile(t)
+	t.Setenv("TELESRV_MTPROTO_MAX_CONNECTIONS", "12345")
+	t.Setenv("TELESRV_MTPROTO_MAX_CONNECTIONS_PER_IP", "234")
+	t.Setenv("TELESRV_MTPROTO_MAX_CONCURRENT_HANDSHAKES", "45")
+	t.Setenv("TELESRV_MTPROTO_RPC_MAX_INFLIGHT", "7")
+	t.Setenv("TELESRV_MTPROTO_RPC_QUEUE_SIZE", "19")
+	t.Setenv("TELESRV_MTPROTO_RPC_TIMEOUT", "9s")
+	t.Setenv("TELESRV_MTPROTO_RPC_GLOBAL_WORKERS", "33")
+	t.Setenv("TELESRV_MTPROTO_RPC_GLOBAL_MAX_TASKS", "444")
+	t.Setenv("TELESRV_MTPROTO_RPC_GLOBAL_MAX_BYTES", "555555")
+	t.Setenv("TELESRV_MTPROTO_INBOUND_FRAME_GLOBAL_MAX_BYTES", "777777")
+	t.Setenv("TELESRV_MTPROTO_OUTBOUND_QUEUE_SIZE", "88")
+	t.Setenv("TELESRV_MTPROTO_OUTBOUND_CONTROL_QUEUE_SIZE", "22")
+	t.Setenv("TELESRV_MTPROTO_OUTBOUND_TRACKED_GLOBAL_MAX_BYTES", "888888")
+	t.Setenv("TELESRV_MTPROTO_OUTBOUND_WRITE_GLOBAL_MAX_BYTES", "999999")
+	t.Setenv("TELESRV_TEMP_KEY_CACHE_MAX_ENTRIES", "666")
+	t.Setenv("TELESRV_TEMP_KEY_CACHE_TTL", "17m")
+	t.Setenv("TELESRV_ORPHAN_AUTH_KEY_RETENTION", "36h")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MTProtoMaxConnections != 12345 || cfg.MTProtoMaxConnectionsPerIP != 234 || cfg.MTProtoMaxConcurrentHandshakes != 45 {
+		t.Fatalf("admission config = %d/%d/%d", cfg.MTProtoMaxConnections, cfg.MTProtoMaxConnectionsPerIP, cfg.MTProtoMaxConcurrentHandshakes)
+	}
+	if cfg.MTProtoRPCMaxInflight != 7 || cfg.MTProtoRPCQueueSize != 19 || cfg.MTProtoRPCTimeout != 9*time.Second ||
+		cfg.MTProtoRPCGlobalWorkers != 33 || cfg.MTProtoRPCGlobalMaxTasks != 444 || cfg.MTProtoRPCGlobalMaxBytes != 555555 {
+		t.Fatalf("rpc budget config = %d/%d/%v/%d/%d/%d", cfg.MTProtoRPCMaxInflight, cfg.MTProtoRPCQueueSize, cfg.MTProtoRPCTimeout, cfg.MTProtoRPCGlobalWorkers, cfg.MTProtoRPCGlobalMaxTasks, cfg.MTProtoRPCGlobalMaxBytes)
+	}
+	if cfg.MTProtoInboundFrameGlobalMaxBytes != 777777 {
+		t.Fatalf("inbound frame budget config = %d", cfg.MTProtoInboundFrameGlobalMaxBytes)
+	}
+	if cfg.MTProtoOutboundQueueSize != 88 || cfg.MTProtoOutboundControlQueueSize != 22 || cfg.MTProtoOutboundTrackedGlobalMaxBytes != 888888 || cfg.MTProtoOutboundWriteGlobalMaxBytes != 999999 {
+		t.Fatalf("outbound config = %d/%d/%d/%d", cfg.MTProtoOutboundQueueSize, cfg.MTProtoOutboundControlQueueSize, cfg.MTProtoOutboundTrackedGlobalMaxBytes, cfg.MTProtoOutboundWriteGlobalMaxBytes)
+	}
+	if cfg.TempKeyResolveCacheMaxEntries != 666 || cfg.TempKeyResolveCacheTTL != 17*time.Minute || cfg.OrphanAuthKeyRetention != 36*time.Hour {
+		t.Fatalf("auth key resource config = %d/%v/%v", cfg.TempKeyResolveCacheMaxEntries, cfg.TempKeyResolveCacheTTL, cfg.OrphanAuthKeyRetention)
+	}
+}
+
+func TestLoadOutboxPoisonPolicy(t *testing.T) {
+	disableDefaultConfigFile(t)
+	t.Setenv("TELESRV_OUTBOX_POISON_RETENTION", "2m")
+	t.Setenv("TELESRV_OUTBOX_POISON_CLEANUP_INTERVAL", "7s")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.OutboxPoisonRetention != 2*time.Minute || cfg.OutboxPoisonCleanupInterval != 7*time.Second {
+		t.Fatalf("outbox poison policy = %v/%v, want 2m/7s", cfg.OutboxPoisonRetention, cfg.OutboxPoisonCleanupInterval)
 	}
 }
 
@@ -76,8 +141,11 @@ func TestLoadLoginEmailDefaultsDisabled(t *testing.T) {
 	if cfg.LoginEmailRequireSetup {
 		t.Fatal("LoginEmailRequireSetup = true, want false")
 	}
-	if cfg.AuthCodeTTL != 5*time.Minute || cfg.AuthCodeMaxAttempts != 5 || cfg.LoginEmailCodeLength != 6 {
-		t.Fatalf("auth/login email defaults = %v/%d/%d", cfg.AuthCodeTTL, cfg.AuthCodeMaxAttempts, cfg.LoginEmailCodeLength)
+	if cfg.AuthCodeTTL != 5*time.Minute || cfg.AuthCodeMaxAttempts != 5 || cfg.LoginEmailCodeLength != 6 ||
+		cfg.AuthCodePhoneRateLimit != 5 || cfg.AuthCodeAuthKeyRateLimit != 20 || cfg.AuthCodeRateWindow != 10*time.Minute {
+		t.Fatalf("auth/login email defaults = ttl=%v attempts=%d length=%d phone_limit=%d key_limit=%d window=%v",
+			cfg.AuthCodeTTL, cfg.AuthCodeMaxAttempts, cfg.LoginEmailCodeLength,
+			cfg.AuthCodePhoneRateLimit, cfg.AuthCodeAuthKeyRateLimit, cfg.AuthCodeRateWindow)
 	}
 }
 
@@ -87,6 +155,9 @@ func TestLoadLoginEmailSMTPConfig(t *testing.T) {
 	t.Setenv("TELESRV_LOGIN_EMAIL_REQUIRE_SETUP", "true")
 	t.Setenv("TELESRV_AUTH_CODE_TTL", "3m")
 	t.Setenv("TELESRV_AUTH_CODE_MAX_ATTEMPTS", "4")
+	t.Setenv("TELESRV_AUTH_CODE_PHONE_RATE_LIMIT", "3")
+	t.Setenv("TELESRV_AUTH_CODE_AUTH_KEY_RATE_LIMIT", "9")
+	t.Setenv("TELESRV_AUTH_CODE_RATE_WINDOW", "2m")
 	t.Setenv("TELESRV_LOGIN_EMAIL_CODE_LENGTH", "7")
 	t.Setenv("TELESRV_SMTP_HOST", "smtp.example.test")
 	t.Setenv("TELESRV_SMTP_PORT", "2525")
@@ -103,8 +174,11 @@ func TestLoadLoginEmailSMTPConfig(t *testing.T) {
 	if !cfg.LoginEmailEnable || !cfg.LoginEmailRequireSetup {
 		t.Fatalf("login email flags = %v/%v, want true/true", cfg.LoginEmailEnable, cfg.LoginEmailRequireSetup)
 	}
-	if cfg.AuthCodeTTL != 3*time.Minute || cfg.AuthCodeMaxAttempts != 4 || cfg.LoginEmailCodeLength != 7 {
-		t.Fatalf("auth/login email config = %v/%d/%d", cfg.AuthCodeTTL, cfg.AuthCodeMaxAttempts, cfg.LoginEmailCodeLength)
+	if cfg.AuthCodeTTL != 3*time.Minute || cfg.AuthCodeMaxAttempts != 4 || cfg.LoginEmailCodeLength != 7 ||
+		cfg.AuthCodePhoneRateLimit != 3 || cfg.AuthCodeAuthKeyRateLimit != 9 || cfg.AuthCodeRateWindow != 2*time.Minute {
+		t.Fatalf("auth/login email config = ttl=%v attempts=%d length=%d phone_limit=%d key_limit=%d window=%v",
+			cfg.AuthCodeTTL, cfg.AuthCodeMaxAttempts, cfg.LoginEmailCodeLength,
+			cfg.AuthCodePhoneRateLimit, cfg.AuthCodeAuthKeyRateLimit, cfg.AuthCodeRateWindow)
 	}
 	if cfg.SMTPHost != "smtp.example.test" || cfg.SMTPPort != 2525 || cfg.SMTPUsername != "smtp-user" || cfg.SMTPPassword != "smtp-pass" || cfg.SMTPFrom != "noreply@example.test" || cfg.SMTPTLSMode != "none" || cfg.SMTPTimeout != 2*time.Second {
 		t.Fatalf("smtp config = %#v", cfg)
@@ -175,6 +249,25 @@ func TestLoadAIProviders(t *testing.T) {
 	}
 }
 
+func TestLoadTranslationConfig(t *testing.T) {
+	t.Setenv("TELESRV_CONFIG", "")
+	t.Setenv("TELESRV_TRANSLATION_ENABLED", "true")
+	t.Setenv("TELESRV_TRANSLATION_PROVIDERS", "openai,gemini")
+	t.Setenv("TELESRV_TRANSLATION_TIMEOUT", "9s")
+	t.Setenv("TELESRV_TRANSLATION_RATE_LIMIT", "17")
+	t.Setenv("TELESRV_TRANSLATION_RATE_WINDOW", "2m")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.TranslationEnabled || len(cfg.TranslationProviders) != 2 || cfg.TranslationProviders[0] != "openai" || cfg.TranslationProviders[1] != "gemini" {
+		t.Fatalf("translation providers = %#v", cfg.TranslationProviders)
+	}
+	if cfg.TranslationTimeout != 9*time.Second || cfg.TranslationRateLimit != 17 || cfg.TranslationRateWindow != 2*time.Minute {
+		t.Fatalf("translation limits = %v/%d/%v", cfg.TranslationTimeout, cfg.TranslationRateLimit, cfg.TranslationRateWindow)
+	}
+}
+
 func TestLoadReadsEnvStyleConfigFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "telesrv.env")
 	writeConfigFile(t, path, `
@@ -183,6 +276,9 @@ TELESRV_POSTGRES_MAX_CONNS=77
 TELESRV_WEBSOCKET_ALLOWED_ORIGINS=https://one.example, https://two.example
 TELESRV_CALL_RING_TIMEOUT=2m
 TELESRV_PUBLIC_BASE_URL=links.example.test/root
+TELESRV_PUBLIC_APP_SCHEME=example-chat
+TELESRV_PUBLIC_WEB_BASE_URL=web.example.test/client
+TELESRV_PUBLIC_APP_NAME=Example Chat
 TELESRV_PUBLIC_LINK_WEB_ADDR=127.0.0.1:2401
 `)
 	t.Setenv("TELESRV_CONFIG", path)
@@ -209,6 +305,15 @@ TELESRV_PUBLIC_LINK_WEB_ADDR=127.0.0.1:2401
 	if cfg.PublicBaseURL != "https://links.example.test/root" {
 		t.Fatalf("PublicBaseURL = %q, want https://links.example.test/root", cfg.PublicBaseURL)
 	}
+	if cfg.PublicAppScheme != "example-chat" {
+		t.Fatalf("PublicAppScheme = %q, want example-chat", cfg.PublicAppScheme)
+	}
+	if cfg.PublicWebBaseURL != "https://web.example.test/client" {
+		t.Fatalf("PublicWebBaseURL = %q, want https://web.example.test/client", cfg.PublicWebBaseURL)
+	}
+	if cfg.PublicAppName != "Example Chat" {
+		t.Fatalf("PublicAppName = %q, want Example Chat", cfg.PublicAppName)
+	}
 }
 
 func TestLoadNormalizesLocalPublicBaseURL(t *testing.T) {
@@ -221,6 +326,61 @@ func TestLoadNormalizesLocalPublicBaseURL(t *testing.T) {
 	}
 	if cfg.PublicBaseURL != "http://127.0.0.1:2401" {
 		t.Fatalf("PublicBaseURL = %q, want http://127.0.0.1:2401", cfg.PublicBaseURL)
+	}
+}
+
+func TestLoadRejectsInvalidPublicBaseURL(t *testing.T) {
+	disableDefaultConfigFile(t)
+	t.Setenv("TELESRV_PUBLIC_BASE_URL", "https://links.example.test/root?tenant=one")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load succeeded with a query-bearing public base URL")
+	}
+}
+
+func TestLoadRejectsInvalidPublicLinkClientConfig(t *testing.T) {
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "official scheme", key: "TELESRV_PUBLIC_APP_SCHEME", value: "tg"},
+		{name: "malformed scheme", key: "TELESRV_PUBLIC_APP_SCHEME", value: "bad scheme"},
+		{name: "invalid web base", key: "TELESRV_PUBLIC_WEB_BASE_URL", value: "file:///tmp/client"},
+		{name: "empty app name after trim", key: "TELESRV_PUBLIC_APP_NAME", value: "   "},
+		{name: "control in app name", key: "TELESRV_PUBLIC_APP_NAME", value: "bad\nname"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			disableDefaultConfigFile(t)
+			t.Setenv(tc.key, tc.value)
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load succeeded with %s=%q", tc.key, tc.value)
+			}
+		})
+	}
+}
+
+func TestLoadExplicitEmptyEnvironmentDisablesNullableListeners(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "telesrv.env")
+	writeConfigFile(t, path, `
+TELESRV_DEBUG_ADDR=127.0.0.1:6060
+TELESRV_BOT_API_ADDR=127.0.0.1:8081
+TELESRV_ADMIN_API_ADDR=127.0.0.1:2599
+TELESRV_PUBLIC_LINK_WEB_ADDR=127.0.0.1:2401
+`)
+	t.Setenv("TELESRV_CONFIG", path)
+	t.Setenv("TELESRV_DEBUG_ADDR", "")
+	t.Setenv("TELESRV_BOT_API_ADDR", "")
+	t.Setenv("TELESRV_ADMIN_API_ADDR", "")
+	t.Setenv("TELESRV_PUBLIC_LINK_WEB_ADDR", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.DebugAddr != "" || cfg.BotAPIAddr != "" || cfg.AdminAPIAddr != "" || cfg.PublicLinkWebAddr != "" {
+		t.Fatalf("nullable listeners were not disabled: debug=%q bot=%q admin=%q public=%q", cfg.DebugAddr, cfg.BotAPIAddr, cfg.AdminAPIAddr, cfg.PublicLinkWebAddr)
 	}
 }
 

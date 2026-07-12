@@ -73,38 +73,6 @@ func (s *AuthKeyStore) Delete(_ context.Context, id [8]byte) error {
 	return nil
 }
 
-// SessionStore 是 store.SessionStore 的内存实现。
-type SessionStore struct {
-	mu       sync.RWMutex
-	sessions map[int64]store.SessionData
-}
-
-// NewSessionStore 创建内存 SessionStore。
-func NewSessionStore() *SessionStore {
-	return &SessionStore{sessions: make(map[int64]store.SessionData)}
-}
-
-func (s *SessionStore) Save(_ context.Context, d store.SessionData) error {
-	s.mu.Lock()
-	s.sessions[d.ID] = d
-	s.mu.Unlock()
-	return nil
-}
-
-func (s *SessionStore) Get(_ context.Context, id int64) (store.SessionData, bool, error) {
-	s.mu.RLock()
-	d, ok := s.sessions[id]
-	s.mu.RUnlock()
-	return d, ok, nil
-}
-
-func (s *SessionStore) Delete(_ context.Context, id int64) error {
-	s.mu.Lock()
-	delete(s.sessions, id)
-	s.mu.Unlock()
-	return nil
-}
-
 // TempAuthKeyBindingStore 是 store.TempAuthKeyBindingStore 的内存实现。
 type TempAuthKeyBindingStore struct {
 	mu sync.RWMutex
@@ -262,17 +230,33 @@ func (s *AuthorizationStore) DeleteByUserExcept(_ context.Context, userID int64,
 
 // CodeStore 是 store.CodeStore 的内存实现（带 TTL）。
 type CodeStore struct {
-	mu sync.Mutex
-	m  map[string]codeEntry
+	mu     sync.Mutex
+	m      map[string]codeEntry
+	scopes map[store.PhoneCodeScope]string
 }
 
 // NewCodeStore 创建内存 CodeStore。
 func NewCodeStore() *CodeStore {
-	return &CodeStore{m: make(map[string]codeEntry)}
+	return &CodeStore{
+		m:      make(map[string]codeEntry),
+		scopes: make(map[store.PhoneCodeScope]string),
+	}
 }
 
 func (s *CodeStore) Set(_ context.Context, hash string, code store.PhoneCode, ttl time.Duration) error {
+	revision, err := store.NewPhoneCodeRevisionToken()
+	if err != nil {
+		return err
+	}
+	code.Revision = revision
 	s.mu.Lock()
+	scope := code.Scope()
+	if scope.Valid() {
+		if oldHash, ok := s.scopes[scope]; ok && oldHash != hash {
+			delete(s.m, oldHash)
+		}
+		s.scopes[scope] = hash
+	}
 	s.m[hash] = codeEntry{code: code, expires: time.Now().Add(ttl)}
 	s.mu.Unlock()
 	return nil
@@ -283,16 +267,27 @@ func (s *CodeStore) Get(_ context.Context, hash string) (store.PhoneCode, bool, 
 	defer s.mu.Unlock()
 	e, ok := s.m[hash]
 	if !ok || time.Now().After(e.expires) {
+		if ok {
+			s.deleteCodeLocked(hash, e.code)
+		}
 		return store.PhoneCode{}, false, nil
 	}
 	return e.code, true, nil
 }
 
 func (s *CodeStore) Update(_ context.Context, hash string, code store.PhoneCode) error {
+	revision, err := store.NewPhoneCodeRevisionToken()
+	if err != nil {
+		return err
+	}
+	code.Revision = revision
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e, ok := s.m[hash]
 	if !ok || time.Now().After(e.expires) {
+		if ok {
+			s.deleteCodeLocked(hash, e.code)
+		}
 		return nil
 	}
 	e.code = code
@@ -302,7 +297,47 @@ func (s *CodeStore) Update(_ context.Context, hash string, code store.PhoneCode)
 
 func (s *CodeStore) Del(_ context.Context, hash string) error {
 	s.mu.Lock()
-	delete(s.m, hash)
+	if e, ok := s.m[hash]; ok {
+		s.deleteCodeLocked(hash, e.code)
+	} else {
+		delete(s.m, hash)
+	}
 	s.mu.Unlock()
 	return nil
+}
+
+func (s *CodeStore) ConsumeScoped(_ context.Context, hash string, scope store.PhoneCodeScope) (store.PhoneCode, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !scope.Valid() || s.scopes[scope] != hash {
+		return store.PhoneCode{}, false, nil
+	}
+	e, ok := s.m[hash]
+	if !ok || time.Now().After(e.expires) {
+		if ok {
+			s.deleteCodeLocked(hash, e.code)
+		} else {
+			delete(s.scopes, scope)
+		}
+		return store.PhoneCode{}, false, nil
+	}
+	if e.code.Version != store.PhoneCodeVersionCurrent || e.code.Scope() != scope {
+		delete(s.m, hash)
+		delete(s.scopes, scope)
+		actualScope := e.code.Scope()
+		if actualScope.Valid() && s.scopes[actualScope] == hash {
+			delete(s.scopes, actualScope)
+		}
+		return store.PhoneCode{}, false, nil
+	}
+	s.deleteCodeLocked(hash, e.code)
+	return e.code, true, nil
+}
+
+func (s *CodeStore) deleteCodeLocked(hash string, code store.PhoneCode) {
+	delete(s.m, hash)
+	scope := code.Scope()
+	if scope.Valid() && s.scopes[scope] == hash {
+		delete(s.scopes, scope)
+	}
 }

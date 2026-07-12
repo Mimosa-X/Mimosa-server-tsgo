@@ -41,15 +41,16 @@ https://github.com/user-attachments/assets/25e651dc-a022-4d60-8b9b-ca3e8bfe216c
 | ✅ | 登录与账号 | 开发验证码登录、sign-in、sign-up、log-out、授权设备、账号设置、SRP/password 状态、email/passkey 相关路径。 |
 | ✅ | 用户与联系人 | 用户资料、username、头像、联系人导入/搜索、block/privacy 状态、presence、last seen。 |
 | ✅ | 会话与同步 | dialog list、置顶、手动未读、folders/filters、草稿、read boundary、durable updates、在线 fan-out、离线 difference 恢复。 |
-| ✅ | Chatlists 与公开链接 | 聊天文件夹分享、chatlist invite links、加入/导入流程、撤销邀请处理，以及统一公开链接落地页。 |
+| ✅ | Chatlists 与公开链接 | 聊天文件夹分享、chatlist invite links、加入/导入流程、撤销邀请处理、公开 username 落地页，以及统一公开链接落地页。 |
 | ✅ | 私聊消息 | send、history、read receipts、edit、delete、forward、reply、富文本实体、媒体/相册消息、reactions、scheduled/TTL 相关路径。 |
 | ✅ | 富文本消息 | Telegram Desktop rich text message、富文本内容转换、send/edit/scheduled 流程、dialog/history 投影，以及 memory/PostgreSQL 持久化。 |
 | ✅ | AI 输入框与 ChatBot | 输入框改写/润色、默认和自定义 tone、addstyle 预览、本地与外部 provider 链、流式 `@ChatBot` 草稿回复、Business AI 回复钩子。 |
-| ✅ | 超级群与频道 | create、join、leave、邀请链接、成员、管理员、forum topics、history、send/edit/delete/read、reactions、公开搜索和预览。 |
-| ✅ | 媒体与文件 | upload、download、本地 blob 存储、照片、文档、缩略图、外链媒体抓取、网页预览、地图缩略图缓存、用户/频道头像。 |
-| ✅ | Stickers 与 Reactions | sticker/reaction catalog、seed 支持、recent reactions、top reactions、default reactions、reaction moderation 相关路径。 |
+| ✅ | 消息翻译 | Telegram `messages.translateText`、provider-backed 批量翻译、peer 语言设置、单账号限流，以及默认不记录正文的日志策略。 |
+| ✅ | 超级群与频道 | create、join、leave、邀请链接、成员、管理员、forum topics、关联讨论组 guest 访问、history、send/edit/delete/read、reactions、公开搜索和预览。 |
+| ✅ | 媒体与文件 | upload、download、本地 blob 存储、照片、文档、缩略图、规范 GIFv 转换、外链媒体抓取、网页预览、地图缩略图缓存、用户/频道头像。 |
+| ✅ | Stickers 与 Reactions | sticker/reaction catalog、seed 支持、saved GIFs、recent reactions、top reactions、default reactions、reaction moderation 相关路径。 |
 | ✅ | Gifts 与 Stars | star gifts、本地 stars ledger 基础，用于兼容和后续功能扩展。 |
-| ✅ | Bots 与 Mini Apps | bot 服务基础、callbacks、inline helpers、webview/mini-app 路径、最小 Bot API gateway、demo 工具。 |
+| ✅ | Bots 与 Mini Apps | bot 服务基础、callbacks、inline helpers、webview/mini-app 路径、适配 `python-telegram-bot` 等库的最小 Bot API gateway、持久化 `getUpdates` 投递队列和 demo 工具。 |
 | ✅ | 通话与直播 | 私聊通话信令基础、group call 状态、RTMP live stream、定时视频通话、频道 `join_as` 身份、SFU/TURN building blocks、liveness 与 expiry worker。 |
 | ✅ | 管理与运维 | Admin API/UI backend、PostgreSQL migrations、Redis 易失态、retention workers、pprof/debug hooks、load-test helpers。 |
 | ✅ | Desktop、Android 与 Web 兼容 | Telegram Desktop 是第一目标，Android 与 Web 兼容路径也由同一套 server 持续覆盖。 |
@@ -90,29 +91,41 @@ go build -o bin/gramsrv ./cmd/telesrv
 
 常用本地环境变量：
 
+完整说明见[中文配置参数手册](docs/configuration.zh-CN.md)和
+[英文配置参数手册](docs/configuration.en.md)。`.env.example` 只作为可直接复制的开发模板，
+不再承担完整参数字典的职责。
+
 | 变量 | 默认值 | 说明 |
 |---|---:|---|
 | `TELESRV_LISTEN` | `0.0.0.0:2398` | MTProto 监听地址 |
-| `TELESRV_ADVERTISE_IP` | `127.0.0.1` | 下发给兼容客户端的连接 IP |
+| `TELESRV_ADVERTISE_IP` | `127.0.0.1` | 媒体与通话使用的客户端可达回退 IP |
 | `TELESRV_DC` | `2` | 自建 DC id |
 | `TELESRV_DEV_AUTH_CODE` | `12345` | 本地开发固定登录验证码 |
 | `TELESRV_AUTH_CODE_MAX_ATTEMPTS` | `5` | 同一验证码 hash 允许的错误次数，达到后删除并要求重发 |
 | `TELESRV_LOGIN_EMAIL_ENABLE` | `false` | 已绑定登录邮箱的账号通过 SMTP 接收登录验证码 |
 | `TELESRV_LOGIN_EMAIL_REQUIRE_SETUP` | `false` | 登录/注册时强制先设置登录邮箱 |
 | `TELESRV_SMTP_HOST` | 空 | 开启登录邮箱验证时使用的 SMTP host |
-| `TELESRV_PUBLIC_BASE_URL` | `https://telesrv.net` | sticker/chatlist 公开链接的 canonical base URL |
+| `TELESRV_PUBLIC_BASE_URL` | `https://telesrv.net` | username、sticker、emoji、chatlist 公开链接使用的外部 canonical base URL |
+| `TELESRV_PUBLIC_APP_SCHEME` | `telesrv` | 公开落地页唤起客户端使用的自定义 URL scheme |
+| `TELESRV_PUBLIC_WEB_BASE_URL` | `https://web.telesrv.net` | 公开落地页展示的 Web 客户端根地址 |
+| `TELESRV_PUBLIC_APP_NAME` | `telesrv` | 公开落地页展示的产品名 |
 | `TELESRV_POSTGRES_DSN` | local Compose DSN | PostgreSQL 连接串 |
 | `TELESRV_REDIS_ADDR` | `127.0.0.1:6399` | Redis 地址 |
 | `TELESRV_LANGPACK_SEED_DIR` | `data/langpack` | 内置语言包种子目录 |
 | `TELESRV_BLOB_DIR` | `data/blobs` | 本地媒体 blob 目录 |
 | `TELESRV_STICKER_SEED_DIR` | `data/sticker-seed` | 可选 sticker/reaction 种子目录 |
-| `TELESRV_PUBLIC_LINK_WEB_ADDR` | 空 | 可选的 sticker/chatlist 公开链接落地页监听地址 |
+| `TELESRV_PUBLIC_LINK_WEB_ADDR` | 空 | 可选的公开链接落地页监听地址，例如 `127.0.0.1:2401` |
+| `TELESRV_BOT_API_ADDR` | 空 | 可选 HTTP Bot API gateway 监听地址，例如 `127.0.0.1:8081` |
+| `TELESRV_BOT_API_UPDATE_RETENTION` | `24h` | 未确认 Bot API `getUpdates` 队列记录的保留窗口 |
 | `TELESRV_AI_ENABLED` | `true` | 启用 AI compose 入口 |
 | `TELESRV_AI_PROVIDERS` | `local` | AI provider 调用链，例如 `local` 或 `kimi,local` |
 | `TELESRV_AI_TIMEOUT` | `15s` | 单次 AI provider 调用超时 |
 | `TELESRV_AI_RATE_LIMIT` | `20` | 每个账号的 AI compose 请求额度 |
 | `TELESRV_AI_RATE_WINDOW` | `1m` | AI compose 限流窗口 |
 | `TELESRV_AI_LOG_CONTENT` | `false` | 日志是否允许记录 prompt/生成文本 |
+| `TELESRV_TRANSLATION_ENABLED` | `true` | 启用 Telegram 消息翻译 RPC |
+| `TELESRV_TRANSLATION_PROVIDERS` | 空 | 可选指定用于翻译的远程 AI provider 子集 |
+| `TELESRV_TRANSLATION_RATE_LIMIT` | `60` | 每个账号的翻译文本条数额度 |
 | `TELESRV_BUSINESS_AI_PROVIDER` | `echo` | Business automation 回复 provider |
 
 如果 sticker seed 目录不存在，启动时会自动跳过。
@@ -144,7 +157,7 @@ go build -o bin/gramsrv ./cmd/telesrv
 | 12400 | UDP | TURN/STUN 服务器 | 启用 P2P/通话 relay |
 | 12500-12999 | UDP | TURN relay 端口段 | 启用 TURN relay |
 | 可配置 | TCP | Bot API | 设置 `TELESRV_BOT_API_ADDR` 时 |
-| 可配置 | TCP | 公开链接深链落地页 | 设置 `TELESRV_PUBLIC_LINK_WEB_ADDR` 时 |
+| 2401 示例 | TCP | username/sticker/chatlist 公开链接落地页 | 设置 `TELESRV_PUBLIC_LINK_WEB_ADDR=127.0.0.1:2401` 时 |
 
 ### 内部/调试端口（不要暴露到公网）
 
@@ -155,6 +168,29 @@ go build -o bin/gramsrv ./cmd/telesrv
 | 6399 | `127.0.0.1:6399` | Redis |
 
 确保设置 `TELESRV_LISTEN=0.0.0.0:2398`，且 `TELESRV_ADVERTISE_IP` 指向公网 IP，客户端才能正确连接。
+
+## 公开链接落地页
+
+`gramsrv` 可以提供 `/<username>`、头像、`/addstickers/<shortName>`、
+`/addemoji/<shortName>`、`/addlist/<slug>` 这些公开落地页。
+
+`TELESRV_PUBLIC_LINK_WEB_ADDR` 是本机 HTTP 监听地址：
+
+```env
+TELESRV_PUBLIC_LINK_WEB_ADDR=127.0.0.1:2401
+```
+
+`TELESRV_PUBLIC_BASE_URL` 是生成公开链接时展示给用户的外部 canonical URL：
+
+```env
+TELESRV_PUBLIC_BASE_URL=https://your-domain.example
+TELESRV_PUBLIC_APP_SCHEME=yourapp
+TELESRV_PUBLIC_WEB_BASE_URL=https://web.your-domain.example
+TELESRV_PUBLIC_APP_NAME=YourApp
+```
+
+生产环境建议让 `TELESRV_PUBLIC_LINK_WEB_ADDR` 只监听 loopback，再用 HTTPS
+反向代理把公开路由转发到这个本地端口。
 
 ## 客户端兼容
 

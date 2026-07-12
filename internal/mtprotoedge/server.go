@@ -47,7 +47,9 @@ type RPCHandler interface {
 type Options struct {
 	// Logger 日志器。默认 zap.NewNop()。
 	Logger *zap.Logger
-	// Codec 传输 codec 构造器。nil 表示自动探测（intermediate/abridged/full）。
+	// Codec 传输 codec 构造器。nil 表示自动探测（intermediate/abridged/full）。自定义
+	// codec 必须是 gotd 内置四种 codec（可包 NoHeader），或实现 InboundFrameBudgetedCodec；
+	// 无法在 payload 分配前预检长度的 codec 会 fail-closed。
 	Codec func() transport.Codec
 	// ObfuscatedTCP 先按 MTProto TCP obfuscation 解包，再自动探测 codec。
 	// Telegram Desktop 的 tcpo_only endpoint 会走这个 64 字节前缀流程。
@@ -72,12 +74,45 @@ type Options struct {
 	HandshakeMaxDuration time.Duration
 	// WriteTimeout 单次写入超时。默认 30s。
 	WriteTimeout time.Duration
+	// MaxConnections 是进程接受的 raw 物理连接总上限，覆盖 codec sniff、握手和
+	// 已认证连接的完整生命周期。默认 200000；负数表示不限制。
+	MaxConnections int
+	// MaxConnectionsPerIP 是单 remote IP 的 raw 物理连接上限。默认 4096，
+	// 为共享 NAT 与 TDesktop 多候选连接保留足够突发；负数表示不限制。
+	MaxConnectionsPerIP int
+	// MaxConcurrentHandshakes 是同时执行 auth_key_id=0 RSA/DH exchange 的上限。
+	// 达限时已完成 transport framing 的连接收到 -429 后断开。默认 256；负数表示不限制。
+	MaxConcurrentHandshakes int
 	// RPCMaxInflight 是单连接同时处理的 RPC 上限。默认 32。
 	RPCMaxInflight int
-	// RPCQueueSize 是单连接等待处理的 RPC 队列长度。默认 256。
+	// RPCQueueSize 是单连接等待处理的 RPC 队列长度。默认 64；队列按首条请求懒分配。
 	RPCQueueSize int
 	// RPCTimeout 是单个 RPC 在连接层的最大处理时长。默认 30s。
+	// 超时从 Copy 前预算/入队开始计算，排队时间包含在内。
 	RPCTimeout time.Duration
+	// RPCGlobalWorkers 是 Server 共享 inbound RPC worker 数。默认 256。
+	RPCGlobalWorkers int
+	// RPCGlobalMaxTasks 是全进程已预留、排队和执行中的 RPC 条数上限。默认 8192。
+	RPCGlobalMaxTasks int
+	// RPCGlobalMaxBytes 是上述 RPC body 的总字节预算。默认 512 MiB。
+	RPCGlobalMaxBytes int64
+	// InboundFrameGlobalMaxBytes 是所有物理连接当前正在处理的 transport wire buffer
+	// 与最大解密 plaintext buffer 的总预算。长度前缀读取后、payload 分配前预留，默认
+	// 512 MiB；非正值使用默认值。
+	InboundFrameGlobalMaxBytes int64
+	// OutboundQueueSize / OutboundControlQueueSize 是每连接普通与控制 mailbox 容量。
+	// 默认 128/32；控制队列在 actor 中保持严格优先。
+	OutboundQueueSize        int
+	OutboundControlQueueSize int
+	// OutboundTrackedGlobalMaxBytes 是所有连接为 msg_resend_req 保留的 RPC/update body
+	// 总预算。默认 512 MiB；编码后的 MTProto service frame 与控制向量另用 64 MiB
+	// control budget（包括需 resend tracking 的 new_session_created 等），避免 body 压力
+	// 阻断连接维持消息。可靠响应无法 tracking 时终止该连接，durable best-effort update
+	// 则只丢在线加速并由 difference 恢复。
+	OutboundTrackedGlobalMaxBytes int64
+	// OutboundWriteGlobalMaxBytes bounds concurrent encrypted wire/codec/obfuscation scratch.
+	// Scratch is shared and pooled across connections; default 512 MiB.
+	OutboundWriteGlobalMaxBytes int64
 
 	// DC 是本 server 的 DC ID。默认 2。
 	DC int
@@ -85,8 +120,6 @@ type Options struct {
 	RSAKey *rsa.PrivateKey
 	// AuthKeys 持久化 auth key。默认内存实现。
 	AuthKeys store.AuthKeyStore
-	// Sessions 记录在线 MTProto session（持久化数据）。默认内存实现。
-	Sessions store.SessionStore
 	// ActiveSessions 管理活跃连接。默认新建；传入时可让 RPC 层共享同一注册表。
 	ActiveSessions *SessionManager
 	// RPC 是 typed RPC 路由。nil 时加密 RPC 被丢弃并记录。
@@ -115,23 +148,53 @@ func (o *Options) setDefaults() {
 	if o.WriteTimeout == 0 {
 		o.WriteTimeout = 30 * time.Second
 	}
+	if o.MaxConnections == 0 {
+		o.MaxConnections = defaultMaxConnections
+	}
+	if o.MaxConnectionsPerIP == 0 {
+		o.MaxConnectionsPerIP = defaultMaxConnectionsPerIP
+	}
+	if o.MaxConcurrentHandshakes == 0 {
+		o.MaxConcurrentHandshakes = defaultMaxConcurrentHandshakes
+	}
 	if o.RPCMaxInflight <= 0 {
 		o.RPCMaxInflight = 32
 	}
 	if o.RPCQueueSize <= 0 {
-		o.RPCQueueSize = 256
+		o.RPCQueueSize = 64
 	}
 	if o.RPCTimeout == 0 {
 		o.RPCTimeout = 30 * time.Second
+	}
+	if o.RPCGlobalWorkers <= 0 {
+		o.RPCGlobalWorkers = 256
+	}
+	if o.RPCGlobalMaxTasks <= 0 {
+		o.RPCGlobalMaxTasks = rpcResultFlightDefaultMaxPending
+	}
+	if o.RPCGlobalMaxBytes <= 0 {
+		o.RPCGlobalMaxBytes = 512 << 20
+	}
+	if o.InboundFrameGlobalMaxBytes <= 0 {
+		o.InboundFrameGlobalMaxBytes = defaultInboundFrameGlobalMaxBytes
+	}
+	if o.OutboundQueueSize <= 0 {
+		o.OutboundQueueSize = defaultOutboundQueueSize
+	}
+	if o.OutboundControlQueueSize <= 0 {
+		o.OutboundControlQueueSize = defaultOutboundControlQueueSize
+	}
+	if o.OutboundTrackedGlobalMaxBytes <= 0 {
+		o.OutboundTrackedGlobalMaxBytes = defaultOutboundTrackedMaxBytes
+	}
+	if o.OutboundWriteGlobalMaxBytes <= 0 {
+		o.OutboundWriteGlobalMaxBytes = defaultOutboundWriteMaxBytes
 	}
 	if o.DC == 0 {
 		o.DC = 2
 	}
 	if o.AuthKeys == nil {
 		o.AuthKeys = memory.NewAuthKeyStore()
-	}
-	if o.Sessions == nil {
-		o.Sessions = memory.NewSessionStore()
 	}
 	if o.Metrics == nil {
 		o.Metrics = NopMetrics{}
@@ -150,30 +213,37 @@ func (o *Options) setDefaults() {
 // 接受连接、协商 codec、完成密钥交换、解密并分发加密消息到 RPC 路由，处理服务消息，
 // 并把活跃连接注册到 SessionManager 以支持主动推送（updates 等）。不含业务逻辑。
 type Server struct {
-	log              *zap.Logger
-	codec            func() transport.Codec
-	obfuscated       bool
-	websocket        bool
-	websocketOrigins []string
-	readTimeout      time.Duration
-	handshakeTimeout time.Duration
-	handshakeMaxDur  time.Duration
-	writeTimeout     time.Duration
-	rpcInflight      int
-	rpcQueueSize     int
-	rpcTimeout       time.Duration
+	log                      *zap.Logger
+	codec                    func() transport.Codec
+	obfuscated               bool
+	websocket                bool
+	websocketOrigins         []string
+	readTimeout              time.Duration
+	handshakeTimeout         time.Duration
+	handshakeMaxDur          time.Duration
+	writeTimeout             time.Duration
+	rpcInflight              int
+	rpcQueueSize             int
+	rpcTimeout               time.Duration
+	rpcScheduler             *inboundRPCScheduler
+	frameBudget              *inboundFrameBudget
+	outboundQueueSize        int
+	outboundControlQueueSize int
+	outboundTrackedBudget    *outboundTrackedBudget
+	outboundControlBudget    *outboundTrackedBudget
+	outboundScratchPool      *outboundScratchPool
 
-	dc       int
-	key      exchange.PrivateKey
-	authKeys store.AuthKeyStore
-	sessions store.SessionStore
-	conns    *SessionManager
-	rpc      RPCHandler
-	metrics  Metrics
-	cipher   crypto.Cipher
-	clock    clock.Clock
-	rand     io.Reader
-	types    *tmap.Map
+	dc        int
+	key       exchange.PrivateKey
+	authKeys  store.AuthKeyStore
+	conns     *SessionManager
+	rpc       RPCHandler
+	metrics   Metrics
+	cipher    crypto.Cipher
+	clock     clock.Clock
+	rand      io.Reader
+	types     *tmap.Map
+	admission *admissionController
 
 	rpcResults *rpcResultCache
 
@@ -189,62 +259,102 @@ func New(opts Options) *Server {
 		conns = NewSessionManager(opts.Logger.Named("sessions"))
 	}
 	return &Server{
-		log:              opts.Logger,
-		codec:            opts.Codec,
-		obfuscated:       opts.ObfuscatedTCP,
-		websocket:        opts.WebSocket,
-		websocketOrigins: append([]string(nil), opts.WebSocketAllowedOrigins...),
-		readTimeout:      opts.ReadTimeout,
-		handshakeTimeout: opts.HandshakeIdleTimeout,
-		handshakeMaxDur:  opts.HandshakeMaxDuration,
-		writeTimeout:     opts.WriteTimeout,
-		rpcInflight:      opts.RPCMaxInflight,
-		rpcQueueSize:     opts.RPCQueueSize,
-		rpcTimeout:       opts.RPCTimeout,
-		dc:               opts.DC,
-		key:              exchange.PrivateKey{RSA: opts.RSAKey},
-		authKeys:         opts.AuthKeys,
-		sessions:         opts.Sessions,
-		conns:            conns,
-		rpc:              opts.RPC,
-		metrics:          opts.Metrics,
-		cipher:           crypto.NewServerCipher(opts.Rand),
-		clock:            opts.Clock,
-		rand:             opts.Rand,
-		types:            tmap.New(tg.TypesMap(), mt.TypesMap(), proto.TypesMap()),
-		rpcResults:       newRPCResultCache(opts.Clock.Now),
+		log:                      opts.Logger,
+		codec:                    opts.Codec,
+		obfuscated:               opts.ObfuscatedTCP,
+		websocket:                opts.WebSocket,
+		websocketOrigins:         append([]string(nil), opts.WebSocketAllowedOrigins...),
+		readTimeout:              opts.ReadTimeout,
+		handshakeTimeout:         opts.HandshakeIdleTimeout,
+		handshakeMaxDur:          opts.HandshakeMaxDuration,
+		writeTimeout:             opts.WriteTimeout,
+		rpcInflight:              opts.RPCMaxInflight,
+		rpcQueueSize:             opts.RPCQueueSize,
+		rpcTimeout:               opts.RPCTimeout,
+		rpcScheduler:             newInboundRPCScheduler(opts.RPCGlobalWorkers, opts.RPCGlobalMaxTasks, opts.RPCGlobalMaxBytes),
+		frameBudget:              newInboundFrameBudget(opts.InboundFrameGlobalMaxBytes),
+		outboundQueueSize:        opts.OutboundQueueSize,
+		outboundControlQueueSize: opts.OutboundControlQueueSize,
+		outboundTrackedBudget:    newOutboundTrackedBudget(opts.OutboundTrackedGlobalMaxBytes),
+		outboundControlBudget:    newOutboundTrackedBudget(defaultOutboundControlMaxBytes),
+		outboundScratchPool:      newOutboundScratchPool(opts.OutboundWriteGlobalMaxBytes),
+		dc:                       opts.DC,
+		key:                      exchange.PrivateKey{RSA: opts.RSAKey},
+		authKeys:                 opts.AuthKeys,
+		conns:                    conns,
+		rpc:                      opts.RPC,
+		metrics:                  opts.Metrics,
+		cipher:                   crypto.NewServerCipher(opts.Rand),
+		clock:                    opts.Clock,
+		rand:                     opts.Rand,
+		types:                    tmap.New(tg.TypesMap(), mt.TypesMap(), proto.TypesMap()),
+		rpcResults:               newRPCResultCacheWithFlightLimit(opts.Clock.Now, opts.RPCGlobalMaxTasks),
+		admission:                newAdmissionController(opts.MaxConnections, opts.MaxConnectionsPerIP, opts.MaxConcurrentHandshakes),
 	}
-}
-
-// Conns 返回活跃连接注册表，供业务层主动推送（updates 等）。
-func (s *Server) Conns() *SessionManager {
-	return s.conns
 }
 
 // newConn 基于一次解密结果创建一个可发送的连接对象。
 func (s *Server) newConn(tc transport.Conn, key crypto.AuthKey, sessionID, salt int64) *Conn {
+	if lease, ok := tc.(*physicalTransportLease); ok {
+		return s.newConnWithLease(lease, key, sessionID, salt)
+	}
+	if tc != nil {
+		_, lease := newPhysicalTransportOwner(tc)
+		return s.newConnWithLease(lease, key, sessionID, salt)
+	}
+	// Preserve the nil transport used by construction-only tests.
+	return s.buildConn(nil, nil, key, sessionID, salt)
+}
+
+// newConnWithLease attaches a logical Conn to an explicitly owned physical
+// transport generation. Production session replacement must Transfer the old
+// lease first; it must never wrap the same raw transport in a second owner.
+func (s *Server) newConnWithLease(lease *physicalTransportLease, key crypto.AuthKey, sessionID, salt int64) *Conn {
+	if lease == nil {
+		panic("mtprotoedge: nil physical transport lease")
+	}
+	c := s.buildConn(lease, lease, key, sessionID, salt)
+	lease.bindLogicalConn(c)
+	return c
+}
+
+func (s *Server) buildConn(tc transport.Conn, lease *physicalTransportLease, key crypto.AuthKey, sessionID, salt int64) *Conn {
 	c := &Conn{
-		transport:    tc,
-		writer:       tc,
-		cipher:       s.cipher,
-		msgID:        proto.NewMessageIDGen(s.clock.Now),
-		writeTimeout: s.writeTimeout,
-		metrics:      s.metrics,
-		authKeyID:    key.ID,
-		authKeyHex:   hex.EncodeToString(key.ID[:]),
-		sessionID:    sessionID,
-		salt:         salt,
-		key:          key,
-		createdAt:    s.clock.Now(),
+		transport:                    tc,
+		transportLease:               lease,
+		writer:                       tc,
+		cipher:                       s.cipher,
+		msgID:                        proto.NewMessageIDGen(s.clock.Now),
+		writeTimeout:                 s.writeTimeout,
+		metrics:                      s.metrics,
+		authKeyID:                    key.ID,
+		authKeyHex:                   hex.EncodeToString(key.ID[:]),
+		sessionID:                    sessionID,
+		salt:                         salt,
+		key:                          key,
+		createdAt:                    s.clock.Now(),
+		outboundQueueSize:            s.outboundQueueSize,
+		outboundControlQueueSize:     s.outboundControlQueueSize,
+		outboundTrackedBudget:        s.outboundTrackedBudget,
+		outboundControlTrackedBudget: s.outboundControlBudget,
+		outboundScratchPool:          s.outboundScratchPool,
 	}
 	c.startOutbound()
-	c.startInboundRPCScheduler(s.rpcInflight, s.rpcQueueSize, s.rpcTimeout)
+	c.startInboundRPCScheduler(s.rpcScheduler, s.rpcInflight, s.rpcQueueSize, s.rpcTimeout)
 	return c
 }
 
 // Serve 在 ln 上运行 MTProto 连接循环，直到 ctx 取消或发生不可恢复错误。
 // ctx 取消时优雅退出：关闭 listener 并等待在途连接处理结束。
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	// 共享 worker 池只在 Server 真正 Serve 后允许消费，并在首条 RPC 到达时懒启动。
+	// serveTCP/serveMixed 返回前会等待连接 goroutine 收敛，各 Conn 已先排空/取消任务；
+	// 最后再停止全局池，避免关闭过程中留下无人消费但仍占预算的队列。
+	s.rpcScheduler.start()
+	defer s.rpcScheduler.stop(rpcCloseWaitTimeout)
+	// 只在最外层 listener 包一次，确保 same-port mux 的 sniff/HTTP upgrade 也计入
+	// raw admission，而不是等连接已经分流后才计数。
+	ln = s.admission.wrapListener(ln)
 	if s.websocket {
 		return s.serveMixed(ctx, ln)
 	}
@@ -273,7 +383,8 @@ func (s *Server) serveMixed(ctx context.Context, ln net.Listener) error {
 	// 触发客户端 6s 重连风暴并误判「后端不健康」回退到外部 DNS。per-conn goroutine 模型已消解
 	// slow-loris 接入饥饿，故嗅探用满 handshakeTimeout 是安全的。
 	mux := newSamePortMux(ln, s.handshakeTimeout)
-	wsLn, wsHandler := transport.WebsocketListener(ln.Addr())
+	wsRawLn, wsHandler := transport.WebsocketListener(ln.Addr())
+	wsLn := newTransportPacketMessageListener(wsRawLn)
 
 	httpServer := &http.Server{
 		Handler:           websocketRouteHandler(wsHandler, s.websocketOrigins),
@@ -292,11 +403,15 @@ func (s *Server) serveMixed(ctx context.Context, ln net.Listener) error {
 	)
 	defer s.log.Info("Stopped")
 
-	go func() {
-		<-ctx.Done()
+	stopAll := func() {
+		cancel()
 		_ = mux.Close()
 		_ = httpServer.Close()
 		_ = wsLn.Close()
+	}
+	go func() {
+		<-ctx.Done()
+		stopAll()
 	}()
 
 	errCh := make(chan error, 4)
@@ -330,17 +445,19 @@ func (s *Server) serveMixed(ctx context.Context, ln net.Listener) error {
 		errCh <- nil
 	}()
 
+	// The four services form one lifecycle: even a clean/closed-listener return from any one
+	// component means the remaining three can no longer make forward progress as a complete
+	// same-port server. Stop them immediately, then collect their terminal results.
 	var firstErr error
-	for i := 0; i < 4; i++ {
+	if err := <-errCh; err != nil {
+		firstErr = err
+	}
+	stopAll()
+	for i := 1; i < 4; i++ {
 		if err := <-errCh; err != nil && firstErr == nil {
 			firstErr = err
-			cancel()
 		}
 	}
-	cancel()
-	_ = mux.Close()
-	_ = httpServer.Close()
-	_ = wsLn.Close()
 	wg.Wait()
 	return firstErr
 }
@@ -351,22 +468,39 @@ func (s *Server) serveMixed(ctx context.Context, ln net.Listener) error {
 // 整个监听循环。obfuscated 为 true 时先走 obfuscated2 去混淆（裸 MTProto TCP）；WebSocket
 // 连接传 false（gotd 升级处理器已完成去混淆）。
 func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, obfuscated bool) error {
+	ctx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	defer func() {
+		// A permanent Accept error is itself a terminal lifecycle event. Cancel accepted
+		// connections and close the listener before waiting; otherwise a live connection can
+		// keep the WaitGroup blocked forever and prevent the accept error from being returned.
+		cancel()
+		_ = ln.Close()
+		wg.Wait()
+	}()
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
 	}()
 
-	var wg sync.WaitGroup
-	defer wg.Wait()
-
+	var tempDelay time.Duration
 	for {
 		raw, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
+			if isTemporaryAcceptError(err) {
+				tempDelay = nextAcceptRetryDelay(tempDelay)
+				s.log.Debug("Temporary accept error; retrying", zap.Duration("backoff", tempDelay), zap.Error(err))
+				if !waitAcceptRetry(ctx, tempDelay) {
+					return nil
+				}
+				continue
+			}
 			return fmt.Errorf("accept: %w", err)
 		}
+		tempDelay = 0
 
 		wg.Add(1)
 		go func() {
@@ -428,7 +562,7 @@ func (s *Server) promoteConn(raw net.Conn, obfuscated bool) (transport.Conn, err
 	if obfuscated {
 		ln = transport.ObfuscatedListener(ln)
 	}
-	return newCompatTransportListener(s.codec, ln).Accept()
+	return newCompatTransportListener(s.codec, ln, s.frameBudget).Accept()
 }
 
 // serveConn 处理单个传输连接：读帧并按 auth_key_id 分流。
@@ -438,12 +572,24 @@ func (s *Server) promoteConn(raw net.Conn, obfuscated bool) (transport.Conn, err
 //   - auth_key_id 未注册：回 AuthKeyNotFound，促使客户端重新握手。
 //
 // 连接建立 session 后注册到 SessionManager，结束时注销。
-func (s *Server) serveConn(ctx context.Context, conn transport.Conn) (err error) {
+func (s *Server) serveConn(ctx context.Context, raw transport.Conn) (err error) {
+	transportOwner, conn := newPhysicalTransportOwner(raw)
 	s.metrics.ConnOpened()
 	s.log.Debug("Connection accepted")
 
 	var current *Conn
 	defer func() {
+		// A successful Recv transfers the frame reservation to serveConn. Release it only after
+		// this stack has stopped using b/plain; transport.Close may have raced us earlier and must
+		// not return that memory budget prematurely.
+		releaseInboundFrameOwnership(conn)
+		// Publish the terminal/RPC-cancel gates before index removal or lifecycle
+		// observers. Physical close then releases a writer already inside Send; the
+		// final Close only waits for the now-fenced actors to converge.
+		if current != nil {
+			current.beginTerminalShutdown()
+		}
+		_ = transportOwner.CloseAny()
 		if current != nil {
 			s.conns.Unregister(current)
 			current.Close()
@@ -457,7 +603,7 @@ func (s *Server) serveConn(ctx context.Context, conn transport.Conn) (err error)
 	defer cancel()
 	go func() {
 		<-ctx.Done()
-		_ = conn.Close()
+		_ = transportOwner.CloseAny()
 	}()
 
 	cs := newConnState()
@@ -468,13 +614,13 @@ func (s *Server) serveConn(ctx context.Context, conn transport.Conn) (err error)
 	var replay *bin.Buffer
 	for {
 		if replay != nil {
-			b.ResetTo(replay.Copy())
+			b.ResetTo(replay.Buf)
 			replay = nil
 		} else {
 			// 建立 session 前（current==nil，握手 + 首个加密消息之前）用较短的 handshakeTimeout
 			// 快速回收静默的半开 / 异常连接；建立 session 后用 readTimeout（客户端有 ping 心跳）。
 			timeout := s.readTimeout
-			if current == nil {
+			if current == nil || !current.isActive() {
 				timeout = s.handshakeTimeout
 			}
 			if err := s.recv(ctx, conn, &b, timeout); err != nil {
@@ -491,37 +637,87 @@ func (s *Server) serveConn(ctx context.Context, conn transport.Conn) (err error)
 		}
 
 		if authKeyID == emptyAuthKeyID {
+			// A physical socket may perform key exchange only before it owns an
+			// encrypted logical session. Mixing the direct exchange writer with an
+			// active outbound actor would bypass generation/write serialization.
+			if current != nil {
+				return errors.New("unencrypted exchange on established encrypted connection")
+			}
+			releaseHandshake, admitted := s.admission.tryAcquireHandshake()
+			if !admitted {
+				if err := s.sendProtoError(ctx, conn, codec.CodeTransportFlood); err != nil {
+					return err
+				}
+				return nil
+			}
 			next, err := s.handleExchange(ctx, conn, &b)
+			releaseHandshake()
 			if err != nil {
 				return err
 			}
 			replay = next
+			// Exchange has finished consuming the original transport frame. Drop its
+			// potentially near-16MiB backing immediately. A replay frame is the gotd
+			// encrypted-frame copy and keeps the existing frame reservation until it is
+			// dispatched; a completed handshake has no surviving frame and can release now.
+			trimOversizedInboundBuffer(&b)
+			if replay == nil {
+				releaseInboundFrameOwnership(conn)
+			} else {
+				retainInboundFrameBackings(conn, replay)
+			}
 			continue
 		}
 
 		// 已建立连接复用缓存密钥走快路径（fetchedKey=nil）：避开每帧回查 AuthKeyStore——
 		// 这是 mtprotoedge 层最热的库访问点。密钥材料创建后不可变；销毁(destroy_auth_key)/
-		// 撤销由 SessionManager 主动 Close 连接保证失效，不依赖此被动回查。仅 destroy_auth_key
-		// 的发起连接置 keyDestroyed，使其下一帧回落到 Get→AuthKeyNotFound，维持原契约。
+		// 撤销由 SessionManager 主动 Close 连接保证失效，不依赖被动的“下一帧 -404”。
+		// 尚未进入 SessionManager 的 bad-salt provisional 会在 handleEncrypted 建立 activation claim
+		// 后精确复查一次，既把撤销与激活线性化，也不把 salt storm 放大成 PG 写风暴。
 		var fetchedKey *store.AuthKeyData
-		if current == nil || current.authKeyID != authKeyID || current.keyDestroyed.Load() {
+		if current == nil || current.authKeyID != authKeyID {
 			d, found, err := s.authKeys.Get(ctx, authKeyID)
 			if err != nil {
 				return fmt.Errorf("lookup auth key: %w", err)
 			}
 			if !found {
-				if err := s.sendProtoError(ctx, conn, codec.CodeAuthKeyNotFound); err != nil {
+				writer := transport.Conn(conn)
+				if current != nil {
+					writer = current.transport
+				}
+				if err := s.sendProtoError(ctx, writer, codec.CodeAuthKeyNotFound); err != nil {
 					return err
 				}
-				continue
+				// -404 对 TDesktop 是 terminal key failure；继续保留 socket 只会允许
+				// 同一客户端反复触发 AuthKeyStore 查询。回包一次后立即断开。
+				return nil
 			}
 			fetchedKey = &d
 		}
 
 		current, err = s.handleEncrypted(ctx, conn, cs, current, fetchedKey, &b, &plain)
+		if errors.Is(err, errActivationAuthKeyRejected) {
+			// handleEncrypted writes -404 while its activation claim still owns the
+			// physical writer, then its deferred abort removes/closes the claim.
+			return nil
+		}
 		if err != nil {
 			return err
 		}
+		trimOversizedInboundBuffer(&b)
+		trimOversizedInboundBuffer(&plain)
+		retainInboundFrameBackings(conn, &b, &plain)
+	}
+}
+
+// maxRetainedConnBuffer keeps normal upload/download frames allocation-free while preventing one
+// exceptional near-16MiB transport frame from pinning that capacity for the lifetime of a long
+// connection. RPC bodies that outlive dispatch already own a budgeted Copy.
+const maxRetainedConnBuffer = 2 << 20
+
+func trimOversizedInboundBuffer(b *bin.Buffer) {
+	if b != nil && cap(b.Buf) > maxRetainedConnBuffer {
+		b.Buf = nil
 	}
 }
 

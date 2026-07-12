@@ -319,14 +319,8 @@ func (s *ChannelStore) ListDirtyActiveChannelsForUser(_ context.Context, userID 
 		if !ok || member.Status != domain.ChannelMemberActive {
 			continue
 		}
-		dirty := false
-		for _, event := range s.events[channelID] {
-			if event.Date > sinceDate {
-				dirty = true
-				break
-			}
-		}
-		if dirty {
+		checkpoint := s.channelUpdateCheckpointLocked(channelID, channel)
+		if checkpoint.LatestEventDate > sinceDate {
 			out = append(out, domain.DirtyChannel{ChannelID: channelID, Pts: channel.Pts})
 		}
 	}
@@ -364,6 +358,11 @@ func (s *ChannelStore) channelForViewerLocked(userID, channelID int64) (domain.C
 	existing, found := s.members[channelID][userID]
 	if found && (existing.Status == domain.ChannelMemberBanned || existing.Status == domain.ChannelMemberKicked || existing.BannedRights.ViewMessages) {
 		return domain.Channel{}, domain.ChannelMember{}, false, domain.ErrChannelUserBanned
+	}
+	if guest, ok, guestErr := s.linkedDiscussionGuestLocked(userID, channel); guestErr != nil {
+		return domain.Channel{}, domain.ChannelMember{}, false, guestErr
+	} else if ok {
+		return channel, guest, true, nil
 	}
 	if channel.Monoforum && channel.LinkedMonoforumID != 0 {
 		parentMember, ok := s.members[channel.LinkedMonoforumID][userID]

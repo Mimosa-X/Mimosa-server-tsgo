@@ -198,7 +198,6 @@ func (r *Router) onMessagesSendQuickReplyMessages(ctx context.Context, req *tg.M
 		return nil, err
 	}
 	sessionID, _ := SessionIDFrom(ctx)
-	authKeyID, _ := AuthKeyIDFrom(ctx)
 	res := domain.ForwardPrivateMessagesResult{OwnerUserID: userID}
 	now := int(r.clock.Now().Unix())
 	for i, template := range list.Messages {
@@ -209,12 +208,15 @@ func (r *Router) onMessagesSendQuickReplyMessages(ctx context.Context, req *tg.M
 			Message:          template.Message,
 			Entities:         append([]domain.MessageEntity(nil), template.Entities...),
 			Date:             now,
-			OriginAuthKeyID:  authKeyID,
+			OriginAuthKeyID:  rawAuthKeyIDForOrigin(ctx),
 			OriginSessionID:  sessionID,
 			RecipientBlocked: recipientBlocked,
 		})
 		if err != nil {
 			return nil, messageSendErr(err)
+		}
+		if !sent.Duplicate {
+			r.enqueueBotAPIPrivateMessageUpdateAsync(ctx, sent)
 		}
 		res.SenderMessages = append(res.SenderMessages, sent.SenderMessage)
 		res.RecipientMessages = append(res.RecipientMessages, sent.RecipientMessage)
@@ -358,7 +360,7 @@ func (r *Router) recordQuickReplyMutation(ctx context.Context, userID int64, mut
 	}
 	authKeyID, _ := AuthKeyIDFrom(ctx)
 	sessionID, _ := SessionIDFrom(ctx)
-	event, _, err := r.deps.Updates.RecordQuickReplyMutation(ctx, authKeyID, userID, mutation, sessionID)
+	event, _, err := r.deps.Updates.RecordQuickReplyMutation(ctx, authKeyID, userID, mutation, rawAuthKeyIDForOrigin(ctx), sessionID)
 	if err != nil {
 		return domain.UpdateEvent{}, internalErr()
 	}

@@ -17,13 +17,14 @@ import (
 var defaultSecureRandom = []byte("telesrv-tdesktop-dev-secure-rand")
 
 const (
-	passwordResetWait            = 7 * 24 * time.Hour
-	passwordResetRetry           = 24 * time.Hour
-	loginEmailVerifyChangePrefix = "login-email-change:"
-	loginEmailVerifySetupPrefix  = "login-email-setup:"
-	codeChannelEmailSetup        = "email_setup"
-	codeChannelEmailChange       = "email_change"
-	codeChannelEmailLogin        = "email_login"
+	passwordResetWait             = 7 * 24 * time.Hour
+	passwordResetRetry            = 24 * time.Hour
+	loginEmailVerifyChangePrefix  = "login-email-change:"
+	loginEmailVerifySetupPrefix   = "login-email-setup:"
+	codeChannelEmailSetup         = "email_setup"
+	codeChannelEmailChange        = "email_change"
+	codeChannelEmailLogin         = "email_login"
+	codeChannelEmailSetupRequired = "email_setup_required"
 )
 
 // Service 提供账号安全配置查询。
@@ -38,8 +39,14 @@ type Service struct {
 	business    store.BusinessAutomationStore
 	// users 仅用于登录邮箱的 phone→user 解析（sendCode 检测 / login-setup / reset 走 phone）。
 	users                     store.UserStore
+	userCache                 store.UserCache
+	authorizations            store.AuthorizationStore
+	phoneChanges              store.PhoneChangeStore
 	publicBaseURL             string
 	codes                     store.CodeStore
+	phoneChangeCode           string
+	phoneChangeCodeTTL        time.Duration
+	phoneChangeMaxAttempts    int
 	loginEmailSender          mail.Sender
 	loginEmailCodeTTL         time.Duration
 	loginEmailCodeMaxAttempts int
@@ -105,6 +112,24 @@ func WithUsers(users store.UserStore) ServiceOption {
 	}
 }
 
+// WithPhoneChange 注入改号所需的授权校验、一次性验证码、原子 user+update
+// 写入与基础用户缓存失效依赖。
+func WithPhoneChange(phoneChanges store.PhoneChangeStore, authorizations store.AuthorizationStore, codes store.CodeStore, cache store.UserCache, fixedCode string, ttl time.Duration, maxAttempts int) ServiceOption {
+	return func(s *Service) {
+		s.phoneChanges = phoneChanges
+		s.authorizations = authorizations
+		s.codes = codes
+		s.userCache = cache
+		s.phoneChangeCode = fixedCode
+		if ttl > 0 {
+			s.phoneChangeCodeTTL = ttl
+		}
+		if maxAttempts > 0 {
+			s.phoneChangeMaxAttempts = maxAttempts
+		}
+	}
+}
+
 func WithPublicBaseURL(baseURL string) ServiceOption {
 	return func(s *Service) {
 		s.publicBaseURL = links.NormalizeBaseURL(baseURL)
@@ -129,7 +154,15 @@ func WithLoginEmailVerification(codes store.CodeStore, sender mail.Sender, ttl t
 
 // NewService 创建 account 服务。
 func NewService(passwords store.PasswordStore, opts ...ServiceOption) *Service {
-	s := &Service{passwords: passwords, publicBaseURL: links.DefaultPublicBaseURL, loginEmailCodeTTL: 5 * time.Minute, loginEmailCodeMaxAttempts: 5, loginEmailCodeLength: 6}
+	s := &Service{
+		passwords:                 passwords,
+		publicBaseURL:             links.DefaultPublicBaseURL,
+		loginEmailCodeTTL:         5 * time.Minute,
+		loginEmailCodeMaxAttempts: 5,
+		loginEmailCodeLength:      6,
+		phoneChangeCodeTTL:        5 * time.Minute,
+		phoneChangeMaxAttempts:    5,
+	}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -536,12 +569,16 @@ func (s *Service) SendLoginEmailCode(ctx context.Context, userID int64, phone, p
 	}
 	key := loginEmailVerifyChangePrefix + fmt.Sprint(userID)
 	rec := store.PhoneCode{
+		Version:      store.PhoneCodeVersionCurrent,
 		Code:         "",
 		Channel:      codeChannelEmailChange,
 		PendingEmail: email,
 		MaxAttempts:  s.loginEmailCodeMaxAttempts,
 	}
 	if setup {
+		if s.users == nil {
+			return "", 0, domain.ErrEmailNotAllowed
+		}
 		phone = domain.NormalizePhone(phone)
 		phoneRec, found, err := s.codes.Get(ctx, phoneCodeHash)
 		if err != nil {
@@ -550,7 +587,8 @@ func (s *Service) SendLoginEmailCode(ctx context.Context, userID int64, phone, p
 		if !found {
 			return "", 0, domain.ErrEmailCodeInvalid
 		}
-		if phoneRec.Phone != phone {
+		if phoneRec.Version != store.PhoneCodeVersionCurrent || phoneRec.Purpose != "" || phoneRec.Phone != phone ||
+			phoneRec.Channel != codeChannelEmailSetupRequired || phoneRec.SignUpVerified {
 			return "", 0, domain.ErrEmailInvalid
 		}
 		targetUserID := int64(0)
@@ -558,6 +596,9 @@ func (s *Service) SendLoginEmailCode(ctx context.Context, userID int64, phone, p
 			return "", 0, err
 		} else if found {
 			targetUserID = existingUserID
+		}
+		if phoneRec.IssuedUserID != targetUserID {
+			return "", 0, domain.ErrEmailInvalid
 		}
 		if err := s.ensureLoginEmailAvailable(ctx, targetUserID, email); err != nil {
 			return "", 0, err
@@ -579,7 +620,9 @@ func (s *Service) SendLoginEmailCode(ctx context.Context, userID int64, phone, p
 		return "", 0, err
 	}
 	if err := s.loginEmailSender.SendLoginCode(ctx, email, code, s.loginEmailCodeTTL); err != nil {
-		_ = s.codes.Del(ctx, key)
+		// Set does not expose its generated revision. A blind Del here could
+		// remove a newer concurrent resend; leave the unreachable random code
+		// to expire or be replaced by the retry instead.
 		return "", 0, err
 	}
 	return emailPattern(email), len(code), nil
@@ -593,28 +636,43 @@ func (s *Service) VerifyLoginEmail(ctx context.Context, userID int64, phone, pho
 	if setup {
 		key = loginEmailVerifySetupPrefix + phoneCodeHash
 	}
-	rec, found, err := s.codes.Get(ctx, key)
+	snapshot, found, err := s.codes.GetSnapshot(ctx, key)
 	if err != nil {
 		return "", err
 	}
 	if !found {
 		return "", domain.ErrEmailCodeInvalid
 	}
+	rec := snapshot.Record
 	if strings.TrimSpace(code) == "" || subtle.ConstantTimeCompare([]byte(rec.Code), []byte(strings.TrimSpace(code))) != 1 {
-		return "", s.rejectEmailCode(ctx, key, rec)
+		return "", s.rejectEmailCode(ctx, key, snapshot)
 	}
 	email := normalizeLoginEmail(rec.PendingEmail)
 	if !validLoginEmail(email) {
-		_ = s.codes.Del(ctx, key)
+		applied, deleteErr := s.codes.CompareAndDelete(ctx, key, snapshot.Revision)
+		if deleteErr != nil {
+			return "", deleteErr
+		}
+		if !applied {
+			return "", domain.ErrEmailCodeInvalid
+		}
 		return "", domain.ErrEmailInvalid
 	}
 	if setup {
+		if s.users == nil || rec.Channel != codeChannelEmailSetup {
+			return "", domain.ErrEmailCodeInvalid
+		}
 		phone = domain.NormalizePhone(phone)
-		phoneRec, found, err := s.codes.Get(ctx, phoneCodeHash)
+		if rec.Phone != phone {
+			return "", domain.ErrEmailCodeInvalid
+		}
+		phoneSnapshot, found, err := s.codes.GetSnapshot(ctx, phoneCodeHash)
 		if err != nil {
 			return "", err
 		}
-		if !found || phoneRec.Phone != phone {
+		phoneRec := phoneSnapshot.Record
+		if !found || phoneRec.Version != store.PhoneCodeVersionCurrent || phoneRec.Purpose != "" ||
+			phoneRec.Phone != phone || phoneRec.Channel != codeChannelEmailSetupRequired || phoneRec.SignUpVerified {
 			return "", domain.ErrEmailCodeInvalid
 		}
 		targetUserID := int64(0)
@@ -623,11 +681,23 @@ func (s *Service) VerifyLoginEmail(ctx context.Context, userID int64, phone, pho
 		} else if found {
 			targetUserID = existingUserID
 		}
+		if phoneRec.IssuedUserID != targetUserID {
+			s.invalidateLoginCode(ctx, phoneCodeHash, phone)
+			return "", domain.ErrEmailCodeInvalid
+		}
 		if err := s.ensureLoginEmailAvailable(ctx, targetUserID, email); err != nil {
-			_ = s.codes.Del(ctx, key)
 			return "", err
 		}
-		_ = s.codes.Del(ctx, key)
+		// Claim this exact email-code revision before mutating the phone login
+		// state. A concurrent resend rotates the revision, so an old verifier
+		// can neither consume the new code nor authorize the phone hash.
+		claimed, err := s.codes.CompareAndDelete(ctx, key, snapshot.Revision)
+		if err != nil {
+			return "", err
+		}
+		if !claimed {
+			return "", domain.ErrEmailCodeInvalid
+		}
 		phoneRec.Channel = codeChannelEmailLogin
 		phoneRec.Code = strings.TrimSpace(code)
 		phoneRec.Email = email
@@ -635,41 +705,92 @@ func (s *Service) VerifyLoginEmail(ctx context.Context, userID int64, phone, pho
 		phoneRec.VerifiedEmail = true
 		phoneRec.Attempts = 0
 		phoneRec.MaxAttempts = s.loginEmailCodeMaxAttempts
-		if err := s.codes.Update(ctx, phoneCodeHash, phoneRec); err != nil {
+		updated, err := s.codes.CompareAndUpdate(ctx, phoneCodeHash, phoneSnapshot.Revision, phoneRec)
+		if err != nil {
 			return "", err
 		}
-		if _, found, err := s.userIDByPhone(ctx, phone); err != nil {
+		if !updated {
+			return "", domain.ErrEmailCodeInvalid
+		}
+		if targetUserID == 0 {
+			verified, err := s.codes.VerifyLogin(ctx, phoneCodeHash, phone, phoneRec.Code, true, s.loginEmailCodeMaxAttempts)
+			if err != nil {
+				return "", err
+			}
+			if verified.Status != store.LoginCodeVerifyAccepted || verified.Record.IssuedUserID != 0 || !verified.Record.SignUpVerified {
+				return "", domain.ErrEmailCodeInvalid
+			}
+			phoneRec = verified.Record
+		}
+		afterUserID := int64(0)
+		if existingUserID, found, err := s.userIDByPhone(ctx, phone); err != nil {
 			return "", err
 		} else if found {
-			if err := s.SetLoginEmailByPhone(ctx, phone, email); err != nil {
+			afterUserID = existingUserID
+		}
+		if afterUserID != targetUserID || phoneRec.IssuedUserID != afterUserID {
+			s.invalidateLoginCode(ctx, phoneCodeHash, phone)
+			return "", domain.ErrEmailCodeInvalid
+		}
+		if targetUserID != 0 {
+			// Keep the identity selected before SMTP verification. Re-resolving
+			// phone at this write boundary would let an A→B transfer attach A's
+			// verified factor to B.
+			if err := s.SetLoginEmail(ctx, targetUserID, email); err != nil {
 				return "", err
+			}
+			finalUserID := int64(0)
+			if existingUserID, found, err := s.userIDByPhone(ctx, phone); err != nil {
+				return "", err
+			} else if found {
+				finalUserID = existingUserID
+			}
+			if finalUserID != targetUserID {
+				s.invalidateLoginCode(ctx, phoneCodeHash, phone)
+				return "", domain.ErrEmailCodeInvalid
 			}
 		}
 		return email, nil
 	}
 	if err := s.ensureLoginEmailAvailable(ctx, userID, email); err != nil {
-		_ = s.codes.Del(ctx, key)
 		return "", err
 	}
-	_ = s.codes.Del(ctx, key)
+	claimed, err := s.codes.CompareAndDelete(ctx, key, snapshot.Revision)
+	if err != nil {
+		return "", err
+	}
+	if !claimed {
+		return "", domain.ErrEmailCodeInvalid
+	}
 	if err := s.SetLoginEmail(ctx, userID, email); err != nil {
 		return "", err
 	}
 	return email, nil
 }
 
-func (s *Service) rejectEmailCode(ctx context.Context, key string, rec store.PhoneCode) error {
+func (s *Service) rejectEmailCode(ctx context.Context, key string, snapshot store.PhoneCodeSnapshot) error {
+	rec := snapshot.Record
 	rec.Attempts++
 	max := rec.MaxAttempts
 	if max <= 0 {
 		max = s.loginEmailCodeMaxAttempts
 	}
 	if max > 0 && rec.Attempts >= max {
-		_ = s.codes.Del(ctx, key)
+		if _, err := s.codes.CompareAndDelete(ctx, key, snapshot.Revision); err != nil {
+			return err
+		}
 		return domain.ErrEmailCodeInvalid
 	}
-	_ = s.codes.Update(ctx, key, rec)
+	if _, err := s.codes.CompareAndUpdate(ctx, key, snapshot.Revision, rec); err != nil {
+		return err
+	}
 	return domain.ErrEmailCodeInvalid
+}
+
+func (s *Service) invalidateLoginCode(ctx context.Context, hash, phone string) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	_, _ = s.codes.InvalidateLoginCode(cleanupCtx, hash, phone)
 }
 
 // SetLoginEmail 为已登录用户写入登录邮箱（authed 的 emailVerifyPurposeLoginChange）。
@@ -694,19 +815,6 @@ func (s *Service) SetLoginEmail(ctx context.Context, userID int64, email string)
 	return s.passwords.Save(ctx, userID, settings)
 }
 
-// SetLoginEmailByPhone 为某手机号对应的账号写入登录邮箱（登录流程中的
-// emailVerifyPurposeLoginSetup，此时尚未鉴权，只能凭 phone 定位用户）。
-func (s *Service) SetLoginEmailByPhone(ctx context.Context, phone, email string) error {
-	userID, found, err := s.userIDByPhone(ctx, phone)
-	if err != nil {
-		return err
-	}
-	if !found {
-		return domain.ErrEmailInvalid
-	}
-	return s.SetLoginEmail(ctx, userID, email)
-}
-
 // LoginEmail 返回已登录用户的登录邮箱原始地址（用于 verifyEmail 回显 emailVerified.email）。
 func (s *Service) LoginEmail(ctx context.Context, userID int64) (string, bool, error) {
 	if s == nil || s.passwords == nil || userID == 0 {
@@ -722,8 +830,7 @@ func (s *Service) LoginEmail(ctx context.Context, userID int64) (string, bool, e
 	return normalizeLoginEmail(settings.LoginEmail), true, nil
 }
 
-// LoginEmailByPhone 按手机号返回登录邮箱原始地址（供 auth.sendCode 检测是否改投邮箱、
-// login-setup 回显、reset 回显使用）。
+// LoginEmailByPhone 按手机号返回登录邮箱原始地址，供 auth.sendCode 检测是否改投邮箱。
 func (s *Service) LoginEmailByPhone(ctx context.Context, phone string) (string, bool, error) {
 	userID, found, err := s.userIDByPhone(ctx, phone)
 	if err != nil || !found {
@@ -732,14 +839,12 @@ func (s *Service) LoginEmailByPhone(ctx context.Context, phone string) (string, 
 	return s.LoginEmail(ctx, userID)
 }
 
-// ClearLoginEmailByPhone 清除某手机号账号的登录邮箱（auth.resetLoginEmail）。
-func (s *Service) ClearLoginEmailByPhone(ctx context.Context, phone string) error {
-	userID, found, err := s.userIDByPhone(ctx, phone)
-	if err != nil {
-		return err
-	}
-	if !found {
-		return nil
+// ClearLoginEmail clears the factor on the exact account selected by the
+// preceding reset-code consume. Authentication factors must never be mutated
+// through a second phone→user lookup.
+func (s *Service) ClearLoginEmail(ctx context.Context, userID int64) error {
+	if s == nil || s.passwords == nil || userID == 0 {
+		return domain.ErrEmailInvalid
 	}
 	settings, found, err := s.passwords.GetByUser(ctx, userID)
 	if err != nil || !found {

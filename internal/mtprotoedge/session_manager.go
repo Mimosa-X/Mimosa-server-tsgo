@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -17,8 +19,10 @@ import (
 // ErrSessionNotFound 表示目标 session 当前无活跃连接。
 var ErrSessionNotFound = errors.New("session not found")
 
-// ErrSessionAmbiguous 表示仅用 session_id 无法唯一定位连接。
-var ErrSessionAmbiguous = errors.New("session id is shared by multiple auth keys")
+var (
+	ErrSessionActivationSuperseded = errors.New("session activation superseded")
+	ErrSessionActivationFence      = errors.New("session activation could not fence previous writer")
+)
 
 const (
 	maxPendingPushesPerSession = 32
@@ -36,7 +40,8 @@ const (
 	// （typing/presence，不写 durable log）经 PushToUserTransient* 在未就绪时直接跳过、不入队，
 	// 因此本队列被老化/溢出/重试耗尽丢弃时，丢的一定是 durable 条目——getDifference 以
 	// user_update_events 兜底补齐，丢弃不丢数据。
-	pendingPushMaxAge = 60 * time.Second
+	pendingPushMaxAge          = 60 * time.Second
+	defaultPendingPushMaxBytes = int64(256 << 20)
 	// maxSessionsPerAuthKey：单个 raw auth_key 允许同时在线的 session 上限。telesrv 单 DC，
 	// 一个客户端的全部连接（主连接 + 并发下载/上传）共享同一 auth_key、各用独立 session_id，
 	// 故此上限须高于真实客户端单设备的并发连接峰值，否则会误杀活跃下载/主连接：
@@ -52,10 +57,51 @@ const (
 	maxChannelIndexPerSession = 8192
 )
 
+// forceCloseBatchTimeout is one deadline for a whole revoke/replace/eviction batch. Conn.Close
+// already bounds its inbound-RPC wait, but calling ForceClose serially would multiply that bound
+// by the number of sessions. The batch helper starts every close concurrently and waits at most
+// this one shared interval.
+const forceCloseBatchTimeout = rpcCloseWaitTimeout
+
+// maxForceCloseParallelism caps control-plane close goroutines even if a corrupted/runtime index
+// hands a revoke path far more sessions than maxSessionsPerAuthKey. Every Conn's producer/RPC gate
+// is closed synchronously before these workers start, so a stuck transport.Close cannot admit more
+// memory while the bounded workers continue draining physical sockets in the background.
+const maxForceCloseParallelism = 64
+
 type queuedPush struct {
-	t   proto.MessageType
-	msg bin.Encoder
-	at  time.Time
+	t           proto.MessageType
+	encoded     *encodedOutboundMessage
+	reservation *pendingPushReservation
+	at          time.Time
+}
+
+type pendingPushReservation struct {
+	budget *outboundTrackedBudget
+	bytes  int
+	refs   atomic.Int32
+}
+
+func (r *pendingPushReservation) retain() {
+	if r == nil {
+		return
+	}
+	if refs := r.refs.Add(1); refs <= 1 {
+		panic("mtprotoedge: retained released pending push reservation")
+	}
+}
+
+func (r *pendingPushReservation) release() {
+	if r == nil {
+		return
+	}
+	refs := r.refs.Add(-1)
+	if refs < 0 {
+		panic("mtprotoedge: pending push reservation released more than retained")
+	}
+	if refs == 0 {
+		r.budget.release(r.bytes)
+	}
 }
 
 type sessionKey struct {
@@ -70,12 +116,16 @@ type SessionLifecycleObserver interface {
 
 // SessionManager 是活跃连接注册表，支持按 session / auth-key / user 查找并主动 push。
 //
-// 它管理运行态的在线连接，与持久化的 store.SessionStore 互补：后者记录 session 数据，
-// 前者持有可发送的活跃连接。所有方法并发安全。
+// 它只管理进程内运行态，持有可发送的活跃连接；协议可恢复事实由 auth key、客户端重连
+// 和 durable updates/difference 链路承担。所有方法并发安全。
 type SessionManager struct {
-	mu                sync.RWMutex
-	bySession         map[sessionKey]*Conn
-	bySessionID       map[int64]map[[8]byte]*Conn // sessionID → raw authKeyID → Conn，用于兼容旧 API 的唯一性检查
+	mu        sync.RWMutex
+	bySession map[sessionKey]*Conn
+	// claims owns the provisional -> active gap. A claimant is intentionally
+	// absent from every push/online index until its required session control frame
+	// is on the wire and PublishActivation validates the same owner.
+	claims            map[sessionKey]*Conn
+	claimsByAuth      map[[8]byte]map[int64]*Conn // raw authKeyID -> sessionID -> provisional claim
 	byAuthKey         map[[8]byte]map[int64]*Conn // raw authKeyID → sessionID → Conn
 	byBusinessAuthKey map[[8]byte]map[sessionKey]*Conn
 	byUser            map[int64]map[sessionKey]*Conn
@@ -85,6 +135,7 @@ type SessionManager struct {
 	bySessionMembers  map[sessionKey]map[int64]struct{}
 	pending           map[sessionKey][]queuedPush // updates-ready 前暂存的主动推送
 	flushing          map[sessionKey]bool         // 置位时暂存正在排空的 session；排空完成前推送继续进 pending 保序
+	pendingBudget     *outboundTrackedBudget      // 未就绪 session 暂存 encoded body 的进程级上限
 
 	lifecycle SessionLifecycleObserver
 	log       *zap.Logger
@@ -97,7 +148,8 @@ func NewSessionManager(log *zap.Logger) *SessionManager {
 	}
 	return &SessionManager{
 		bySession:         make(map[sessionKey]*Conn),
-		bySessionID:       make(map[int64]map[[8]byte]*Conn),
+		claims:            make(map[sessionKey]*Conn),
+		claimsByAuth:      make(map[[8]byte]map[int64]*Conn),
 		byAuthKey:         make(map[[8]byte]map[int64]*Conn),
 		byBusinessAuthKey: make(map[[8]byte]map[sessionKey]*Conn),
 		byUser:            make(map[int64]map[sessionKey]*Conn),
@@ -107,6 +159,7 @@ func NewSessionManager(log *zap.Logger) *SessionManager {
 		bySessionMembers:  make(map[sessionKey]map[int64]struct{}),
 		pending:           make(map[sessionKey][]queuedPush),
 		flushing:          make(map[sessionKey]bool),
+		pendingBudget:     newOutboundTrackedBudget(defaultPendingPushMaxBytes),
 		log:               log,
 	}
 }
@@ -118,34 +171,95 @@ func (m *SessionManager) SetLifecycleObserver(observer SessionLifecycleObserver)
 	m.mu.Unlock()
 }
 
-// Register 注册一个活跃连接。若同 raw auth_key_id + session_id 已存在（重连），旧连接被替换并移除索引。
-func (m *SessionManager) Register(c *Conn) {
-	m.mu.Lock()
+// BeginActivation atomically claims auth_key_id + session_id without publishing the
+// new Conn. Under the manager lock it irreversibly fences every previous owner,
+// removes active indexes and closes producer/RPC admission gates. Physical close and
+// outbound-actor convergence happen outside the lock; the caller may send the
+// required new_session_created frame only after this method returns nil.
+func (m *SessionManager) BeginActivation(c *Conn) error {
+	if c == nil || !c.beginActivationClaim() {
+		return ErrSessionActivationSuperseded
+	}
 
 	key := connSessionKey(c)
-	var replaced *Conn
-	var evicted *Conn
-	if old, ok := m.bySession[key]; ok && old != c {
-		replaced = old
-		m.removeLocked(old, false)
-	} else if existing := m.byAuthKey[c.authKeyID]; len(existing) >= maxSessionsPerAuthKey {
-		// 同 raw auth_key 的 session 数达上限且本次是新 session：驱逐建连最早的 session 让位，
-		// 防对抗客户端用海量 session_id 撑爆索引。驱逐对象与新连接同属一个设备凭据，
-		// 触顶基本是该凭据自身异常；选最旧而非 map 随机，避免误杀刚建立的活跃下载/主连接。
-		// 被驱逐连接的 serveConn 会在下一帧因 actor 已关而退出。O(cap) 扫描仅在触顶时发生。
-		for _, ec := range existing {
-			if evicted == nil || ec.createdAt.Before(evicted.createdAt) {
-				evicted = ec
-			}
+	retired := make([]*Conn, 0, 2)
+	m.mu.Lock()
+	if !c.isPhysicalTransportCurrentOpen() || c.lifecycleState() != connLifecycleClaiming {
+		c.beginTerminalShutdown()
+		m.mu.Unlock()
+		return ErrConnClosed
+	}
+	if oldClaim := m.claims[key]; oldClaim != nil && oldClaim != c {
+		m.retireClaimLocked(key, oldClaim, false)
+		retired = append(retired, oldClaim)
+	}
+	if old := m.bySession[key]; old != nil && old != c {
+		m.retireConnLocked(old, false)
+		retired = append(retired, old)
+	}
+
+	// Claims reserve a cap slot just like published sessions. Otherwise many
+	// concurrent handshakes could all pass the old byAuthKey-only check and publish
+	// beyond maxSessionsPerAuthKey.
+	for len(m.byAuthKey[c.authKeyID])+m.claimCountForAuthLocked(c.authKeyID) >= maxSessionsPerAuthKey {
+		victimKey, victim, isClaim := m.oldestAuthOwnerLocked(c.authKeyID, c)
+		if victim == nil {
+			break
 		}
-		m.removeLocked(evicted, true)
-		m.log.Debug("Evicted oldest session for auth key at cap",
+		if isClaim {
+			m.retireClaimLocked(victimKey, victim, true)
+		} else {
+			m.retireConnLocked(victim, true)
+		}
+		retired = append(retired, victim)
+		m.log.Debug("Evicted oldest session activation for auth key at cap",
 			zap.String("auth_key_id", sessionKeyLog(c.authKeyID)),
 			zap.Int("cap", maxSessionsPerAuthKey),
 		)
 	}
+	m.addClaimLocked(key, c)
+	m.mu.Unlock()
+
+	// Do not wait for old business handlers: their root context/admission gate is
+	// already canceled. We only need the old physical writer and outbound actor to
+	// converge before the new Conn is allowed to write the session barrier.
+	if !closeConnBatch(retired, forceCloseBatchTimeout, false) {
+		m.AbortActivation(c)
+		return ErrSessionActivationFence
+	}
+	return nil
+}
+
+// PublishActivation makes the current claim visible to push/online lookups. It is
+// deliberately a separate operation from BeginActivation so required protocol
+// control can be written while the Conn remains provisional and unindexed.
+func (m *SessionManager) PublishActivation(c *Conn) error {
+	if c == nil {
+		return ErrSessionActivationSuperseded
+	}
+	key := connSessionKey(c)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.claims[key] != c {
+		return ErrSessionActivationSuperseded
+	}
+	if c.lifecycleState() != connLifecycleClaiming {
+		m.removeClaimLocked(key, c)
+		return ErrConnClosed
+	}
+	if old := m.bySession[key]; old != nil && old != c {
+		// An active owner without this claim can only be a stale/unsafe publisher.
+		// Never reverse-replace it from here; the caller must reconnect and claim again.
+		m.removeClaimLocked(key, c)
+		c.beginTerminalShutdown()
+		return ErrSessionActivationSuperseded
+	}
+	if !c.publishActivation() {
+		m.removeClaimLocked(key, c)
+		return ErrConnClosed
+	}
+	m.removeClaimLocked(key, c)
 	m.bySession[key] = c
-	addSessionIDIndex(m.bySessionID, c.sessionID, c.authKeyID, c)
 	addConnIndex(m.byAuthKey, c.authKeyID, c.sessionID, c)
 	if businessAuthKeyID, resolved := c.BusinessAuthKeyID(); resolved {
 		addBusinessAuthKeyIndex(m.byBusinessAuthKey, businessAuthKeyID, key, c)
@@ -154,18 +268,35 @@ func (m *SessionManager) Register(c *Conn) {
 		c.userIDResolved.Store(true)
 		addUserIndex(m.byUser, uid, key, c)
 	}
-	m.log.Debug("Session registered",
+	m.log.Debug("Session activated",
 		zap.String("auth_key_id", sessionKeyLog(key.authKeyID)),
 		zap.Int64("session_id", c.sessionID),
 		zap.Int("online", len(m.bySession)),
 	)
-	m.mu.Unlock()
+	return nil
+}
 
-	if replaced != nil {
-		replaced.Close()
+// AbortActivation removes a claim only when c still owns it, then terminally
+// retires the provisional Conn. A superseded caller cannot delete the newer claim.
+func (m *SessionManager) AbortActivation(c *Conn) {
+	if c == nil {
+		return
 	}
-	if evicted != nil {
-		evicted.Close()
+	key := connSessionKey(c)
+	owned := false
+	m.mu.Lock()
+	if m.claims[key] == c {
+		c.beginTerminalShutdown()
+		m.removeClaimLocked(key, c)
+		if m.bySession[key] == nil {
+			m.deletePendingLocked(key)
+			delete(m.flushing, key)
+		}
+		owned = true
+	}
+	m.mu.Unlock()
+	if owned {
+		_ = closeConnBatch([]*Conn{c}, forceCloseBatchTimeout, false)
 	}
 }
 
@@ -173,13 +304,26 @@ func (m *SessionManager) Register(c *Conn) {
 // 观察者对未登录连接（userID=0）也回调：业务层据此清理按 session 维度的缓存条目，
 // 否则未登录连接的元数据只能等容量上限驱逐。
 func (m *SessionManager) Unregister(c *Conn) {
+	if c == nil {
+		return
+	}
+	// Close admission/outbound producer gates before removing indexes or invoking
+	// a lifecycle observer. An observer may block, but no old RPC/push may continue
+	// to write or enqueue work during that interval.
+	c.beginTerminalShutdown()
 	m.mu.Lock()
 	var (
 		observer    SessionLifecycleObserver
 		offlineUser int64
 		lastForUser bool
 	)
-	if cur, ok := m.bySession[connSessionKey(c)]; ok && cur == c {
+	key := connSessionKey(c)
+	if m.claims[key] == c {
+		m.removeClaimLocked(key, c)
+		m.deletePendingLocked(key)
+		delete(m.flushing, key)
+	}
+	if cur, ok := m.bySession[key]; ok && cur == c {
 		offlineUser = m.removeLocked(c, true)
 		if offlineUser != 0 {
 			lastForUser = len(m.byUser[offlineUser]) == 0
@@ -197,44 +341,28 @@ func (m *SessionManager) Unregister(c *Conn) {
 	}
 }
 
-// DestroySession 移除指定 session 的运行态索引，供 MTProto destroy_session 使用。
-func (m *SessionManager) DestroySession(sessionID int64) bool {
-	m.mu.Lock()
-	c, key, ok, ambiguous := m.uniqueSessionLocked(sessionID)
-	if ambiguous || !ok {
-		if !ambiguous {
-			m.dropPendingBySessionLocked(sessionID)
-		}
-		m.mu.Unlock()
-		return false
-	}
-	offlineUser := m.removeLocked(c, true)
-	lastForUser := offlineUser != 0 && len(m.byUser[offlineUser]) == 0
-	observer := m.lifecycle
-	m.log.Debug("Session destroyed",
-		zap.String("auth_key_id", sessionKeyLog(key.authKeyID)),
-		zap.Int64("session_id", sessionID),
-		zap.Int("online", len(m.bySession)),
-	)
-	m.mu.Unlock()
-	c.Close()
-	if observer != nil && offlineUser != 0 {
-		observer.SessionOffline(key.authKeyID, sessionID, offlineUser, lastForUser)
-	}
-	return true
-}
-
 // DestroySessionForAuthKey 精确移除某个 raw auth_key_id 下的 session。
 func (m *SessionManager) DestroySessionForAuthKey(authKeyID [8]byte, sessionID int64) bool {
 	m.mu.Lock()
 	key := sessionKey{authKeyID: authKeyID, sessionID: sessionID}
 	c, ok := m.bySession[key]
 	if !ok {
-		delete(m.pending, key)
+		if claim := m.claims[key]; claim != nil {
+			m.retireClaimLocked(key, claim, true)
+			m.mu.Unlock()
+			if !forceCloseConnBatch([]*Conn{claim}, forceCloseBatchTimeout) {
+				m.log.Warn("Claimed session close exceeded shared deadline",
+					zap.String("auth_key_id", sessionKeyLog(authKeyID)),
+					zap.Int64("session_id", sessionID),
+				)
+			}
+			return true
+		}
+		m.deletePendingLocked(key)
 		m.mu.Unlock()
 		return false
 	}
-	offlineUser := m.removeLocked(c, true)
+	offlineUser := m.retireConnLocked(c, true)
 	lastForUser := offlineUser != 0 && len(m.byUser[offlineUser]) == 0
 	observer := m.lifecycle
 	m.log.Debug("Session destroyed",
@@ -243,27 +371,16 @@ func (m *SessionManager) DestroySessionForAuthKey(authKeyID [8]byte, sessionID i
 		zap.Int("online", len(m.bySession)),
 	)
 	m.mu.Unlock()
-	c.Close()
+	if !forceCloseConnBatch([]*Conn{c}, forceCloseBatchTimeout) {
+		m.log.Warn("Destroyed session close exceeded shared deadline",
+			zap.String("auth_key_id", sessionKeyLog(authKeyID)),
+			zap.Int64("session_id", sessionID),
+		)
+	}
 	if observer != nil && offlineUser != 0 {
 		observer.SessionOffline(authKeyID, sessionID, offlineUser, lastForUser)
 	}
 	return true
-}
-
-// BindUser 缓存 session 的授权用户。userID=0 表示当前 auth_key 已确认未登录。
-// 登录后绑定非 0 userID，使其可经 PushToUser 收到推送。
-func (m *SessionManager) BindUser(sessionID, userID int64) {
-	m.mu.Lock()
-	c, key, ok, ambiguous := m.uniqueSessionLocked(sessionID)
-	if ambiguous || !ok {
-		if ambiguous {
-			m.log.Warn("Skip BindUser for ambiguous session_id", zap.Int64("session_id", sessionID))
-		}
-		m.mu.Unlock()
-		return
-	}
-	m.bindUserLocked(c, key, userID)
-	m.mu.Unlock()
 }
 
 // BindUserForAuthKey 缓存指定 raw auth_key_id + session_id 的授权用户。
@@ -287,7 +404,7 @@ func (m *SessionManager) bindUserLocked(c *Conn, key sessionKey, userID int64) {
 			c.membershipsSynced.Store(false)
 			// 身份变化即丢弃暂存推送：它们属于前一个账号，flush 给新账号是跨账号泄露。
 			// 同时取消进行中的排空（runFlush 还另有 owner 校验做批内兜底）。
-			delete(m.pending, key)
+			m.deletePendingLocked(key)
 			delete(m.flushing, key)
 		}
 	}
@@ -298,51 +415,9 @@ func (m *SessionManager) bindUserLocked(c *Conn, key sessionKey, userID int64) {
 		m.clearChannelInterestsLocked(key)
 		m.clearChannelMembershipsLocked(c, key)
 		c.membershipsSynced.Store(false)
-		delete(m.pending, key)
+		m.deletePendingLocked(key)
 		delete(m.flushing, key)
 	}
-}
-
-// UserID 返回 session 当前缓存的登录用户 id。未绑定或离线时 ok=false。
-func (m *SessionManager) UserID(sessionID int64) (int64, bool) {
-	m.mu.RLock()
-	c, _, ok, ambiguous := m.uniqueSessionLocked(sessionID)
-	m.mu.RUnlock()
-	if ambiguous || !ok {
-		return 0, false
-	}
-	userID := c.userID.Load()
-	if userID == 0 {
-		return 0, false
-	}
-	return userID, true
-}
-
-// UserIDForAuthKey 返回指定 raw auth_key_id + session_id 当前缓存的登录用户 id。
-func (m *SessionManager) UserIDForAuthKey(authKeyID [8]byte, sessionID int64) (int64, bool) {
-	m.mu.RLock()
-	c, ok := m.bySession[sessionKey{authKeyID: authKeyID, sessionID: sessionID}]
-	m.mu.RUnlock()
-	if !ok {
-		return 0, false
-	}
-	userID := c.userID.Load()
-	if userID == 0 {
-		return 0, false
-	}
-	return userID, true
-}
-
-// UserIDResolved 返回 session 的 user_id 授权状态是否已经查过。
-// resolved=true 且 userID=0 表示该 session 当前未登录。
-func (m *SessionManager) UserIDResolved(sessionID int64) (int64, bool) {
-	m.mu.RLock()
-	c, _, ok, ambiguous := m.uniqueSessionLocked(sessionID)
-	m.mu.RUnlock()
-	if ambiguous || !ok {
-		return 0, false
-	}
-	return c.UserIDResolved()
 }
 
 // UserIDResolvedForAuthKey 返回指定 raw auth_key_id + session_id 的 user_id 缓存状态。
@@ -354,21 +429,6 @@ func (m *SessionManager) UserIDResolvedForAuthKey(authKeyID [8]byte, sessionID i
 		return 0, false
 	}
 	return c.UserIDResolved()
-}
-
-// BindAuthKey 缓存业务视角 auth_key_id（temp auth_key 解析后的 perm auth_key）。
-func (m *SessionManager) BindAuthKey(sessionID int64, authKeyID [8]byte) {
-	m.mu.Lock()
-	c, key, ok, ambiguous := m.uniqueSessionLocked(sessionID)
-	if ambiguous || !ok {
-		if ambiguous {
-			m.log.Warn("Skip BindAuthKey for ambiguous session_id", zap.Int64("session_id", sessionID))
-		}
-		m.mu.Unlock()
-		return
-	}
-	m.bindAuthKeyLocked(c, key, authKeyID)
-	m.mu.Unlock()
 }
 
 // BindAuthKeyForSession 缓存指定 raw auth_key_id + session_id 的业务 auth_key_id。
@@ -399,23 +459,11 @@ func (m *SessionManager) bindAuthKeyLocked(c *Conn, key sessionKey, authKeyID [8
 		m.clearChannelInterestsLocked(key)
 		m.clearChannelMembershipsLocked(c, key)
 		c.membershipsSynced.Store(false)
-		delete(m.pending, key)
+		m.deletePendingLocked(key)
 		delete(m.flushing, key)
 		c.userID.Store(0)
 		c.userIDResolved.Store(false)
 	}
-}
-
-// AuthKeyID 返回 session 缓存的业务视角 auth_key_id。
-// ok=false 表示该连接尚未完成 temp→perm 解析。
-func (m *SessionManager) AuthKeyID(sessionID int64) ([8]byte, bool) {
-	m.mu.RLock()
-	c, _, ok, ambiguous := m.uniqueSessionLocked(sessionID)
-	m.mu.RUnlock()
-	if ambiguous || !ok {
-		return [8]byte{}, false
-	}
-	return c.BusinessAuthKeyID()
 }
 
 // AuthKeyIDForSession 返回指定 raw auth_key_id + session_id 缓存的业务 auth_key_id。
@@ -447,9 +495,16 @@ func (m *SessionManager) CloseSessionsForBusinessAuthKey(authKeyID [8]byte) int 
 		if !connUsesBusinessAuthKey(c, authKeyID) {
 			continue
 		}
-		uid := m.removeLocked(c, true)
+		uid := m.retireConnLocked(c, true)
 		conns = append(conns, c)
 		events = append(events, offlineEvent{key: key, userID: uid, last: uid != 0 && len(m.byUser[uid]) == 0})
+	}
+	for key, c := range m.claims {
+		if !connUsesBusinessAuthKey(c, authKeyID) {
+			continue
+		}
+		m.retireClaimLocked(key, c, true)
+		conns = append(conns, c)
 	}
 	observer := m.lifecycle
 	if len(conns) > 0 {
@@ -459,8 +514,11 @@ func (m *SessionManager) CloseSessionsForBusinessAuthKey(authKeyID [8]byte) int 
 		)
 	}
 	m.mu.Unlock()
-	for _, c := range conns {
-		c.ForceClose()
+	if !forceCloseConnBatch(conns, forceCloseBatchTimeout) {
+		m.log.Warn("Revoked auth-key session close exceeded shared deadline",
+			zap.String("auth_key_id", sessionKeyLog(authKeyID)),
+			zap.Int("sessions", len(conns)),
+		)
 	}
 	if observer != nil {
 		for _, e := range events {
@@ -470,10 +528,26 @@ func (m *SessionManager) CloseSessionsForBusinessAuthKey(authKeyID [8]byte) int 
 	return len(conns)
 }
 
-// CloseSessionsForRawAuthKeyExcept 强制断开指定 raw auth_key 的活跃连接，可排除
-// 一个 session（destroy_auth_key 的发起连接：响应要先送达，它的密钥已删，下一帧
-// 自然失效）。出站推送不回查密钥库，必须主动断开底层 transport 才能让销毁立即生效。
+// CloseSessionsForRawAuthKeyExcept 强制断开指定 raw auth_key 的活跃连接，可按
+// session ID 排除一个 session。该接口供业务层授权撤销使用；wire-level
+// destroy_auth_key 必须改用精确 Conn 排除，避免同 session replacement 被误放过。
 func (m *SessionManager) CloseSessionsForRawAuthKeyExcept(authKeyID [8]byte, exceptSessionID int64) int {
+	return m.closeSessionsForRawAuthKey(authKeyID, func(sessionID int64, _ *Conn) bool {
+		return sessionID == exceptSessionID
+	})
+}
+
+// CloseSessionsForRawAuthKeyExceptConn closes every active/claiming owner for a raw
+// auth key except the exact Conn executing destroy_auth_key. A session ID is not an
+// identity: a concurrent replacement may already own the same logical session while
+// the retired request handler finishes deletion.
+func (m *SessionManager) CloseSessionsForRawAuthKeyExceptConn(authKeyID [8]byte, except *Conn) int {
+	return m.closeSessionsForRawAuthKey(authKeyID, func(_ int64, c *Conn) bool {
+		return c == except
+	})
+}
+
+func (m *SessionManager) closeSessionsForRawAuthKey(authKeyID [8]byte, skip func(int64, *Conn) bool) int {
 	type offlineEvent struct {
 		key    sessionKey
 		userID int64
@@ -483,18 +557,29 @@ func (m *SessionManager) CloseSessionsForRawAuthKeyExcept(authKeyID [8]byte, exc
 	var conns []*Conn
 	var events []offlineEvent
 	for sessionID, c := range m.byAuthKey[authKeyID] {
-		if sessionID == exceptSessionID {
+		if skip != nil && skip(sessionID, c) {
 			continue
 		}
 		key := sessionKey{authKeyID: authKeyID, sessionID: sessionID}
-		uid := m.removeLocked(c, true)
+		uid := m.retireConnLocked(c, true)
 		conns = append(conns, c)
 		events = append(events, offlineEvent{key: key, userID: uid, last: uid != 0 && len(m.byUser[uid]) == 0})
 	}
+	for sessionID, c := range m.claimsByAuth[authKeyID] {
+		if skip != nil && skip(sessionID, c) {
+			continue
+		}
+		key := sessionKey{authKeyID: authKeyID, sessionID: sessionID}
+		m.retireClaimLocked(key, c, true)
+		conns = append(conns, c)
+	}
 	observer := m.lifecycle
 	m.mu.Unlock()
-	for _, c := range conns {
-		c.ForceClose()
+	if !forceCloseConnBatch(conns, forceCloseBatchTimeout) {
+		m.log.Warn("Raw auth-key session close exceeded shared deadline",
+			zap.String("auth_key_id", sessionKeyLog(authKeyID)),
+			zap.Int("sessions", len(conns)),
+		)
 	}
 	if observer != nil {
 		for _, e := range events {
@@ -502,6 +587,107 @@ func (m *SessionManager) CloseSessionsForRawAuthKeyExcept(authKeyID [8]byte, exc
 		}
 	}
 	return len(conns)
+}
+
+// forceCloseConnBatch closes every producer/RPC gate first, then closes physical transports with a
+// bounded worker set. Physical close and actor/RPC convergence share one batch deadline; the wait is
+// never multiplied by the number of sessions. Workers may finish physical closes after the caller's
+// deadline, but no timed-out Conn can enqueue more work in that interval. Nil/duplicate entries are
+// removed so Register's replacement/eviction slots cannot close the same Conn twice.
+func forceCloseConnBatch(conns []*Conn, timeout time.Duration) bool {
+	return closeConnBatch(conns, timeout, true)
+}
+
+// closeConnBatch always converges physical writers/outbound actors. waitInbound
+// is reserved for destructive control-plane operations; activation takeover sets
+// it false so a canceled business handler that ignores its context cannot stall a
+// healthy replacement. Its admission and response writer are already terminal.
+func closeConnBatch(conns []*Conn, timeout time.Duration, waitInbound bool) bool {
+	if len(conns) == 0 {
+		return true
+	}
+	unique := make([]*Conn, 0, len(conns))
+	seen := make(map[*Conn]struct{}, len(conns))
+	for _, c := range conns {
+		if c == nil {
+			continue
+		}
+		if _, ok := seen[c]; ok {
+			continue
+		}
+		seen[c] = struct{}{}
+		unique = append(unique, c)
+	}
+	if len(unique) == 0 {
+		return true
+	}
+
+	// This phase is non-blocking and must precede transport.Close: it is the safety boundary if
+	// an implementation of transport.Conn.Close itself blocks past the batch deadline.
+	for _, c := range unique {
+		c.beginTerminalShutdown()
+	}
+
+	workers := min(len(unique), maxForceCloseParallelism)
+	jobs := make(chan *Conn, len(unique))
+	for _, c := range unique {
+		jobs <- c
+	}
+	close(jobs)
+	var closeWG sync.WaitGroup
+	closeWG.Add(workers)
+	for range workers {
+		go func() {
+			defer closeWG.Done()
+			for c := range jobs {
+				c.closeTransport()
+			}
+		}()
+	}
+	physicalDone := make(chan struct{})
+	go func() {
+		closeWG.Wait()
+		close(physicalDone)
+	}()
+
+	if timeout <= 0 {
+		return false
+	}
+	deadline := time.Now().Add(timeout)
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case <-physicalDone:
+	case <-timer.C:
+		return false
+	}
+
+	// All physical close calls returned. Wait for memory-owning actor/RPC work using the same
+	// deadline; the first genuinely stuck Conn consumes the remaining allowance, not a fresh 5s.
+	for _, c := range unique {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		if waitInbound && c.rpcScheduler != nil && !c.waitInboundShutdown(remaining) {
+			return false
+		}
+		if c.outboundDone == nil {
+			continue
+		}
+		remaining = time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		wait := time.NewTimer(remaining)
+		select {
+		case <-c.outboundDone:
+			wait.Stop()
+		case <-wait.C:
+			return false
+		}
+	}
+	return true
 }
 
 // UnbindAuthKey 清理某业务 auth_key 下所有活跃连接的登录用户缓存。
@@ -520,34 +706,12 @@ func (m *SessionManager) UnbindAuthKey(authKeyID [8]byte) int {
 		m.clearChannelMembershipsLocked(c, key)
 		c.membershipsSynced.Store(false)
 		// 授权解除后暂存推送属于已登出的账号，不能等下一个登录者置位时 flush 出去。
-		delete(m.pending, key)
+		m.deletePendingLocked(key)
 		delete(m.flushing, key)
 		c.userIDResolved.Store(true)
 		count++
 	}
 	return count
-}
-
-// SetReceivesUpdates 标记 session 是否已完成 updates 同步入口。
-//
-// TDesktop 登录后会先调用 updates.getState/getDifference 建立本地同步基线。
-// 在此之前收到的主动 updates 先暂存，待 session 可接收后再异步下发。
-func (m *SessionManager) SetReceivesUpdates(sessionID int64, receives bool) {
-	m.mu.Lock()
-	c, key, ok, ambiguous := m.uniqueSessionLocked(sessionID)
-	if ambiguous || !ok {
-		if ambiguous {
-			m.log.Warn("Skip SetReceivesUpdates for ambiguous session_id", zap.Int64("session_id", sessionID))
-		}
-		m.mu.Unlock()
-		return
-	}
-	owner, start := m.setReceivesUpdatesLocked(c, key, receives)
-	m.mu.Unlock()
-
-	if start {
-		go m.runFlush(c, key, owner, 0)
-	}
 }
 
 // setReceivesUpdatesLocked 是置位/复位的共同内核，调用方须持有 m.mu。
@@ -595,7 +759,7 @@ func (m *SessionManager) runFlush(c *Conn, key sessionKey, owner int64, attempt 
 		}
 		if c.userID.Load() != owner {
 			// 排空期间发生登出/换号：剩余暂存属于旧账号，丢弃且不得发给新账号。
-			delete(m.pending, key)
+			m.deletePendingLocked(key)
 			delete(m.flushing, key)
 			m.mu.Unlock()
 			return
@@ -613,38 +777,47 @@ func (m *SessionManager) runFlush(c *Conn, key sessionKey, owner int64, attempt 
 			// 每条发送前复查身份：登出/换号后 batch 的剩余条目不能继续发到已易主的连接。
 			if c.userID.Load() != owner {
 				m.mu.Lock()
-				delete(m.pending, key)
+				m.deletePendingLocked(key)
 				delete(m.flushing, key)
 				m.mu.Unlock()
+				releaseQueuedPushes(batch[i:])
 				return
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			err := c.Send(ctx, item.t, item.msg)
+			// Pending entries are durable account updates. Shared body-budget pressure is not
+			// evidence that this socket is corrupt, so use the non-terminal enqueue path; after
+			// bounded retries, getDifference is the authoritative recovery path.
+			err := c.SendBestEffortEncoded(ctx, item.t, item.encoded, 5*time.Second)
 			cancel()
 			if err == nil {
+				item.release()
 				continue
 			}
 			m.mu.Lock()
 			if cur, ok := m.bySession[key]; !ok || cur != c || !m.flushing[key] || c.userID.Load() != owner {
 				// 连接换代/取消/易主：剩余 batch 不属于当前连接当前账号，丢弃。
 				if c.userID.Load() != owner {
-					delete(m.pending, key)
+					m.deletePendingLocked(key)
 					delete(m.flushing, key)
 				}
 				m.mu.Unlock()
+				releaseQueuedPushes(batch[i:])
 				return
 			}
 			rest := append(append([]queuedPush(nil), batch[i:]...), m.pending[key]...)
 			if len(rest) > maxPendingPushesPerSession {
 				// 与 queueLocked 溢出策略一致：丢最旧留最新，让 pts 空洞集中在最前端，
 				// flush 首条即触发客户端 gap 检测，恢复路径最短。
-				rest = rest[len(rest)-maxPendingPushesPerSession:]
+				dropped := len(rest) - maxPendingPushesPerSession
+				releaseQueuedPushes(rest[:dropped])
+				rest = rest[dropped:]
 			}
 			m.pending[key] = rest
 			if attempt+1 >= maxFlushAttempts {
 				// 重试用尽：置位激活避免 idle 客户端永久断流；剩余暂存中的 durable 更新
 				// 由客户端后续 pts 空洞触发 getDifference 补齐。
 				c.receivesUpdates.Store(true)
+				m.deletePendingLocked(key)
 				delete(m.flushing, key)
 				m.mu.Unlock()
 				m.log.Debug("Flush gave up after retries; activated with getDifference fallback",
@@ -715,43 +888,43 @@ func (m *SessionManager) SetReceivesUpdatesForAuthKey(authKeyID [8]byte, session
 	}
 }
 
-// PushToSession 向指定 session 推送一条消息。
-func (m *SessionManager) PushToSession(ctx context.Context, sessionID int64, t proto.MessageType, msg bin.Encoder) error {
-	m.mu.Lock()
-	c, key, ok, ambiguous := m.uniqueSessionLocked(sessionID)
-	if ambiguous {
-		m.mu.Unlock()
-		return ErrSessionAmbiguous
-	}
-	if !ok {
-		m.mu.Unlock()
-		return ErrSessionNotFound
-	}
-	if !c.receivesUpdates.Load() {
-		m.queueLocked(key, t, msg)
-		m.mu.Unlock()
-		return nil
-	}
-	m.mu.Unlock()
-	return c.Send(ctx, t, msg)
-}
-
 // PushToSessionForAuthKey 向指定 raw auth_key_id + session_id 推送一条消息。
 func (m *SessionManager) PushToSessionForAuthKey(ctx context.Context, authKeyID [8]byte, sessionID int64, t proto.MessageType, msg bin.Encoder) error {
-	m.mu.Lock()
+	m.mu.RLock()
 	key := sessionKey{authKeyID: authKeyID, sessionID: sessionID}
+	c, ok := m.bySession[key]
+	if !ok {
+		m.mu.RUnlock()
+		return ErrSessionNotFound
+	}
+	ready := c.receivesUpdates.Load()
+	m.mu.RUnlock()
+	if ready {
+		return c.Send(ctx, t, msg)
+	}
+	return m.queueOrSendPrepared(ctx, key, t, msg)
+}
+
+func (m *SessionManager) queueOrSendPrepared(ctx context.Context, key sessionKey, t proto.MessageType, msg bin.Encoder) error {
+	encoded, reservation, err := m.preparePendingPush(ctx, msg)
+	if err != nil {
+		return err
+	}
+	defer reservation.release()
+
+	m.mu.Lock()
 	c, ok := m.bySession[key]
 	if !ok {
 		m.mu.Unlock()
 		return ErrSessionNotFound
 	}
 	if !c.receivesUpdates.Load() {
-		m.queueLocked(key, t, msg)
+		_ = m.queuePreparedLocked(key, t, encoded, reservation)
 		m.mu.Unlock()
 		return nil
 	}
 	m.mu.Unlock()
-	return c.Send(ctx, t, msg)
+	return c.SendEncoded(ctx, t, encoded)
 }
 
 // PushToSessionForAuthKeyImmediate 向指定 raw auth_key_id + session_id 立即推送一条消息。
@@ -770,19 +943,7 @@ func (m *SessionManager) PushToSessionForAuthKeyImmediate(ctx context.Context, a
 	return c.SendBestEffort(ctx, t, msg, 2*time.Second)
 }
 
-// PushToUser 向某 user 所有活跃连接推送，返回已发送或已暂存的连接数。
-// 发送在释放锁后进行，避免持锁阻塞于网络 IO。
-func (m *SessionManager) PushToUser(ctx context.Context, userID int64, t proto.MessageType, msg bin.Encoder) (int, error) {
-	return m.PushToUserExceptAuthKeySession(ctx, userID, [8]byte{}, 0, t, msg)
-}
-
-// PushToUserExceptSession 向某 user 所有活跃连接推送，但跳过指定 session。
-// 未完成 updates 同步入口的 session 会先暂存，等 SetReceivesUpdates(true) 后再发。
-func (m *SessionManager) PushToUserExceptSession(ctx context.Context, userID, excludeSessionID int64, t proto.MessageType, msg bin.Encoder) (int, error) {
-	return m.pushToUser(ctx, userID, nil, excludeSessionID, t, msg)
-}
-
-// PushToUserExceptAuthKeySession 向某 user 所有活跃连接推送，跳过指定业务 auth_key + session。
+// PushToUserExceptAuthKeySession 向某 user 所有活跃连接推送，跳过指定 raw auth_key + session。
 func (m *SessionManager) PushToUserExceptAuthKeySession(ctx context.Context, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64, t proto.MessageType, msg bin.Encoder) (int, error) {
 	return m.pushToUser(ctx, userID, &excludeAuthKeyID, excludeSessionID, t, msg)
 }
@@ -793,23 +954,28 @@ func (m *SessionManager) PushToUserExceptAuthKeySession(ctx context.Context, use
 // 漏 temp-key 设备）。未就绪连接跳过、不进 pending——密聊消息 durable 在 qts 队列，
 // 离线设备靠 getDifference 补回（在线推送只是加速器）。c.userID 复查防跨账号泄露。
 func (m *SessionManager) PushToUserAuthKey(ctx context.Context, userID int64, businessAuthKeyID [8]byte, t proto.MessageType, msg bin.Encoder) (int, error) {
-	getEncoded := onceEncodedOutbound(msg)
-	return m.pushToBusinessAuthKey(ctx, userID, businessAuthKeyID, false, func(c *Conn) error {
-		if c.outbound == nil || c.outboundControl == nil {
-			return ErrConnClosed
-		}
-		encoded, err := getEncoded()
-		if err != nil {
-			return err
-		}
-		return c.SendEncoded(ctx, t, encoded)
-	})
+	// Secret-chat qts is the durable source of truth, so online delivery is an accelerator just
+	// like account pts fan-out.  Do not synchronously wait for every PFS/raw connection's socket.
+	return m.pushToBusinessAuthKeyBestEffort(ctx, userID, businessAuthKeyID, t, msg, 2*time.Second)
 }
 
 // PushToUserAuthKeyTransient 是 PushToUserAuthKey 的 transient（typing）best-effort 版本。
 func (m *SessionManager) PushToUserAuthKeyTransient(ctx context.Context, userID int64, businessAuthKeyID [8]byte, t proto.MessageType, msg bin.Encoder, timeout time.Duration) (int, error) {
-	getEncoded := onceEncodedOutbound(msg)
-	return m.pushToBusinessAuthKey(ctx, userID, businessAuthKeyID, true, func(c *Conn) error {
+	return m.pushToBusinessAuthKeyBestEffort(ctx, userID, businessAuthKeyID, t, msg, timeout)
+}
+
+func (m *SessionManager) pushToBusinessAuthKeyBestEffort(ctx context.Context, userID int64, businessAuthKeyID [8]byte, t proto.MessageType, msg bin.Encoder, timeout time.Duration) (int, error) {
+	getEncoded := onceEncodedOutbound(ctx, msg)
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	if ctx != nil {
+		if ctxDeadline, ok := ctx.Deadline(); ok && (deadline.IsZero() || ctxDeadline.Before(deadline)) {
+			deadline = ctxDeadline
+		}
+	}
+	return m.pushToBusinessAuthKey(ctx, userID, businessAuthKeyID, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -817,11 +983,18 @@ func (m *SessionManager) PushToUserAuthKeyTransient(ctx context.Context, userID 
 		if err != nil {
 			return err
 		}
-		return c.SendBestEffortEncoded(ctx, t, encoded, timeout)
+		remaining := timeout
+		if !deadline.IsZero() {
+			remaining = time.Until(deadline)
+			if remaining < 0 {
+				remaining = 0
+			}
+		}
+		return c.SendBestEffortEncoded(ctx, t, encoded, remaining)
 	})
 }
 
-func (m *SessionManager) pushToBusinessAuthKey(ctx context.Context, userID int64, businessAuthKeyID [8]byte, transient bool, send func(*Conn) error) (int, error) {
+func (m *SessionManager) pushToBusinessAuthKey(ctx context.Context, userID int64, businessAuthKeyID [8]byte, send func(*Conn) error) (int, error) {
 	m.mu.Lock()
 	candidates := m.businessAuthKeyCandidatesLocked(businessAuthKeyID)
 	conns := make([]*Conn, 0, len(candidates))
@@ -836,7 +1009,6 @@ func (m *SessionManager) pushToBusinessAuthKey(ctx context.Context, userID int64
 		conns = append(conns, c)
 	}
 	m.mu.Unlock()
-	_ = transient
 	var firstErr error
 	sent := 0
 	for _, c := range conns {
@@ -845,6 +1017,18 @@ func (m *SessionManager) pushToBusinessAuthKey(ctx context.Context, userID int64
 			continue
 		}
 		if err := send(c); err != nil {
+			if errors.Is(err, ErrOutboundTrackedBudget) {
+				// Shared process pressure is not evidence that this particular socket is
+				// slow. Skip this online accelerator; durable qts/difference is the truth.
+				continue
+			}
+			if errors.Is(err, ErrOutboundQueueFull) {
+				c.dropSlowConsumer()
+				continue
+			}
+			if errors.Is(err, ErrConnClosed) {
+				continue
+			}
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -856,7 +1040,7 @@ func (m *SessionManager) pushToBusinessAuthKey(ctx context.Context, userID int64
 }
 
 func (m *SessionManager) pushToUser(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, t proto.MessageType, msg bin.Encoder) (int, error) {
-	getEncoded := onceEncodedOutbound(msg)
+	getEncoded := onceEncodedOutbound(ctx, msg)
 	return m.pushToUserWithSender(ctx, userID, excludeAuthKeyID, excludeSessionID, t, msg, true, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
@@ -875,7 +1059,7 @@ func (m *SessionManager) pushToUser(ctx context.Context, userID int64, excludeAu
 // 下一次状态变化重建，囤积过期 transient 既无意义又会被 pending 的老化/溢出/重试耗尽误当
 // 「durable 兜底」丢弃。走 best-effort 发送，不阻塞调用方。
 func (m *SessionManager) PushToUserTransientExceptAuthKeySession(ctx context.Context, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64, t proto.MessageType, msg bin.Encoder, timeout time.Duration) (int, error) {
-	getEncoded := onceEncodedOutbound(msg)
+	getEncoded := onceEncodedOutbound(ctx, msg)
 	return m.pushToUserWithSender(ctx, userID, &excludeAuthKeyID, excludeSessionID, t, msg, false, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
@@ -888,16 +1072,24 @@ func (m *SessionManager) PushToUserTransientExceptAuthKeySession(ctx context.Con
 	})
 }
 
-func (m *SessionManager) PushToUserExceptSessionBestEffort(ctx context.Context, userID, excludeSessionID int64, t proto.MessageType, msg bin.Encoder, timeout time.Duration) (int, error) {
-	return m.pushToUserBestEffort(ctx, userID, nil, excludeSessionID, t, msg, timeout)
-}
-
 func (m *SessionManager) PushToUserExceptAuthKeySessionBestEffort(ctx context.Context, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64, t proto.MessageType, msg bin.Encoder, timeout time.Duration) (int, error) {
 	return m.pushToUserBestEffort(ctx, userID, &excludeAuthKeyID, excludeSessionID, t, msg, timeout)
 }
 
 func (m *SessionManager) pushToUserBestEffort(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, t proto.MessageType, msg bin.Encoder, timeout time.Duration) (int, error) {
-	getEncoded := onceEncodedOutbound(msg)
+	getEncoded := onceEncodedOutbound(ctx, msg)
+	// timeout 是整次 fan-out 的等待预算，不是每个 session 各自一份。健康连接始终先走
+	// SendBestEffortEncoded 的非阻塞快路径；预算耗尽后 remaining=0，仍会尝试快路径，
+	// 但不会再为后续慢连接串行等待。
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	if ctx != nil {
+		if ctxDeadline, ok := ctx.Deadline(); ok && (deadline.IsZero() || ctxDeadline.Before(deadline)) {
+			deadline = ctxDeadline
+		}
+	}
 	return m.pushToUserWithSender(ctx, userID, excludeAuthKeyID, excludeSessionID, t, msg, true, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
@@ -906,18 +1098,25 @@ func (m *SessionManager) pushToUserBestEffort(ctx context.Context, userID int64,
 		if err != nil {
 			return err
 		}
-		return c.SendBestEffortEncoded(ctx, t, encoded, timeout)
+		remaining := timeout
+		if !deadline.IsZero() {
+			remaining = time.Until(deadline)
+			if remaining < 0 {
+				remaining = 0
+			}
+		}
+		return c.SendBestEffortEncoded(ctx, t, encoded, remaining)
 	})
 }
 
-func onceEncodedOutbound(msg bin.Encoder) func() (*encodedOutboundMessage, error) {
+func onceEncodedOutbound(ctx context.Context, msg bin.Encoder) func() (*encodedOutboundMessage, error) {
 	var (
 		encoded *encodedOutboundMessage
 		err     error
 	)
 	return func() (*encodedOutboundMessage, error) {
 		if encoded == nil && err == nil {
-			encoded, err = encodeOutboundMessage(msg)
+			encoded, err = encodeOutboundMessageContext(ctx, msg)
 		}
 		return encoded, err
 	}
@@ -957,6 +1156,10 @@ func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64,
 	}
 	m.mu.RUnlock()
 	if needQueue {
+		// TL encoding and the process-wide pending-byte reservation may be expensive or
+		// briefly block on the global encode gate. Do both before taking SessionManager.mu,
+		// then share the immutable body across every not-ready session found by the re-scan.
+		pendingEncoded, pendingReservation, pendingErr := m.preparePendingPush(ctx, msg)
 		// 写锁下完整重扫（读锁释放到此之间状态可能变化，以重扫结果为准）。
 		conns = conns[:0]
 		queued, dropped, excluded, skipped = 0, 0, 0, 0
@@ -972,7 +1175,7 @@ func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64,
 					skipped++
 					continue
 				}
-				if m.queueLocked(key, t, msg) {
+				if pendingErr == nil && m.queuePreparedLocked(key, t, pendingEncoded, pendingReservation) {
 					queued++
 					if debug {
 						m.log.Debug("Push queued (session not updates-ready)",
@@ -996,6 +1199,15 @@ func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64,
 			conns = append(conns, c)
 		}
 		m.mu.Unlock()
+		if pendingReservation != nil {
+			pendingReservation.release() // drop producer ref; queued entries own the body now.
+		}
+		if pendingErr != nil && debug {
+			m.log.Debug("Drop pending pushes outside byte budget",
+				zap.Int64("user_id", userID),
+				zap.Error(pendingErr),
+			)
+		}
 	}
 
 	var firstErr error
@@ -1008,6 +1220,29 @@ func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64,
 			continue
 		}
 		if err := send(c); err != nil {
+			if errors.Is(err, ErrOutboundTrackedBudget) {
+				// Do not turn pressure owned by other sockets into a reconnect storm on
+				// healthy recipients. The durable event remains recoverable by difference.
+				dropped++
+				continue
+			}
+			// 对 durable/best-effort fan-out，队列满意味着该 socket 已成为慢消费者。
+			// 立即摘除并把它视为离线：不能让其错误把已经投递给健康 session 的 outbox
+			// 行整体重试。该 session 的 durable gap 由 getDifference 恢复。
+			if errors.Is(err, ErrOutboundQueueFull) {
+				c.dropSlowConsumer()
+				if debug {
+					m.log.Debug("Drop slow outbound consumer",
+						zap.Int64("user_id", userID),
+						zap.String("auth_key_id", sessionKeyLog(c.authKeyID)),
+						zap.Int64("session_id", c.sessionID),
+					)
+				}
+				continue
+			}
+			if errors.Is(err, ErrConnClosed) {
+				continue
+			}
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -1048,11 +1283,22 @@ func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64,
 	return sent + queued, firstErr
 }
 
-// Online 返回当前活跃连接数。
-func (m *SessionManager) Online() int {
+// ActiveRawAuthKeyIDs 返回当前物理连接实际使用的 raw auth_key_id 去重快照。
+// maintenance 用它保护“已建 key 但尚未登录”的长连接不被 orphan GC 删除；不能用
+// business/temp→perm key 替代，否则活跃 temp 连接仍可能误删。
+func (m *SessionManager) ActiveRawAuthKeyIDs() [][8]byte {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return len(m.bySession)
+	seen := make(map[[8]byte]struct{}, len(m.bySession))
+	out := make([][8]byte, 0, len(m.byAuthKey))
+	for key := range m.bySession {
+		if _, ok := seen[key.authKeyID]; ok {
+			continue
+		}
+		seen[key.authKeyID] = struct{}{}
+		out = append(out, key.authKeyID)
+	}
+	return out
 }
 
 // IsUserOnline returns whether userID has at least one active connection.
@@ -1268,6 +1514,35 @@ func (m *SessionManager) OnlineChannelMemberUserIDsExcluding(channelID int64, ex
 	return out
 }
 
+// OnlineChannelIDsSnapshot returns every channel with at least one live joined-member session in
+// strictly ascending order. The global SessionManager lock is held only while copying map keys;
+// sorting and all recovery database work happen after unlock. The fixed saturation-recovery actor
+// is the sole caller, so its exceptional-path temporary memory is one int64 slice (peak about 8*C
+// bytes) rather than repeated O(C) scans under the connection/membership lock.
+func (m *SessionManager) OnlineChannelIDsSnapshot() []int64 {
+	m.mu.RLock()
+	out := make([]int64, 0, len(m.byMemberChannel))
+	for channelID, sessions := range m.byMemberChannel {
+		if channelID <= 0 || len(sessions) == 0 {
+			continue
+		}
+		live := false
+		for key := range sessions {
+			if _, ok := m.bySession[key]; ok {
+				live = true
+				break
+			}
+		}
+		if !live {
+			continue
+		}
+		out = append(out, channelID)
+	}
+	m.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
 func (m *SessionManager) onlineChannelUsers(index map[int64]map[sessionKey]int64, channelID int64, limit int) []int64 {
 	if channelID == 0 {
 		return nil
@@ -1301,8 +1576,10 @@ func (m *SessionManager) onlineChannelUsers(index map[int64]map[sessionKey]int64
 
 func (m *SessionManager) removeLocked(c *Conn, dropPending bool) int64 {
 	key := connSessionKey(c)
+	if m.bySession[key] != c {
+		return 0
+	}
 	delete(m.bySession, key)
-	removeSessionIDIndex(m.bySessionID, c.sessionID, c.authKeyID)
 	removeConnIndex(m.byAuthKey, c.authKeyID, c.sessionID)
 	if businessAuthKeyID, resolved := c.BusinessAuthKeyID(); resolved {
 		removeBusinessAuthKeyIndex(m.byBusinessAuthKey, businessAuthKeyID, key)
@@ -1314,10 +1591,79 @@ func (m *SessionManager) removeLocked(c *Conn, dropPending bool) int64 {
 	m.clearChannelInterestsLocked(key)
 	m.clearChannelMembershipsLocked(c, key)
 	if dropPending {
-		delete(m.pending, key)
+		m.deletePendingLocked(key)
 	}
 	delete(m.flushing, key)
 	return uid
+}
+
+// retireConnLocked closes every admission/producer gate before the Conn leaves
+// manager indexes. Callers may close the physical transport and wait outside m.mu,
+// but no pointer collected by an earlier fan-out can enqueue after this returns.
+func (m *SessionManager) retireConnLocked(c *Conn, dropPending bool) int64 {
+	if c == nil {
+		return 0
+	}
+	c.beginTerminalShutdown()
+	return m.removeLocked(c, dropPending)
+}
+
+func (m *SessionManager) retireClaimLocked(key sessionKey, c *Conn, dropPending bool) {
+	if c == nil || m.claims[key] != c {
+		return
+	}
+	c.beginTerminalShutdown()
+	m.removeClaimLocked(key, c)
+	if dropPending && m.bySession[key] == nil {
+		m.deletePendingLocked(key)
+	}
+	delete(m.flushing, key)
+}
+
+func (m *SessionManager) claimCountForAuthLocked(authKeyID [8]byte) int {
+	return len(m.claimsByAuth[authKeyID])
+}
+
+func (m *SessionManager) oldestAuthOwnerLocked(authKeyID [8]byte, exclude *Conn) (sessionKey, *Conn, bool) {
+	var (
+		oldestKey sessionKey
+		oldest    *Conn
+		isClaim   bool
+	)
+	for sessionID, candidate := range m.byAuthKey[authKeyID] {
+		if candidate == nil || candidate == exclude {
+			continue
+		}
+		if oldest == nil || candidate.createdAt.Before(oldest.createdAt) {
+			oldestKey = sessionKey{authKeyID: authKeyID, sessionID: sessionID}
+			oldest = candidate
+			isClaim = false
+		}
+	}
+	for sessionID, candidate := range m.claimsByAuth[authKeyID] {
+		if candidate == nil || candidate == exclude {
+			continue
+		}
+		if oldest == nil || candidate.createdAt.Before(oldest.createdAt) {
+			oldestKey = sessionKey{authKeyID: authKeyID, sessionID: sessionID}
+			oldest = candidate
+			isClaim = true
+		}
+	}
+	return oldestKey, oldest, isClaim
+}
+
+func (m *SessionManager) addClaimLocked(key sessionKey, c *Conn) {
+	m.claims[key] = c
+	addConnIndex(m.claimsByAuth, key.authKeyID, key.sessionID, c)
+}
+
+func (m *SessionManager) removeClaimLocked(key sessionKey, c *Conn) {
+	if m.claims[key] != c {
+		return
+	}
+	delete(m.claims, key)
+	removeConnIndex(m.claimsByAuth, key.authKeyID, key.sessionID)
 }
 
 func (m *SessionManager) businessAuthKeyCandidatesLocked(authKeyID [8]byte) map[sessionKey]*Conn {
@@ -1430,8 +1776,11 @@ func (m *SessionManager) takePendingLocked(key sessionKey, ready bool) []queuedP
 	now := time.Now()
 	pending := make([]queuedPush, 0, len(q))
 	dropped := 0
-	for _, item := range q {
+	for i := range q {
+		item := q[i]
+		q[i] = queuedPush{}
 		if now.Sub(item.at) > pendingPushMaxAge {
+			item.release()
 			dropped++
 			continue
 		}
@@ -1447,9 +1796,43 @@ func (m *SessionManager) takePendingLocked(key sessionKey, ready bool) []queuedP
 	return pending
 }
 
-// queueLocked 暂存一条主动推送，返回是否实际入队——stale 丢批分支会连同当前
-// 这条一起丢弃，调用方据此区分 queued/dropped 计数，避免投递日志失真。
-func (m *SessionManager) queueLocked(key sessionKey, t proto.MessageType, msg bin.Encoder) bool {
+// preparePendingPush encodes outside SessionManager.mu and reserves the one physical body before
+// releasing the process-wide encode slot. Multiple not-ready sessions may then share this
+// immutable body via reservation refs instead of encoding/copying it once per session.
+func (m *SessionManager) preparePendingPush(ctx context.Context, msg bin.Encoder) (*encodedOutboundMessage, *pendingPushReservation, error) {
+	var (
+		encoded *encodedOutboundMessage
+		bytes   int
+	)
+	err := withOutboundEncodeSlot(ctx, nil, func() error {
+		var err error
+		encoded, err = encodeOutboundMessageWithoutSlot(msg)
+		if err != nil {
+			return err
+		}
+		if encoded == nil {
+			return errors.New("nil encoded pending push")
+		}
+		bytes = len(encoded.body)
+		if bytes > maxOutboundBodyBytes {
+			return fmt.Errorf("%w: body=%d limit=%d", ErrOutboundMessageTooLarge, bytes, maxOutboundBodyBytes)
+		}
+		if !m.pendingBudget.reserve(bytes) {
+			return ErrOutboundTrackedBudget
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	reservation := &pendingPushReservation{budget: m.pendingBudget, bytes: bytes}
+	reservation.refs.Store(1) // producer ownership; queue entries retain below.
+	return encoded, reservation, nil
+}
+
+// queuePreparedLocked 暂存一条已编码的主动推送，返回是否实际入队。
+// 调用方必须在锁外保持 reservation 的 producer ref，并在全部入队完成后 release。
+func (m *SessionManager) queuePreparedLocked(key sessionKey, t proto.MessageType, encoded *encodedOutboundMessage, reservation *pendingPushReservation) bool {
 	q := m.pending[key]
 	// 过期保护：最早一条暂存已超过 pendingPushMaxAge（session 迟迟未 ready）时，丢整批并
 	// 不再囤这条，记 trace。避免「登录后从不 getState」的连接长期占用 pending 内存。
@@ -1459,11 +1842,21 @@ func (m *SessionManager) queueLocked(key sessionKey, t proto.MessageType, msg bi
 			zap.Int64("session_id", key.sessionID),
 			zap.Int("dropped", len(q)),
 		)
-		delete(m.pending, key)
+		m.deletePendingLocked(key)
 		return false
 	}
-	push := queuedPush{t: t, msg: msg, at: time.Now()}
+	if encoded == nil || reservation == nil {
+		return false
+	}
+	reservation.retain()
+	push := queuedPush{
+		t:           t,
+		encoded:     encoded,
+		reservation: reservation,
+		at:          time.Now(),
+	}
 	if len(q) >= maxPendingPushesPerSession {
+		q[0].release()
 		copy(q, q[1:])
 		q[len(q)-1] = push
 		m.pending[key] = q
@@ -1471,28 +1864,6 @@ func (m *SessionManager) queueLocked(key sessionKey, t proto.MessageType, msg bi
 	}
 	m.pending[key] = append(q, push)
 	return true
-}
-
-func (m *SessionManager) uniqueSessionLocked(sessionID int64) (*Conn, sessionKey, bool, bool) {
-	set := m.bySessionID[sessionID]
-	if len(set) == 0 {
-		return nil, sessionKey{}, false, false
-	}
-	if len(set) > 1 {
-		return nil, sessionKey{}, false, true
-	}
-	for authKeyID, c := range set {
-		return c, sessionKey{authKeyID: authKeyID, sessionID: sessionID}, true, false
-	}
-	return nil, sessionKey{}, false, false
-}
-
-func (m *SessionManager) dropPendingBySessionLocked(sessionID int64) {
-	for key := range m.pending {
-		if key.sessionID == sessionID {
-			delete(m.pending, key)
-		}
-	}
 }
 
 // RunPendingSweeper 周期回收长期滞留的 pending 暂存：被动老化（queueLocked/takePendingLocked）
@@ -1528,12 +1899,33 @@ func (m *SessionManager) sweepStalePending() {
 		if len(q) == 0 || now.Sub(q[0].at) <= pendingPushMaxAge {
 			continue
 		}
-		delete(m.pending, key)
+		m.deletePendingLocked(key)
 		dropped++
 	}
 	if dropped > 0 {
 		m.log.Debug("Swept stale pending sessions", zap.Int("dropped_sessions", dropped))
 	}
+}
+
+func (q *queuedPush) release() {
+	if q == nil {
+		return
+	}
+	reservation := q.reservation
+	*q = queuedPush{}
+	reservation.release()
+}
+
+func releaseQueuedPushes(q []queuedPush) {
+	for i := range q {
+		q[i].release()
+	}
+}
+
+func (m *SessionManager) deletePendingLocked(key sessionKey) {
+	q := m.pending[key]
+	delete(m.pending, key)
+	releaseQueuedPushes(q)
 }
 
 func addConnIndex[K comparable](idx map[K]map[int64]*Conn, key K, sessionID int64, c *Conn) {
@@ -1568,24 +1960,6 @@ func removeBusinessAuthKeyIndex(idx map[[8]byte]map[sessionKey]*Conn, authKeyID 
 		delete(set, key)
 		if len(set) == 0 {
 			delete(idx, authKeyID)
-		}
-	}
-}
-
-func addSessionIDIndex(idx map[int64]map[[8]byte]*Conn, sessionID int64, authKeyID [8]byte, c *Conn) {
-	set := idx[sessionID]
-	if set == nil {
-		set = make(map[[8]byte]*Conn)
-		idx[sessionID] = set
-	}
-	set[authKeyID] = c
-}
-
-func removeSessionIDIndex(idx map[int64]map[[8]byte]*Conn, sessionID int64, authKeyID [8]byte) {
-	if set := idx[sessionID]; set != nil {
-		delete(set, authKeyID)
-		if len(set) == 0 {
-			delete(idx, sessionID)
 		}
 	}
 }
@@ -1630,7 +2004,7 @@ func shouldExcludeSession(c *Conn, excludeAuthKeyID *[8]byte, excludeSessionID i
 	if excludeAuthKeyID == nil || *excludeAuthKeyID == ([8]byte{}) {
 		return true
 	}
-	return connUsesBusinessAuthKey(c, *excludeAuthKeyID)
+	return c.authKeyID == *excludeAuthKeyID
 }
 
 func sessionKeyLog(id [8]byte) string {

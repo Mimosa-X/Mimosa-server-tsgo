@@ -3,6 +3,7 @@ package domain
 import (
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // 本文件定义媒体相关的业务值对象（文档、照片、贴纸集、可用 reaction、消息媒体）。
@@ -81,12 +82,36 @@ type UploadedFileRef struct {
 	MD5         string // small file 客户端 md5_checksum（hex），可校验；big file 为空
 }
 
+// UploadedMediaKind identifies the durable object materialized from a one-shot upload file id.
+type UploadedMediaKind string
+
+const (
+	UploadedMediaPhoto    UploadedMediaKind = "photo"
+	UploadedMediaDocument UploadedMediaKind = "document"
+)
+
+// UploadedMediaReceipt makes InputMediaUploaded* replayable after transient upload parts have
+// been consumed. IntentHash binds the file id to the complete materialization intent (kind, part
+// metadata and document spec); MediaID points at the immutable Photo/Document returned on every
+// exact replay.
+type UploadedMediaReceipt struct {
+	OwnerUserID int64
+	FileID      int64
+	IntentHash  []byte
+	Kind        UploadedMediaKind
+	MediaID     int64
+	CreatedAt   time.Time
+}
+
 // DocumentSpec 描述从上传文件创建 Document 的元数据（来自 InputMediaUploadedDocument）。
 type DocumentSpec struct {
 	MimeType   string
 	Attributes []DocumentAttribute
 	Thumb      *UploadedFileRef // 可选缩略图上传，生成 doc:<id>:m
 	ForceFile  bool
+	// NosoundVideo 对应 inputMediaUploadedDocument.nosound_video。真实 GIF 仍会
+	// 转成 MP4，但该标志存在时按普通无声视频落库，不附 animated 属性（album 路径）。
+	NosoundVideo bool
 }
 
 // FileDownloadRequest 是 upload.getFile 解析后的下载请求；
@@ -183,6 +208,8 @@ type DocumentAttribute struct {
 	Duration          float64 `json:"duration,omitempty"`
 	RoundMessage      bool    `json:"round_message,omitempty"`
 	SupportsStreaming bool    `json:"supports_streaming,omitempty"`
+	NoSound           bool    `json:"no_sound,omitempty"`
+	VideoCodec        string  `json:"video_codec,omitempty"`
 
 	// audio
 	AudioDuration int    `json:"audio_duration,omitempty"`
@@ -328,14 +355,24 @@ func (d Document) stickerMaterialMimeOrExt() string {
 	return mimeType
 }
 
-// IsGif reports whether the document is a savable GIF (documentAttributeAnimated).
+// IsGif reports whether the document is a canonical, savable Telegram GIFv.
+// Telegram 的 GIF 是无声 MP4；仅有 animated 属性的 raw image/gif 不是合法 saved GIF。
 func (d Document) IsGif() bool {
+	if !strings.EqualFold(strings.TrimSpace(d.MimeType), "video/mp4") {
+		return false
+	}
+	var animated, video bool
 	for _, attr := range d.Attributes {
-		if attr.Kind == DocAttrAnimated {
-			return true
+		switch attr.Kind {
+		case DocAttrAnimated:
+			animated = true
+		case DocAttrVideo:
+			if !attr.RoundMessage && attr.W > 0 && attr.H > 0 && attr.Duration > 0 {
+				video = true
+			}
 		}
 	}
-	return false
+	return animated && video
 }
 
 // Photo 是已存储的 Telegram 照片（头像或图片消息）。

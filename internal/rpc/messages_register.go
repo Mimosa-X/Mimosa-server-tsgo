@@ -79,6 +79,8 @@ func (r *Router) registerMessages(d *tg.ServerDispatcher) {
 	d.OnMessagesReportMusicListen(r.onMessagesReportMusicListen)
 	d.OnMessagesReportSponsoredMessage(r.onMessagesReportSponsoredMessage)
 	d.OnMessagesReadMessageContents(r.onMessagesReadMessageContents)
+	d.OnMessagesTranslateText(r.onMessagesTranslateText)
+	d.OnMessagesTogglePeerTranslations(r.onMessagesTogglePeerTranslations)
 	d.OnMessagesGetMessagesViews(r.onMessagesGetMessagesViews)
 	d.OnMessagesGetUnreadMentions(r.onMessagesGetUnreadMentions)
 	d.OnMessagesReadMentions(r.onMessagesReadMentions)
@@ -330,7 +332,7 @@ func (r *Router) registerMessages(d *tg.ServerDispatcher) {
 				Peer:            peer,
 				MaxID:           req.MaxID,
 				Date:            int(r.clock.Now().Unix()),
-				OriginAuthKeyID: id,
+				OriginAuthKeyID: rawAuthKeyIDForOrigin(ctx),
 				OriginSessionID: sessionID,
 			})
 			if err != nil {

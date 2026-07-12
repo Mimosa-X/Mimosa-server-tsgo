@@ -19,6 +19,8 @@ func (r *Router) registerAccount(d *tg.ServerDispatcher) {
 	d.OnAccountUnregisterDevice(func(ctx context.Context, req *tg.AccountUnregisterDeviceRequest) (bool, error) {
 		return true, nil
 	})
+	d.OnAccountSendChangePhoneCode(r.onAccountSendChangePhoneCode)
+	d.OnAccountChangePhone(r.onAccountChangePhone)
 	d.OnAccountCheckUsername(r.onAccountCheckUsername)
 	d.OnAccountUpdateProfile(r.onAccountUpdateProfile)
 	d.OnAccountUpdateUsername(r.onAccountUpdateUsername)
@@ -488,8 +490,8 @@ func (r *Router) onAccountVerifyEmail(ctx context.Context, req *tg.AccountVerify
 				SentCode: tgEmailSentCode(p.PhoneCodeHash, domain.MaskEmail(email), len(strings.TrimSpace(code))),
 			}, nil
 		}
-		u, loginMessage, needSignUp, signInErr := r.deps.Auth.SignInWithEmail(ctx, r.authzFromCtx(ctx), p.PhoneNumber, p.PhoneCodeHash, code)
-		authorization, err := r.finishAuthSignIn(ctx, u, loginMessage, needSignUp, signInErr)
+		u, _, needSignUp, signInErr := r.deps.Auth.SignInWithEmail(ctx, r.authzFromCtx(ctx), p.PhoneNumber, p.PhoneCodeHash, code)
+		authorization, err := r.finishAuthSignIn(ctx, u, needSignUp, signInErr)
 		if err != nil {
 			return nil, err
 		}

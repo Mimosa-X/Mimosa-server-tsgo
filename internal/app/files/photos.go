@@ -4,14 +4,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"image"
 	"image/color"
-	"io"
 	stddraw "image/draw"
 	_ "image/jpeg" // 注册 jpeg DecodeConfig，用于读取上传头像/图片尺寸
 	"image/png"
+	"io"
 	"math"
 	"strings"
 	"time"
@@ -48,14 +49,40 @@ func (s *Service) UploadProfilePhotoKind(ctx context.Context, ownerType domain.P
 
 // CreatePhotoFromUpload 把已上传文件组装成 Photo（不绑定 profile_photos），用于频道头像 / 图片消息。
 func (s *Service) CreatePhotoFromUpload(ctx context.Context, file domain.UploadedFileRef) (domain.Photo, error) {
-	data, err := s.assembleUpload(ctx, file.OwnerUserID, file.FileID, file.Parts)
+	intentHash, err := uploadedMediaIntentHash(domain.UploadedMediaPhoto, file, nil)
+	if err != nil {
+		return domain.Photo{}, err
+	}
+	if photo, found, err := s.replayUploadedPhoto(ctx, file, intentHash); err != nil || found {
+		return photo, err
+	}
+	data, err := s.readUploadBytes(ctx, file.OwnerUserID, file.FileID, file.Parts)
 	if err != nil {
 		return domain.Photo{}, err
 	}
 	if len(data) == 0 {
 		return domain.Photo{}, domain.ErrPhotoInvalid
 	}
-	return s.createPhoto(ctx, data, photoSizeSpecsForMessage(data))
+	photo, err := s.createPhoto(ctx, data, photoSizeSpecsForMessage(data))
+	if err != nil {
+		return domain.Photo{}, err
+	}
+	receipt, err := s.commitUploadedMediaReceipt(ctx, file, domain.UploadedMediaPhoto, intentHash, photo.ID)
+	if err != nil {
+		return domain.Photo{}, err
+	}
+	if receipt.MediaID != photo.ID {
+		winner, found, err := s.media.GetPhoto(ctx, receipt.MediaID)
+		if err != nil {
+			return domain.Photo{}, err
+		}
+		if !found {
+			return domain.Photo{}, fmt.Errorf("concurrent upload receipt references missing photo %d", receipt.MediaID)
+		}
+		photo = winner
+	}
+	s.cleanupMaterializedUpload(ctx, file, "photo materialized")
+	return photo, nil
 }
 
 // CreatePhotoFromBytes stores already-fetched image bytes as a message Photo.
@@ -202,12 +229,23 @@ func validateAvatarMarkupSize(size domain.PhotoSize) error {
 
 // CreateDocumentFromUpload 把已上传文件组装成 Document（文件/视频/音频/gif/贴纸消息），落 blob + documents。
 func (s *Service) CreateDocumentFromUpload(ctx context.Context, file domain.UploadedFileRef, spec domain.DocumentSpec) (domain.Document, error) {
+	intentHash, err := uploadedMediaIntentHash(domain.UploadedMediaDocument, file, &spec)
+	if err != nil {
+		return domain.Document{}, err
+	}
+	if doc, found, err := s.replayUploadedDocument(ctx, file, intentHash); err != nil || found {
+		return doc, err
+	}
 	body, err := s.assembleUploadBlob(ctx, file.OwnerUserID, file.FileID, file.Parts)
 	if err != nil {
 		return domain.Document{}, err
 	}
 	if body.Size == 0 {
 		return domain.Document{}, domain.ErrDocumentInvalid
+	}
+	body, spec, err = s.normalizeUploadedGIF(ctx, body, spec)
+	if err != nil {
+		return domain.Document{}, err
 	}
 	// faststart：MP4 视频若 moov 在末尾，搬到文件头以支持流式播放。普通 Telegram 客户端
 	// 上传前会做这步；DrKLO 发 story 视频不转码导致 moov 在末尾，TDesktop 流式播放路径
@@ -234,11 +272,13 @@ func (s *Service) CreateDocumentFromUpload(ctx context.Context, file domain.Uplo
 		DCID:          s.dc,
 		Attributes:    spec.Attributes,
 	}
+	thumbMaterialized := false
 	if spec.Thumb != nil {
-		thumbData, err := s.assembleUpload(ctx, spec.Thumb.OwnerUserID, spec.Thumb.FileID, spec.Thumb.Parts)
+		thumbData, err := s.readUploadBytes(ctx, spec.Thumb.OwnerUserID, spec.Thumb.FileID, spec.Thumb.Parts)
 		if err == nil && len(thumbData) > 0 {
 			if thumb, err := s.putDocumentThumb(ctx, docID, thumbData); err == nil {
 				doc.Thumbs = []domain.PhotoSize{thumb}
+				thumbMaterialized = true
 			}
 		}
 	}
@@ -250,14 +290,74 @@ func (s *Service) CreateDocumentFromUpload(ctx context.Context, file domain.Uplo
 	if err := s.media.PutDocument(ctx, doc); err != nil {
 		return domain.Document{}, err
 	}
-	if err := s.cleanupUploadParts(ctx, file.OwnerUserID, file.FileID); err != nil {
-		s.log.Warn("cleanup assembled document upload parts failed",
-			zap.Int64("owner_user_id", file.OwnerUserID),
-			zap.Int64("file_id", file.FileID),
-			zap.Int64("document_id", docID),
-			zap.Error(err))
+	receipt, err := s.commitUploadedMediaReceipt(ctx, file, domain.UploadedMediaDocument, intentHash, doc.ID)
+	if err != nil {
+		return domain.Document{}, err
+	}
+	if receipt.MediaID != doc.ID {
+		winner, found, err := s.media.GetDocument(ctx, receipt.MediaID)
+		if err != nil {
+			return domain.Document{}, err
+		}
+		if !found {
+			return domain.Document{}, fmt.Errorf("concurrent upload receipt references missing document %d", receipt.MediaID)
+		}
+		doc = winner
+	}
+	s.cleanupMaterializedUpload(ctx, file, "document materialized")
+	if spec.Thumb != nil && thumbMaterialized {
+		s.cleanupMaterializedUpload(ctx, *spec.Thumb, "document thumbnail materialized")
 	}
 	return doc, nil
+}
+
+func (s *Service) normalizeUploadedGIF(ctx context.Context, body assembledUploadBlob, spec domain.DocumentSpec) (assembledUploadBlob, domain.DocumentSpec, error) {
+	if !strings.EqualFold(strings.TrimSpace(spec.MimeType), "image/gif") || spec.ForceFile {
+		return body, spec, nil
+	}
+	if s.gifs == nil || body.Size <= 0 || body.Size > gifTranscodeMaxInputBytes {
+		return assembledUploadBlob{}, domain.DocumentSpec{}, domain.ErrDocumentInvalid
+	}
+	data, total, err := s.blobs.GetRange(ctx, body.ObjectKey, 0, gifTranscodeMaxInputBytes+1)
+	if err != nil || total != body.Size || int64(len(data)) != body.Size {
+		return assembledUploadBlob{}, domain.DocumentSpec{}, domain.ErrDocumentInvalid
+	}
+	started := time.Now()
+	converted, err := s.gifs.Transcode(ctx, data)
+	if err != nil || len(converted.Data) == 0 || converted.Width <= 0 || converted.Height <= 0 || converted.Duration <= 0 {
+		s.log.Warn("GIF to MP4 conversion failed", zap.Int64("input_bytes", body.Size), zap.Error(err))
+		return assembledUploadBlob{}, domain.DocumentSpec{}, domain.ErrDocumentInvalid
+	}
+	objectKey, err := s.blobs.Put(ctx, converted.Data)
+	if err != nil {
+		return assembledUploadBlob{}, domain.DocumentSpec{}, err
+	}
+	sum := sha256.Sum256(converted.Data)
+	body = assembledUploadBlob{ObjectKey: objectKey, Size: int64(len(converted.Data)), SHA256: append([]byte(nil), sum[:]...)}
+	spec.MimeType = "video/mp4"
+	spec.Attributes = canonicalGIFVideoAttributes(spec.Attributes, converted, spec.NosoundVideo)
+	s.log.Info("GIF normalized to MP4",
+		zap.Int64("input_bytes", total), zap.Int("output_bytes", len(converted.Data)),
+		zap.Int("width", converted.Width), zap.Int("height", converted.Height),
+		zap.Float64("duration", converted.Duration), zap.Duration("dur", time.Since(started)))
+	return body, spec, nil
+}
+
+func canonicalGIFVideoAttributes(attrs []domain.DocumentAttribute, video GIFVideo, nosoundVideo bool) []domain.DocumentAttribute {
+	out := make([]domain.DocumentAttribute, 0, 3)
+	for _, attr := range attrs {
+		if attr.Kind == domain.DocAttrFilename {
+			out = append(out, attr)
+		}
+	}
+	if !nosoundVideo {
+		out = append(out, domain.DocumentAttribute{Kind: domain.DocAttrAnimated})
+	}
+	out = append(out, domain.DocumentAttribute{
+		Kind: domain.DocAttrVideo, W: video.Width, H: video.Height,
+		Duration: video.Duration, SupportsStreaming: true, NoSound: true, VideoCodec: "h264",
+	})
+	return out
 }
 
 // maxFaststartBytes 限制 faststart 一次性载入内存的视频大小；超过则跳过（流式 faststart
@@ -277,6 +377,7 @@ var faststartVideoMimes = map[string]bool{
 //     此时只发生几次 16 字节读，不读整段媒体。
 //  2. 仅 moov 在末尾时才重写；且优先走流式（仅 ftyp+moov 进内存，mdat 大块分块流式拼接），
 //     不把整段视频 2× 驻留内存。moov 非末尾的罕见排布回退到全量重排。
+//
 // 任何不适用/失败都返回原 body，绝不让上传失败或损坏数据。
 func (s *Service) maybeFaststartVideoBlob(ctx context.Context, mimeType string, body assembledUploadBlob) assembledUploadBlob {
 	if !faststartVideoMimes[strings.ToLower(strings.TrimSpace(mimeType))] {
@@ -375,6 +476,18 @@ func (s *Service) CreateDocumentFromBytes(ctx context.Context, data []byte, spec
 	}
 	if strings.TrimSpace(spec.MimeType) == "" {
 		spec.MimeType = "application/octet-stream"
+	}
+	if strings.EqualFold(strings.TrimSpace(spec.MimeType), "image/gif") && !spec.ForceFile {
+		if s.gifs == nil || len(data) > gifTranscodeMaxInputBytes {
+			return domain.Document{}, domain.ErrDocumentInvalid
+		}
+		converted, err := s.gifs.Transcode(ctx, data)
+		if err != nil || len(converted.Data) == 0 || converted.Width <= 0 || converted.Height <= 0 || converted.Duration <= 0 {
+			return domain.Document{}, domain.ErrDocumentInvalid
+		}
+		data = converted.Data
+		spec.MimeType = "video/mp4"
+		spec.Attributes = canonicalGIFVideoAttributes(spec.Attributes, converted, spec.NosoundVideo)
 	}
 	objectKey, size, sum, err := s.blobs.PutReader(ctx, bytes.NewReader(data))
 	if err != nil {
