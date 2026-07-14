@@ -50,20 +50,31 @@ type Conn struct {
 	msgID          *proto.MessageIDGen
 	writeTimeout   time.Duration
 	metrics        Metrics
+	// now shares the Server protocol clock with inbound expiry admission. Tests may
+	// advance it without sleeping; construction-only Conns fall back to time.Now.
+	now func() time.Time
 
 	authKeyID [8]byte
 	// authKeyHex 是 authKeyID 的 hex 缓存：每条 RPC 的结构化日志都会带它，
 	// 建连时算一次，避免热路径反复 hex 编码分配。
 	authKeyHex string
-	sessionID  int64
-	salt       int64
-	key        crypto.AuthKey
+	// authKeyExpiresAt=0 表示 permanent key；正值是 temporary/media-temporary
+	// key 在握手时确定的绝对协议失效时间；-1 是仅供迁移的 legacy-unknown
+	// sentinel（edge 会在创建 Conn 前以 -404 拒绝）。Conn 创建后不可变。
+	authKeyExpiresAt int
+	sessionID        int64
+	salt             int64
+	key              crypto.AuthKey
 
 	outbound        chan outboundOp
 	outboundControl chan outboundOp
-	outboundStop    chan struct{}
-	outboundDone    chan struct{}
-	outboundClose   sync.Once
+	// Critical RPC results (session/difference convergence) and large bulk
+	// responses have independent bounded lanes. The actor remains the sole writer.
+	outboundCritical chan outboundOp
+	outboundBulk     chan outboundOp
+	outboundStop     chan struct{}
+	outboundDone     chan struct{}
+	outboundClose    sync.Once
 	// outboundEnqueueMu orders producer registration against terminal close. Close
 	// flips closing under this lock before waiting, so no WaitGroup Add can race Wait.
 	outboundEnqueueMu sync.Mutex
@@ -103,6 +114,12 @@ type Conn struct {
 	rpcRunning       int
 	rpcReady         bool
 	rpcClosed        bool
+	// Rewrap aliasing never delays execution. initialized stops collecting
+	// candidates after the first valid init wrapper on this physical generation.
+	rpcRewrapInitialized atomic.Bool
+	// rpcResultAcked is invoked by the sole outbound actor after it resolves an
+	// acknowledged server frame back to the rpc_result request msg_id.
+	rpcResultAcked func(*Conn, int64)
 	// inflightRPCBytes 跟踪已入队未完成的 inbound RPC body 总字节，配合 maxInflightRPCBytes
 	// 给 RPC 队列设字节预算（不止限条数），防对抗客户端发大请求撑内存。
 	inflightRPCBytes atomic.Int64
@@ -232,6 +249,20 @@ func (c *Conn) SetClientLayer(layer int) { c.clientLayer.Store(int32(layer)) }
 
 // AuthKeyID 返回连接的 auth_key_id。
 func (c *Conn) AuthKeyID() [8]byte { return c.authKeyID }
+
+// AuthKeyExpiresAt 返回 raw 协议 key 的失效时间；0 表示 permanent key。
+func (c *Conn) AuthKeyExpiresAt() int { return c.authKeyExpiresAt }
+
+func (c *Conn) authKeyProtocolUnavailableNow() bool {
+	if c == nil {
+		return true
+	}
+	now := time.Now()
+	if c.now != nil {
+		now = c.now()
+	}
+	return authKeyProtocolUnavailable(c.authKeyExpiresAt, now)
+}
 
 // BusinessAuthKeyID 返回业务视角的 auth_key_id。
 //
