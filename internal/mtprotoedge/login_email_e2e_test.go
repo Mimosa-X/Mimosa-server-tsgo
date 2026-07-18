@@ -12,13 +12,13 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/gotd/log/logzap"
-	"github.com/gotd/td/clock"
-	"github.com/gotd/td/exchange"
-	"github.com/gotd/td/session"
-	"github.com/gotd/td/telegram"
-	"github.com/gotd/td/telegram/dcs"
-	"github.com/gotd/td/tg"
-	"github.com/gotd/td/transport"
+	"github.com/iamxvbaba/td/clock"
+	"github.com/iamxvbaba/td/exchange"
+	"github.com/iamxvbaba/td/session"
+	"github.com/iamxvbaba/td/telegram"
+	"github.com/iamxvbaba/td/telegram/dcs"
+	"github.com/iamxvbaba/td/tg"
+	"github.com/iamxvbaba/td/transport"
 
 	"telesrv/internal/app/account"
 	"telesrv/internal/app/auth"
@@ -27,6 +27,7 @@ import (
 	"telesrv/internal/app/help"
 	"telesrv/internal/app/updates"
 	"telesrv/internal/app/users"
+	"telesrv/internal/otpdelivery"
 	"telesrv/internal/rpc"
 	"telesrv/internal/store/memory"
 )
@@ -36,10 +37,10 @@ type loginEmailTestSender struct {
 	code string
 }
 
-func (s *loginEmailTestSender) SendLoginCode(_ context.Context, to, code string, _ time.Duration) error {
-	s.to = to
-	s.code = code
-	return nil
+func (s *loginEmailTestSender) Deliver(_ context.Context, req otpdelivery.Request) (otpdelivery.Result, error) {
+	s.to = req.Recipient
+	s.code = req.Code
+	return otpdelivery.Result{}, nil
 }
 
 // TestLoginEmailEndToEnd 端到端验证登录邮箱：设备 A 注册并设置登录邮箱（loginChange），
@@ -100,7 +101,7 @@ func TestLoginEmailEndToEnd(t *testing.T) {
 		Dialogs:  dialogs.NewService(dialogStore),
 	}
 	router := rpc.New(rpc.Config{DC: dc, IP: tcpAddr.IP.String(), Port: tcpAddr.Port}, deps, zaptest.NewLogger(t), clock.System)
-	srv := New(Options{Logger: zaptest.NewLogger(t), DC: dc, RSAKey: rsaKey, AuthKeys: authKeyStore, RPC: router})
+	srv := New(Options{Logger: zaptest.NewLogger(t), DC: dc, RSAKey: rsaKey, AuthKeys: authKeyStore, LayerRPC: router})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	serveErr := make(chan error, 1)

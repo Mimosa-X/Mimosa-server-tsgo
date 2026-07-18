@@ -32,7 +32,14 @@
 | `TELESRV_MTPROTO_RPC_TIMEOUT` | duration / `30s` | 调度后 RPC handler 的端到端超时。 |
 | `TELESRV_MTPROTO_RPC_GLOBAL_WORKERS` | int / `256` | 共享公平调度器 worker 数。 |
 | `TELESRV_MTPROTO_RPC_GLOBAL_MAX_TASKS` | int / `8192` | 进程级排队与执行中的 RPC task 上限。 |
-| `TELESRV_MTPROTO_RPC_GLOBAL_MAX_BYTES` | int64 bytes / `536870912` | 进程级排队/执行中 RPC request body 字节预算。 |
+| `TELESRV_MTPROTO_RPC_GLOBAL_MAX_BYTES` | int64 charge bytes / `536870912` | 进程级已预留/排队/执行中 RPC 内存 charge 预算；legacy 等于 copied body，exact 是 typed decode 前按 wire 与生成对象放大计算的保守 materialization charge，不代表可并发接收同等大小的 wire body。 |
+| `TELESRV_MTPROTO_RPC_RESULT_CACHE_MAX_ENTRIES` | int / `262144` | 331 秒进程内重放窗口中，pending owner、completed `rpc_result` 与容量 tombstone 的全局 ownership 条目上限。owner 执行前先占 1 条，转 completed 时不重复计数。 |
+| `TELESRV_MTPROTO_RPC_RESULT_CACHE_MAX_BYTES` | int64 bytes / `67108864` | 上述 ownership 的全局 retained-byte 上限；owner 先占 1 byte，Put 转移为真实 body 或 1-byte identity tombstone。不得低于 `16775168`（单条合法 outbound body 上限）。 |
+| `TELESRV_MTPROTO_RPC_RESULT_CACHE_AUTH_MAX_ENTRIES` | int / `32768` | 单 raw auth key 的 ownership 条目上限；与全局、session 层同时计费，防一个 auth key 吃满进程缓存。必须 `global >= auth >= session`。 |
+| `TELESRV_MTPROTO_RPC_RESULT_CACHE_AUTH_MAX_BYTES` | int64 bytes / `33554432` | 单 raw auth key retained-byte 上限；必须不低于单条合法 outbound body，且满足 byte 层级关系。 |
+| `TELESRV_MTPROTO_RPC_RESULT_CACHE_SESSION_MAX_ENTRIES` | int / `16384` | 单 `raw auth key + session_id` ownership 条目上限；不同 session 不共享该局部额度。 |
+| `TELESRV_MTPROTO_RPC_RESULT_CACHE_SESSION_MAX_BYTES` | int64 bytes / `16777216` | 单 `raw auth key + session_id` retained-byte 上限；默认略高于单条合法 outbound body，确保空预算时任一合法结果可完整进入。 |
+| `TELESRV_MTPROTO_RPC_RESULT_PENDING_PER_AUTH` | int / `2048` | 单 raw auth key 的 active pending owner 附加上限；必须不大于 `RPC_GLOBAL_MAX_TASKS` 和 auth entry 上限。Put/Abort 都立即归还此 active 额度。 |
 | `TELESRV_MTPROTO_INBOUND_FRAME_GLOBAL_MAX_BYTES` | int64 bytes / `536870912` | transport wire 与最大解密明文的进程级在途预算，在分配 payload 前预留。 |
 | `TELESRV_MTPROTO_OUTBOUND_QUEUE_SIZE` | int / `128` | 单连接普通 outbound mailbox 容量。 |
 | `TELESRV_MTPROTO_OUTBOUND_CONTROL_QUEUE_SIZE` | int / `32` | 单连接控制消息 mailbox 容量。 |
@@ -68,31 +75,40 @@
 | `TELESRV_REDIS_PASSWORD` | secret string / 空 | Redis 密码。 |
 | `TELESRV_REDIS_DB` | int / `0` | Redis 逻辑库编号。 |
 | `TELESRV_LANGPACK_SEED_DIR` | path / `data/langpack` | TDesktop `.strings` 语言包 seed 目录。 |
+| `TELESRV_OFFICIAL_GIFTS_DIR` | path / `data/official-gifts` | `cmd/giftfetch` 生成的只读官方礼物快照；供管理后台选择、验哈希并显式导入。 |
 | `TELESRV_BLOB_DIR` | path / `data/blobs` | 本地开发 blob backend 的媒体字节根目录。 |
 | `TELESRV_STICKER_SEED_DIR` | path / `data/sticker-seed` | 导入 documents、sticker sets、blob 的贴纸/reaction seed 目录。 |
 | `TELESRV_STICKER_SEED_MAX_SETS` | int / `300` | 启动时导入的常规贴纸集上限；`<=0` 表示不限。 |
 
-## 5. 登录、邮箱验证码、SMTP 与 passkey
+语言包 seed 以文件 manifest 为事实源。新增语言时放入 `data/langpack/<pack>/<pack>_<lang>_v<version>.strings` 并重启 `telesrv`；`pack` 必须与所在一级目录一致，允许 Telegram 已使用的字母、数字、`-` 与 `_`（例如 `android_x`），`lang` 会统一为小写、连字符形式（例如 `pt_BR` 归一为 `pt-br`）。同一语言存在多个文件时只读取最高版本。修改已有语言的有效内容必须提高版本；同版本有效内容变化或版本倒退会阻止启动。删除语言文件或整个 pack 子目录后，下次重启会原子移除对应数据库目录和字符串。启动先流式计算源文件 SHA-256；未变化文件复用上次原子 manifest，不解析字符串也不写库，只有新增或变化文件才解析并通过 PostgreSQL `COPY` 整包替换。
+
+## 5. 登录、OTP Provider、SMTP 与 passkey
 
 | 参数 | 类型 / 代码默认值 | 说明与约束 |
 |---|---|---|
-| `TELESRV_DEV_AUTH_CODE` | sensitive string / `12345` | 固定开发登录码；生产短信/风控尚未接入，不得把默认值暴露在公网环境。 |
+| `TELESRV_DEV_AUTH_CODE` | sensitive string / `12345` | `PHONE_CODE_DELIVERY_PROVIDER=development` 使用的固定开发登录码；不得把默认值暴露在公网环境。 |
 | `TELESRV_AUTH_CODE_TTL` | duration / `5m` | 登录/注册/邮箱验证码有效期，必须为正数。 |
 | `TELESRV_AUTH_CODE_MAX_ATTEMPTS` | int / `5` | 单 code/hash 最大错误次数，必须为正数。 |
+| `TELESRV_PHONE_CODE_LENGTH` | int / `5` | `webhook` phone provider 生成的随机 SMS 验证码长度，允许 `4..10`。 |
 | `TELESRV_AUTH_CODE_PHONE_RATE_LIMIT` | int / `5` | 每个规范化手机号摘要在窗口内的发码上限；`<=0` 关闭该维度。 |
 | `TELESRV_AUTH_CODE_AUTH_KEY_RATE_LIMIT` | int / `20` | 每个 raw auth key 在窗口内的发码上限；`<=0` 关闭该维度。 |
 | `TELESRV_AUTH_CODE_RATE_WINDOW` | duration / `10m` | 手机号与 auth-key 发码限流共用窗口。 |
-| `TELESRV_LOGIN_EMAIL_ENABLE` | bool / `false` | 启用登录邮箱验证码投递；开启后 SMTP 配置成为必填。 |
+| `TELESRV_PHONE_CODE_DELIVERY_PROVIDER` | enum / `development` | `development` 使用固定码；`webhook` 为登录、注册、改号生成随机 SMS code 并调用 OTP Webhook。已有账号在两种模式下都先 durable 写入同码 777000 消息，Webhook 只是附加渠道。 |
+| `TELESRV_EMAIL_CODE_DELIVERY_PROVIDER` | enum / `smtp` | 登录邮箱、邮箱 setup/change 的投递实现：`smtp` 或 `webhook`。已有账号的登录邮箱码会先同码镜像到 777000；邮箱 setup/change 仍只走 provider。 |
+| `TELESRV_OTP_WEBHOOK_URL` | absolute URL / 空 | 任一 provider 选择 `webhook` 时必填；固定 v1 协议见 [otp-delivery.md](otp-delivery.md)。只允许 `http`/`https` 且不得含 userinfo。 |
+| `TELESRV_OTP_WEBHOOK_SECRET` | secret string / 空 | 可选 HMAC-SHA256 签名密钥；非空时发送 `X-Telesrv-Signature`。 |
+| `TELESRV_OTP_WEBHOOK_TIMEOUT` | duration / `5s` | Webhook HTTP 请求超时，启用 Webhook 时必须为正数。 |
+| `TELESRV_LOGIN_EMAIL_ENABLE` | bool / `false` | 启用登录邮箱验证码；email provider 为 `smtp` 时要求 SMTP 配置，`webhook` 时不依赖 SMTP。 |
 | `TELESRV_LOGIN_EMAIL_REQUIRE_SETUP` | bool / `false` | 强制没有登录邮箱的账号设置邮箱；要求 `TELESRV_LOGIN_EMAIL_ENABLE=true`。 |
 | `TELESRV_LOGIN_EMAIL_CODE_LENGTH` | int / `6` | 邮箱验证码长度，允许 `4..10`。 |
-| `TELESRV_SMTP_HOST` | string / 空 | SMTP host；启用登录邮箱时必填。 |
-| `TELESRV_SMTP_PORT` | int / `587` | SMTP 端口；启用登录邮箱时必须为 `1..65535`。 |
+| `TELESRV_SMTP_HOST` | string / 空 | SMTP host；启用登录邮箱且 email provider 为 `smtp` 时必填。 |
+| `TELESRV_SMTP_PORT` | int / `587` | SMTP 端口；使用 SMTP provider 时必须为 `1..65535`。 |
 | `TELESRV_SMTP_USERNAME` | sensitive string / 空 | SMTP 用户名；`TELESRV_SMTP_FROM` 为空时也用作发件人。 |
 | `TELESRV_SMTP_PASSWORD` | secret string / 空 | SMTP 密码。 |
 | `TELESRV_SMTP_FROM` | email/string / 空 | envelope/header 发件人；启用登录邮箱时它与 SMTP username 至少一个非空。 |
 | `TELESRV_SMTP_FROM_NAME` | string / `telesrv` | 登录邮件展示的发件人名称。 |
 | `TELESRV_SMTP_TLS` | enum / `starttls` | 仅允许 `starttls`、`tls`、`none`，其它值阻止启动。 |
-| `TELESRV_SMTP_TIMEOUT` | duration / `10s` | SMTP 操作超时；启用登录邮箱时必须为正数。 |
+| `TELESRV_SMTP_TIMEOUT` | duration / `10s` | SMTP 操作超时；使用 SMTP provider 时必须为正数。 |
 | `TELESRV_PASSKEY_RP_ID` | hostname / `telesrv.net` | WebAuthn relying-party ID，用于校验 `rpIdHash`；Android Credential Manager 必须与公网 `assetlinks.json` 对齐。 |
 | `TELESRV_PASSKEY_ALLOWED_ORIGINS` | list / 空 | WebAuthn origin 白名单；空值不做显式 origin 校验，因为服务端可能无法预知 Android APK-key-hash origin。 |
 
@@ -119,7 +135,7 @@
 
 | 参数 | 类型 / 代码默认值 | 说明与约束 |
 |---|---|---|
-| `TELESRV_BUSINESS_AI_PROVIDER` | string / `echo` | Business 自动回复生成器：`echo`、`template`/`quick_reply`，或 `ai`/`compose_ai`/已配置 provider 名。 |
+| `TELESRV_BUSINESS_AI_PROVIDER` | string / `echo` | Business 自动回复生成器。可填 `echo`/空值（回显触发文本）、`template`/`quick_reply`/`quick-reply`（使用 quick reply 模板），或 `ai`/`compose_ai`/`ai_compose`/`aicompose`/`kimi`（复用 `TELESRV_AI_PROVIDERS` provider 链）。这里不接受任意 provider 名；例如使用 Ollama 时填 `TELESRV_BUSINESS_AI_PROVIDER=ai`，实际 provider 由 `TELESRV_AI_PROVIDERS=ollama,local` 决定。 |
 | `TELESRV_AI_ENABLED` | bool / `true` | 启用客户端输入框改写/润色；关闭时返回空 tone 集合并隐藏入口。 |
 | `TELESRV_AI_PROVIDERS` | list / `local` | 按顺序尝试的 provider 链；空列表回退确定性 `local`，不访问外网。 |
 | `TELESRV_AI_TIMEOUT` | duration / `15s` | 单次 provider 调用总超时。 |
@@ -225,4 +241,4 @@
 
 ## 12. 生产部署最低检查清单
 
-生产至少应显式检查并替换这些开发值：PostgreSQL DSN 与 TLS、Redis 密码和网络暴露、RSA 私钥持久化、固定开发验证码暴露、Admin 凭证/session key、启用邮件时的 SMTP secret、AI/Mapbox API key、TURN secret 与防火墙端口、公开 URL/scheme 与客户端一致性，以及真机所需的非 loopback SFU/TURN advertise IP。
+生产至少应显式检查并替换这些开发值：PostgreSQL DSN 与 TLS、Redis 密码和网络暴露、RSA 私钥持久化、固定开发验证码暴露、Admin 凭证/session key、OTP Webhook/SMTP secret、AI/Mapbox API key、TURN secret 与防火墙端口、公开 URL/scheme 与客户端一致性，以及真机所需的非 loopback SFU/TURN advertise IP。

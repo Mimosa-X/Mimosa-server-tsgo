@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/gotd/td/tgerr"
+	"github.com/iamxvbaba/td/tgerr"
 
 	"telesrv/internal/app/auth"
 	"telesrv/internal/domain"
@@ -25,6 +25,9 @@ func wrapperTooDeepErr() error { return tgerr.New(400, "WRAPPER_TOO_DEEP") }
 
 // inputConstructorInvalidErr 表示客户端传入的 TL 构造器不在当前 RPC 接受范围内。
 func inputConstructorInvalidErr() error { return tgerr.New(400, "INPUT_CONSTRUCTOR_INVALID") }
+
+// langCodeNotSupportedErr 表示请求的语言码没有已导入的语言包。
+func langCodeNotSupportedErr() error { return tgerr.New(400, "LANG_CODE_NOT_SUPPORTED") }
 
 // folderIDInvalidErr 表示客户端传入多个 folder peer 或非法 folder。
 func folderIDInvalidErr() error { return tgerr.New(400, "FOLDER_ID_INVALID") }
@@ -91,7 +94,8 @@ func documentInvalidErr() error      { return tgerr.New(400, "DOCUMENT_INVALID")
 
 func mediaEmptyErr() error { return tgerr.New(400, "MEDIA_EMPTY") }
 
-func frozenMethodInvalidErr() error { return tgerr.New(400, "FROZEN_METHOD_INVALID") }
+func frozenMethodInvalidErr() error      { return tgerr.New(420, "FROZEN_METHOD_INVALID") }
+func frozenParticipantMissingErr() error { return tgerr.New(400, "FROZEN_PARTICIPANT_MISSING") }
 
 func photoInvalidErr() error { return tgerr.New(400, "PHOTO_INVALID") }
 
