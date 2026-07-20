@@ -9,6 +9,9 @@ import (
 
 // tgSelfUser 把 domain.User 转为 self 标记的 tg.User（optional 字段由 Encode 自动 SetFlags）。
 func tgSelfUser(u domain.User) *tg.User {
+	if u.Deleted {
+		return &tg.User{ID: u.ID, Deleted: true}
+	}
 	out := &tg.User{
 		ID:            u.ID,
 		AccessHash:    u.AccessHash,
@@ -34,6 +37,9 @@ func tgSelfUser(u domain.User) *tg.User {
 }
 
 func tgUser(u domain.User) *tg.User {
+	if u.Deleted {
+		return &tg.User{ID: u.ID, Deleted: true}
+	}
 	out := &tg.User{
 		ID:            u.ID,
 		AccessHash:    u.AccessHash,
@@ -79,9 +85,35 @@ func tgUserEmojiStatus(u domain.User, now int64) tg.EmojiStatusClass {
 	if !u.EmojiStatusActiveAt(now) {
 		return &tg.EmojiStatusEmpty{}
 	}
-	status := &tg.EmojiStatus{DocumentID: u.EmojiStatusDocumentID}
-	if u.EmojiStatusUntil > 0 {
-		status.SetUntil(u.EmojiStatusUntil)
+	return tgUserEmojiStatusValue(u.EmojiStatus())
+}
+
+// tgUserEmojiStatusValue converts an already validated absolute snapshot. It
+// is shared by inline user projections and durable updateUserEmojiStatus.
+func tgUserEmojiStatusValue(value domain.UserEmojiStatus) tg.EmojiStatusClass {
+	if !value.Valid() || value.Empty() {
+		return &tg.EmojiStatusEmpty{}
+	}
+	if collectible := value.Collectible; !collectible.Empty() {
+		status := &tg.EmojiStatusCollectible{
+			CollectibleID:     collectible.CollectibleID,
+			DocumentID:        collectible.DocumentID,
+			Title:             collectible.Title,
+			Slug:              collectible.Slug,
+			PatternDocumentID: collectible.PatternDocumentID,
+			CenterColor:       collectible.CenterColor,
+			EdgeColor:         collectible.EdgeColor,
+			PatternColor:      collectible.PatternColor,
+			TextColor:         collectible.TextColor,
+		}
+		if value.Until > 0 {
+			status.SetUntil(value.Until)
+		}
+		return status
+	}
+	status := &tg.EmojiStatus{DocumentID: value.DocumentID}
+	if value.Until > 0 {
+		status.SetUntil(value.Until)
 	}
 	return status
 }

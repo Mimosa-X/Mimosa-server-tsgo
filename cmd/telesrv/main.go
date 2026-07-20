@@ -362,6 +362,7 @@ func run(logger *zap.Logger) error {
 	dispatchOutboxStore := postgres.NewDispatchOutboxStore(pool, postgres.WithLeaseTimeout(cfg.OutboxLeaseTimeout))
 	bootstrapUpdateStore := postgres.NewBootstrapUpdateJobStore(pool)
 	botAPIUpdateStore := postgres.NewBotAPIUpdateStore(pool)
+	botCallbackStore := redisstore.NewBotCallbackRegistryStore(rdb)
 	boxIDAllocator := redisstore.NewBoxIDAllocator(rdb, postgres.NewMessageBoxCounterSource(pool))
 	channelIDAllocator := redisstore.NewChannelIDAllocator(rdb, postgres.NewChannelIDCounterSource(pool))
 	channelMessageIDAllocator := redisstore.NewChannelMessageIDAllocator(rdb, postgres.NewChannelMessageIDCounterSource(pool))
@@ -526,6 +527,7 @@ func run(logger *zap.Logger) error {
 		account.WithBusinessAutomation(passwordStore),
 		account.WithUsers(userStore),
 		account.WithPhoneChange(phoneChangeStore, authzStore, codeStore, userCache, cfg.DevAuthCode, cfg.AuthCodeTTL, cfg.AuthCodeMaxAttempts),
+		account.WithAccountLifecycle(postgres.NewAccountLifecycleStore(pool)),
 		account.WithPublicBaseURL(cfg.PublicBaseURL),
 	}
 	var webhookSender otpdelivery.Sender
@@ -791,6 +793,7 @@ func run(logger *zap.Logger) error {
 		Updates:              updatesService,
 		BootstrapUpdates:     bootstrapUpdateStore,
 		BotAPIUpdates:        botAPIUpdateStore,
+		BotCallbacks:         botCallbackStore,
 		Contacts:             contactsService,
 		Dialogs:              dialogsService,
 		Chatlists:            chatlistsService,
@@ -871,6 +874,7 @@ func run(logger *zap.Logger) error {
 	go router.RunPresenceSweeper(ctx, time.Minute)
 	go activeSessions.RunPendingSweeper(ctx, time.Minute)
 	go router.RunPremiumSweeper(ctx, cfg.PremiumSweepInterval, cfg.PremiumSweepBatch)
+	go router.RunAccountLifecycle(ctx, time.Minute, 500)
 	go func() {
 		interval := cfg.StarGiftSweepInterval
 		if interval <= 0 {
@@ -898,6 +902,7 @@ func run(logger *zap.Logger) error {
 		}
 	}()
 	go router.RunInlineBotPushSubscriber(ctx)
+	go router.RunBotCallbackAnswerSubscriber(ctx)
 	if _, err := botapi.Start(ctx, cfg.BotAPIAddr, botsService, usersService, router, router, logger.Named("botapi")); err != nil {
 		return fmt.Errorf("start bot api: %w", err)
 	}

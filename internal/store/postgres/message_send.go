@@ -117,7 +117,7 @@ func (s *MessageStore) sendPrivateTextOnce(ctx context.Context, req domain.SendP
 	if err != nil {
 		return domain.SendPrivateTextResult{}, err
 	}
-	// reply_markup（bot inline keyboard）随消息一并入双盒；普通用户发送恒 nil → "{}"。
+	// reply_markup（bot reply/inline keyboard）随消息一并入双盒；普通用户发送恒 nil → "{}"。
 	replyMarkupJSON, err := encodeReplyMarkup(req.ReplyMarkup)
 	if err != nil {
 		return domain.SendPrivateTextResult{}, err
@@ -656,22 +656,23 @@ func appendNewMessageEvent(ctx context.Context, q *sqlcgen.Queries, msg domain.M
 	peerType := string(msg.Peer.Type)
 	peerID := msg.Peer.ID
 	if err := q.AppendUserUpdateEvent(ctx, sqlcgen.AppendUserUpdateEventParams{
-		UserID:          msg.OwnerUserID,
-		Pts:             int32(msg.Pts),
-		PtsCount:        1,
-		Date:            int32(msg.Date),
-		EventType:       string(domain.UpdateEventNewMessage),
-		EventPeers:      []byte("[]"),
-		PeerSettings:    []byte("{}"),
-		MessageIds:      []byte("[]"),
-		DialogFilter:    []byte("{}"),
-		FilterOrder:     []byte("[]"),
-		FolderPeers:     []byte("[]"),
-		StoryPayload:    []byte("{}"),
-		ReactionPayload: []byte("{}"),
-		MessageBoxID:    &boxID,
-		PeerType:        &peerType,
-		PeerID:          &peerID,
+		UserID:             msg.OwnerUserID,
+		Pts:                int32(msg.Pts),
+		PtsCount:           1,
+		Date:               int32(msg.Date),
+		EventType:          string(domain.UpdateEventNewMessage),
+		EventPeers:         []byte("[]"),
+		PeerSettings:       []byte("{}"),
+		MessageIds:         []byte("[]"),
+		DialogFilter:       []byte("{}"),
+		FilterOrder:        []byte("[]"),
+		FolderPeers:        []byte("[]"),
+		StoryPayload:       []byte("{}"),
+		ReactionPayload:    []byte("{}"),
+		EmojiStatusPayload: []byte("{}"),
+		MessageBoxID:       &boxID,
+		PeerType:           &peerType,
+		PeerID:             &peerID,
 	}); err != nil {
 		return fmt.Errorf("append new message event: %w", err)
 	}
