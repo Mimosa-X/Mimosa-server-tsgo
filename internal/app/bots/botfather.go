@@ -50,7 +50,7 @@ const (
 	maxTelegramLoginCommandsPerMessage = 32
 )
 
-const botFatherHelpText = `I can help you create and manage ` + branding.ProductName + ` bots.
+var botFatherHelpText = `I can help you create and manage ` + branding.ProductName + ` bots.
 
 You can control me by sending these commands:
 

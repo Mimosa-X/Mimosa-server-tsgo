@@ -1436,7 +1436,7 @@ func (s *Service) passwordNeeded(ctx context.Context, userID int64) (bool, error
 	return found && settings.HasPassword, nil
 }
 
-const loginMessageTpl = `Login code: %s. Do not give this code to anyone, even if they say they are from ` + branding.ProductName + `!
+var loginMessageTpl = `Login code: %s. Do not give this code to anyone, even if they say they are from ` + branding.ProductName + `!
 
 This code can be used to log in to your ` + branding.ProductName + ` account. We never ask it for anything else.
 
