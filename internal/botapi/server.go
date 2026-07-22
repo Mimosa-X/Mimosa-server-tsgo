@@ -23,6 +23,8 @@ import (
 
 type BotsService interface {
 	BotInfo(ctx context.Context, botUserID int64) (domain.BotProfile, bool, error)
+	SetBotCommands(ctx context.Context, botUserID int64, commands []domain.BotCommand) (int, error)
+	GetBotCommands(ctx context.Context, botUserID int64) ([]domain.BotCommand, error)
 	SetBotMenuButton(ctx context.Context, botUserID int64, button domain.BotMenuButton) (int, error)
 	GetBotMenuButton(ctx context.Context, botUserID int64) (domain.BotMenuButton, error)
 	BotEmojiStatusPermission(ctx context.Context, botUserID, userID int64) (bool, error)
@@ -41,12 +43,21 @@ type GatewayService interface {
 	BotAPISelf(ctx context.Context, botID int64) (domain.User, error)
 	BotAPIUpdates(ctx context.Context, botID int64, offset int64) ([]domain.UpdateEvent, error)
 	BotAPISendMessage(ctx context.Context, botID, chatID int64, text string, entities []domain.MessageEntity, replyMarkup *domain.MessageReplyMarkup, disableWebPagePreview, silent bool, replyToMessageID int) (domain.Message, error)
+	BotAPISendRichMessage(ctx context.Context, botID, chatID int64, rich domain.BotAPIRichMessageInput, replyMarkup *domain.MessageReplyMarkup, silent, noForwards bool, replyToMessageID int, effectID int64) (domain.Message, error)
 	BotAPISendMedia(ctx context.Context, botID, chatID int64, kind, locationKey, remoteURL, fileName, mimeType string, fileBytes []byte, caption string, entities []domain.MessageEntity, replyMarkup *domain.MessageReplyMarkup, silent bool, replyToMessageID int) (domain.Message, error)
 	BotAPIEditMessageText(ctx context.Context, botID, chatID int64, messageID int, text string, entities []domain.MessageEntity, setReplyMarkup bool, replyMarkup *domain.MessageReplyMarkup, disableWebPagePreview bool) (domain.Message, error)
+	BotAPIEditRichMessage(ctx context.Context, botID, chatID int64, messageID int, rich domain.BotAPIRichMessageInput, setReplyMarkup bool, replyMarkup *domain.MessageReplyMarkup) (domain.Message, error)
 	BotAPIEditInlineMessageText(ctx context.Context, botID int64, inlineMessageID domain.BotInlineMessageID, text string, entities []domain.MessageEntity, setReplyMarkup bool, replyMarkup *domain.MessageReplyMarkup, disableWebPagePreview bool) (bool, error)
+	BotAPIEditInlineRichMessage(ctx context.Context, botID int64, inlineMessageID domain.BotInlineMessageID, rich domain.BotAPIRichMessageInput, setReplyMarkup bool, replyMarkup *domain.MessageReplyMarkup) (bool, error)
 	BotAPIDeleteMessage(ctx context.Context, botID, chatID int64, messageID int) (bool, error)
 	BotAPIAnswerCallbackQuery(ctx context.Context, botID int64, callbackQueryID, text, url string, showAlert bool, cacheTime int) (bool, error)
 	BotAPIGetFile(ctx context.Context, botID int64, locationKey string, offset int64, limit int) (domain.FileChunk, bool, error)
+}
+
+type EphemeralGatewayService interface {
+	BotAPISendEphemeral(ctx context.Context, input domain.BotAPIEphemeralSendInput) (domain.EphemeralMessage, error)
+	BotAPIEditEphemeral(ctx context.Context, input domain.BotAPIEphemeralEditInput) (bool, error)
+	BotAPIDeleteEphemeral(ctx context.Context, botUserID, chatID, receiverUserID int64, messageID int) (bool, error)
 }
 
 type GatewayUpdateWaiter interface {
@@ -186,18 +197,56 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) {
 	switch strings.ToLower(method) {
 	case "getme":
 		h.getMe(w, r, botID)
+	case "setmycommands":
+		h.setMyCommands(w, r, botID)
+	case "deletemycommands":
+		h.deleteMyCommands(w, r, botID)
+	case "getmycommands":
+		h.getMyCommands(w, r, botID)
 	case "getupdates":
 		h.getUpdates(w, r, botID)
 	case "sendmessage":
 		h.sendMessage(w, r, botID)
+	case "sendrichmessage":
+		h.sendRichMessage(w, r, botID)
 	case "sendphoto":
 		h.sendMedia(w, r, botID, "photo")
+	case "sendanimation":
+		h.sendMedia(w, r, botID, "animation")
+	case "sendaudio":
+		h.sendMedia(w, r, botID, "audio")
 	case "senddocument":
 		h.sendMedia(w, r, botID, "document")
+	case "sendlivephoto":
+		h.sendMedia(w, r, botID, "live_photo")
+	case "sendsticker":
+		h.sendMedia(w, r, botID, "sticker")
+	case "sendvideo":
+		h.sendMedia(w, r, botID, "video")
+	case "sendvideonote":
+		h.sendMedia(w, r, botID, "video_note")
+	case "sendvoice":
+		h.sendMedia(w, r, botID, "voice")
+	case "sendcontact":
+		h.sendEphemeralContact(w, r, botID)
+	case "sendlocation":
+		h.sendEphemeralLocation(w, r, botID, false)
+	case "sendvenue":
+		h.sendEphemeralLocation(w, r, botID, true)
 	case "editmessagetext":
 		h.editMessageText(w, r, botID)
 	case "deletemessage":
 		h.deleteMessage(w, r, botID)
+	case "editephemeralmessagetext":
+		h.editEphemeralMessage(w, r, botID, "text")
+	case "editephemeralmessagemedia":
+		h.editEphemeralMessage(w, r, botID, "media")
+	case "editephemeralmessagecaption":
+		h.editEphemeralMessage(w, r, botID, "caption")
+	case "editephemeralmessagereplymarkup":
+		h.editEphemeralMessage(w, r, botID, "reply_markup")
+	case "deleteephemeralmessage":
+		h.deleteEphemeralMessage(w, r, botID)
 	case "answercallbackquery":
 		h.answerCallbackQuery(w, r, botID)
 	case "getfile":
@@ -480,12 +529,7 @@ func (h *handler) sendMessage(w http.ResponseWriter, r *http.Request, botID int6
 		writeAPIError(w, http.StatusBadRequest, "CHAT_ID_INVALID")
 		return
 	}
-	text := values["text"]
-	if strings.TrimSpace(values["parse_mode"]) != "" {
-		writeAPIError(w, http.StatusBadRequest, "ENTITY_PARSE_UNSUPPORTED")
-		return
-	}
-	entities, err := botAPIMessageEntities(values["entities"])
+	text, entities, err := botAPIFormattedTextRaw(values["text"], values["parse_mode"], values["entities"], domain.MaxMessageTextLength, true)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
@@ -498,8 +542,100 @@ func (h *handler) sendMessage(w http.ResponseWriter, r *http.Request, botID int6
 			return
 		}
 	}
+	ephemeral, isEphemeral, err := parseEphemeralSendTarget(values)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if isEphemeral {
+		if markup != nil && !markup.IsZero() && markup.Kind() != domain.MessageReplyMarkupInline {
+			writeAPIError(w, http.StatusBadRequest, "BUTTON_TYPE_INVALID")
+			return
+		}
+		gateway, ok := h.gateway.(EphemeralGatewayService)
+		if !ok {
+			writeAPIError(w, http.StatusNotImplemented, "METHOD_NOT_FOUND")
+			return
+		}
+		message, err := gateway.BotAPISendEphemeral(r.Context(), domain.BotAPIEphemeralSendInput{
+			BotUserID: botID, ChatID: chatID, ReceiverUserID: ephemeral.receiverUserID,
+			CallbackQueryID: ephemeral.callbackQueryID, ReplyToEphemeralID: ephemeral.replyToEphemeralID,
+			TopMessageID: ephemeral.topMessageID, Kind: "message", Text: text, Entities: entities, ReplyMarkup: markup,
+		})
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, apiErrorDescription(err))
+			return
+		}
+		h.writeEphemeralMessage(w, r, botID, message)
+		return
+	}
 	replyTo := apiInt(values["reply_to_message_id"], 0)
 	msg, err := h.gateway.BotAPISendMessage(r.Context(), botID, chatID, text, entities, markup, apiBool(values["disable_web_page_preview"]), apiBool(values["disable_notification"]), replyTo)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, apiErrorDescription(err))
+		return
+	}
+	users := []domain.User(nil)
+	if self, err := h.gateway.BotAPISelf(r.Context(), botID); err == nil && self.ID != 0 {
+		users = append(users, self)
+	}
+	writeAPIOK(w, apiMessage(msg, users))
+}
+
+func (h *handler) sendRichMessage(w http.ResponseWriter, r *http.Request, botID int64) {
+	if h.gateway == nil {
+		writeAPIError(w, http.StatusNotImplemented, "METHOD_NOT_FOUND")
+		return
+	}
+	values, err := requestValues(r)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "BAD_REQUEST")
+		return
+	}
+	chatID, err := strconv.ParseInt(strings.TrimSpace(values["chat_id"]), 10, 64)
+	if err != nil || chatID == 0 {
+		writeAPIError(w, http.StatusBadRequest, "CHAT_ID_INVALID")
+		return
+	}
+	if strings.TrimSpace(values["business_connection_id"]) != "" {
+		writeAPIError(w, http.StatusBadRequest, "BUSINESS_CONNECTION_INVALID")
+		return
+	}
+	if apiInt(values["message_thread_id"], 0) != 0 || apiInt(values["direct_messages_topic_id"], 0) != 0 {
+		writeAPIError(w, http.StatusBadRequest, "MESSAGE_THREAD_INVALID")
+		return
+	}
+	if apiBool(values["allow_paid_broadcast"]) || strings.TrimSpace(values["suggested_post_parameters"]) != "" {
+		writeAPIError(w, http.StatusBadRequest, "RICH_MESSAGE_OPTION_UNSUPPORTED")
+		return
+	}
+	rich, err := richMessageInputFromAPI(values["rich_message"])
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var markup *domain.MessageReplyMarkup
+	if raw := strings.TrimSpace(values["reply_markup"]); raw != "" {
+		markup, err = inlineReplyMarkupFromAPI(json.RawMessage(raw))
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	replyTo, err := richReplyMessageID(values)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	effectID, err := apiInt64(values["message_effect_id"])
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "EFFECT_ID_INVALID")
+		return
+	}
+	msg, err := h.gateway.BotAPISendRichMessage(
+		r.Context(), botID, chatID, rich, markup,
+		apiBool(values["disable_notification"]), apiBool(values["protect_content"]), replyTo, effectID,
+	)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, apiErrorDescription(err))
 		return
@@ -526,11 +662,7 @@ func (h *handler) sendMedia(w http.ResponseWriter, r *http.Request, botID int64,
 		writeAPIError(w, http.StatusBadRequest, "CHAT_ID_INVALID")
 		return
 	}
-	if strings.TrimSpace(values["parse_mode"]) != "" {
-		writeAPIError(w, http.StatusBadRequest, "ENTITY_PARSE_UNSUPPORTED")
-		return
-	}
-	entities, err := botAPIMessageEntities(values["caption_entities"])
+	caption, entities, err := botAPIFormattedTextRaw(values["caption"], values["parse_mode"], values["caption_entities"], domain.MaxEphemeralCaptionLength, false)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
@@ -543,12 +675,57 @@ func (h *handler) sendMedia(w http.ResponseWriter, r *http.Request, botID int64,
 			return
 		}
 	}
-	locationKey, remoteURL, fileName, mimeType, fileBytes, ok := mediaInput(values[kind], files, kind)
+	var file, secondary domain.BotAPIFileInput
+	var ok bool
+	if kind == "live_photo" {
+		file, ok = botAPIFileInput(values["photo"], files, "photo", values)
+		if ok {
+			secondary, ok = botAPIFileInput(values["live_photo"], files, "live_photo", values)
+		}
+	} else {
+		file, ok = botAPIFileInput(values[kind], files, kind, values)
+	}
 	if !ok {
 		writeAPIError(w, http.StatusBadRequest, "FILE_ID_INVALID")
 		return
 	}
-	msg, err := h.gateway.BotAPISendMedia(r.Context(), botID, chatID, kind, locationKey, remoteURL, fileName, mimeType, fileBytes, values["caption"], entities, markup, apiBool(values["disable_notification"]), apiInt(values["reply_to_message_id"], 0))
+	// The official Bot API does not accept HTTP URLs for the video part of a
+	// live photo or for video notes. Reject them before either the ordinary or
+	// ephemeral send path can fetch the remote resource.
+	if (kind == "live_photo" && secondary.RemoteURL != "") || (kind == "video_note" && file.RemoteURL != "") {
+		writeAPIError(w, http.StatusBadRequest, "FILE_ID_INVALID")
+		return
+	}
+	ephemeral, isEphemeral, err := parseEphemeralSendTarget(values)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if isEphemeral {
+		if markup != nil && !markup.IsZero() && markup.Kind() != domain.MessageReplyMarkupInline {
+			writeAPIError(w, http.StatusBadRequest, "BUTTON_TYPE_INVALID")
+			return
+		}
+		gateway, ok := h.gateway.(EphemeralGatewayService)
+		if !ok {
+			writeAPIError(w, http.StatusNotImplemented, "METHOD_NOT_FOUND")
+			return
+		}
+		message, err := gateway.BotAPISendEphemeral(r.Context(), domain.BotAPIEphemeralSendInput{
+			BotUserID: botID, ChatID: chatID, ReceiverUserID: ephemeral.receiverUserID,
+			CallbackQueryID: ephemeral.callbackQueryID, ReplyToEphemeralID: ephemeral.replyToEphemeralID,
+			TopMessageID: ephemeral.topMessageID, Kind: kind, Text: caption, Entities: entities,
+			ReplyMarkup: markup, File: file, SecondaryFile: secondary,
+		})
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, apiErrorDescription(err))
+			return
+		}
+		h.writeEphemeralMessage(w, r, botID, message)
+		return
+	}
+	locationKey, remoteURL, fileName, mimeType, fileBytes := file.LocationKey, file.RemoteURL, file.FileName, file.MimeType, file.Bytes
+	msg, err := h.gateway.BotAPISendMedia(r.Context(), botID, chatID, kind, locationKey, remoteURL, fileName, mimeType, fileBytes, caption, entities, markup, apiBool(values["disable_notification"]), apiInt(values["reply_to_message_id"], 0))
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, apiErrorDescription(err))
 		return
@@ -588,11 +765,26 @@ func (h *handler) editMessageText(w http.ResponseWriter, r *http.Request, botID 
 		writeAPIError(w, http.StatusBadRequest, "MESSAGE_IDENTIFIER_INVALID")
 		return
 	}
-	if strings.TrimSpace(values["parse_mode"]) != "" {
-		writeAPIError(w, http.StatusBadRequest, "ENTITY_PARSE_UNSUPPORTED")
+	rawRich := strings.TrimSpace(values["rich_message"])
+	_, textSpecified := values["text"]
+	if rawRich != "" && textSpecified {
+		writeAPIError(w, http.StatusBadRequest, "RICH_MESSAGE_INVALID")
 		return
 	}
-	entities, err := botAPIMessageEntities(values["entities"])
+	var (
+		text     string
+		entities []domain.MessageEntity
+		rich     domain.BotAPIRichMessageInput
+	)
+	if rawRich != "" {
+		rich, err = richMessageInputFromAPI(rawRich)
+	} else {
+		if !textSpecified {
+			writeAPIError(w, http.StatusBadRequest, "MESSAGE_EMPTY")
+			return
+		}
+		text, entities, err = botAPIFormattedTextRaw(values["text"], values["parse_mode"], values["entities"], domain.MaxMessageTextLength, true)
+	}
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
@@ -612,7 +804,12 @@ func (h *handler) editMessageText(w http.ResponseWriter, r *http.Request, botID 
 			writeAPIError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		ok, err := h.gateway.BotAPIEditInlineMessageText(r.Context(), botID, inlineID, values["text"], entities, setReplyMarkup, markup, apiBool(values["disable_web_page_preview"]))
+		var ok bool
+		if rawRich != "" {
+			ok, err = h.gateway.BotAPIEditInlineRichMessage(r.Context(), botID, inlineID, rich, setReplyMarkup, markup)
+		} else {
+			ok, err = h.gateway.BotAPIEditInlineMessageText(r.Context(), botID, inlineID, text, entities, setReplyMarkup, markup, apiBool(values["disable_web_page_preview"]))
+		}
 		if err != nil {
 			writeAPIError(w, http.StatusBadRequest, apiErrorDescription(err))
 			return
@@ -620,7 +817,12 @@ func (h *handler) editMessageText(w http.ResponseWriter, r *http.Request, botID 
 		writeAPIOK(w, ok)
 		return
 	}
-	msg, err := h.gateway.BotAPIEditMessageText(r.Context(), botID, chatID, messageID, values["text"], entities, setReplyMarkup, markup, apiBool(values["disable_web_page_preview"]))
+	var msg domain.Message
+	if rawRich != "" {
+		msg, err = h.gateway.BotAPIEditRichMessage(r.Context(), botID, chatID, messageID, rich, setReplyMarkup, markup)
+	} else {
+		msg, err = h.gateway.BotAPIEditMessageText(r.Context(), botID, chatID, messageID, text, entities, setReplyMarkup, markup, apiBool(values["disable_web_page_preview"]))
+	}
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, apiErrorDescription(err))
 		return
@@ -875,11 +1077,18 @@ func validateWebhookURL(raw string) error {
 		return errors.New("WEBHOOK_URL_INVALID")
 	}
 	u, err := neturl.ParseRequestURI(raw)
-	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Fragment != "" {
+	if err != nil {
 		return errors.New("WEBHOOK_URL_INVALID")
 	}
-	if port := u.Port(); port != "" && port != "443" && port != "80" && port != "88" && port != "8443" {
-		return errors.New("WEBHOOK_PORT_NOT_ALLOWED")
+	scheme := strings.ToLower(u.Scheme)
+	if (scheme != "http" && scheme != "https") || u.Hostname() == "" || u.User != nil || u.Fragment != "" {
+		return errors.New("WEBHOOK_URL_INVALID")
+	}
+	if port := u.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return errors.New("WEBHOOK_URL_INVALID")
+		}
 	}
 	return nil
 }
@@ -1235,13 +1444,20 @@ func apiErrorDescription(err error) string {
 		"RESULT_TYPE_INVALID",
 		"MESSAGE_EMPTY",
 		"MESSAGE_TOO_LONG",
+		"RICH_MESSAGE_INVALID",
+		"RICH_MESSAGE_TOO_LONG",
+		"RICH_MESSAGE_DATE_INVALID",
+		"RICH_MESSAGE_BLOCKS_UNSUPPORTED",
+		"RICH_MESSAGE_MEDIA_UNSUPPORTED",
+		"RICH_MESSAGE_OPTION_UNSUPPORTED",
+		"WEBPAGE_MEDIA_EMPTY",
+		"EFFECT_ID_INVALID",
 		"BUTTON_INVALID",
 		"BUTTON_DATA_INVALID",
 		"BUTTON_URL_INVALID",
 		"BOT_INVALID",
 		"CHAT_ID_INVALID",
 		"ENTITY_INVALID",
-		"ENTITY_PARSE_UNSUPPORTED",
 		"ENTITIES_TOO_LONG",
 		"ENTITY_BOUNDS_INVALID",
 		"ENTITY_TYPE_UNSUPPORTED",
@@ -1252,6 +1468,9 @@ func apiErrorDescription(err error) string {
 		"QUERY_ID_INVALID",
 		"MESSAGE_ID_INVALID",
 		"MESSAGE_NOT_MODIFIED",
+		"BOT_COMMAND_INVALID",
+		"EPHEMERAL_MESSAGE_ID_INVALID",
+		"EPHEMERAL_ACTION_EXPIRED",
 		"CHAT_WRITE_FORBIDDEN",
 		"CHAT_ADMIN_REQUIRED",
 		"REPLY_MESSAGE_ID_INVALID",

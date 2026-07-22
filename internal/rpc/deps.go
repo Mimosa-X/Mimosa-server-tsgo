@@ -180,6 +180,15 @@ type AuthKeyTargetedSessionBinder interface {
 	PushToUserAuthKeyTransient(ctx context.Context, userID int64, businessAuthKeyID [8]byte, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
 }
 
+// ExactLayerTransientSessionBinder is the admission boundary for updates whose
+// constructors do not exist in older profiles. Implementations must filter the
+// live session index before encoding, skip unknown/not-ready profiles, and must
+// never queue the transient payload for later delivery.
+type ExactLayerTransientSessionBinder interface {
+	PushToUserTransientAtLeastLayer(ctx context.Context, userID int64, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
+	PushToUserAuthKeyTransientAtLeastLayer(ctx context.Context, userID int64, businessAuthKeyID [8]byte, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
+}
+
 // OnlineUserProvider exposes a bounded runtime snapshot for best-effort fanout.
 type OnlineUserProvider interface {
 	IsUserOnline(userID int64) bool
@@ -230,6 +239,24 @@ type UsersService interface {
 	Self(ctx context.Context, userID int64) (domain.User, error)
 	ByID(ctx context.Context, currentUserID, userID int64) (domain.User, bool, error)
 	ByIDs(ctx context.Context, currentUserID int64, userIDs []int64) ([]domain.User, error)
+}
+
+// TelegramLoginService is the domain-only boundary shared by the MTProto RPC
+// edge and the public OIDC provider. PostgreSQL remains authoritative for all
+// consent transitions; the RPC layer only projects domain state to TL.
+type TelegramLoginService interface {
+	ValidateMessageButton(ctx context.Context, botUserID int64, rawURL string) (normalizedURL, domainName string, err error)
+	AuthorizeMessageButton(ctx context.Context, params domain.TelegramLoginMessageButtonAuthorization) (domain.TelegramLoginMessageButtonResult, error)
+	RequestByDeepLink(ctx context.Context, deepLink string) (domain.TelegramLoginRequest, error)
+	RequestByDeepLinkForOrigin(ctx context.Context, deepLink, inAppOrigin string) (domain.TelegramLoginRequest, error)
+	CheckMatchCode(ctx context.Context, deepLink, selected string) (bool, error)
+	Approve(ctx context.Context, deepLink string, identity domain.TelegramLoginIdentitySnapshot, writeAllowed, phoneShared bool, matchCode string) (domain.TelegramLoginRequest, domain.TelegramLoginWebAuthorization, error)
+	FinalizeRedirectByDeepLink(ctx context.Context, deepLink string) (string, error)
+	FinalizeInAppRedirectByDeepLink(ctx context.Context, deepLink string) (string, error)
+	Decline(ctx context.Context, deepLink string, userID int64) (domain.TelegramLoginRequest, error)
+	ListWebAuthorizations(ctx context.Context, userID int64) ([]domain.TelegramLoginWebAuthorization, error)
+	RevokeWebAuthorization(ctx context.Context, userID, hash int64) error
+	RevokeAllWebAuthorizations(ctx context.Context, userID int64) (int64, error)
 }
 
 // BatchViewerUsersResolver 是 UsersService 的可选能力：跨多个 viewer 一次性投影同一组 user
@@ -611,6 +638,7 @@ type ChannelsService interface {
 	CheckUsername(ctx context.Context, userID, channelID int64, username string) (bool, error)
 	UpdateUsername(ctx context.Context, userID int64, req domain.UpdateChannelUsernameRequest) (domain.Channel, error)
 	ListAdminedPublicChannels(ctx context.Context, userID int64) ([]domain.Channel, error)
+	ListCommunityLinkableChannels(ctx context.Context, userID int64) ([]domain.Channel, error)
 	ListStoryPostableChannels(ctx context.Context, userID int64) ([]domain.Channel, error)
 	ListSendAsChannels(ctx context.Context, userID int64) ([]domain.Channel, error)
 	ResolvePublicUsername(ctx context.Context, userID int64, username string) (domain.Channel, bool, error)
@@ -724,6 +752,32 @@ type ChannelsService interface {
 	FilterActiveMemberIDs(ctx context.Context, channelID int64, userIDs []int64) ([]int64, error)
 }
 
+// CommunitiesService abstracts the Layer 228 Community aggregation domain.
+// Community containers never expose tg types and never own message/read/pts state.
+type CommunitiesService interface {
+	Create(ctx context.Context, userID int64, req domain.CreateCommunityRequest) (domain.CommunityView, error)
+	Get(ctx context.Context, userID, communityID int64) (domain.CommunityView, error)
+	GetMany(ctx context.Context, userID int64, ids []int64) ([]domain.CommunityView, error)
+	ListJoined(ctx context.Context, userID int64) ([]domain.CommunityView, error)
+	TogglePeerLink(ctx context.Context, userID int64, req domain.CommunityTogglePeerLinkRequest) (domain.CommunityTogglePeerLinkResult, error)
+	SetCollapsed(ctx context.Context, userID, communityID int64, collapsed bool) (domain.CommunityView, bool, error)
+	ListPeerLinkRequests(ctx context.Context, userID, communityID int64, offset string, limit int) (domain.CommunityPeerLinkRequestPage, error)
+	DecidePeerLinkRequest(ctx context.Context, userID, communityID int64, peer domain.Peer, reject bool, date int) (domain.CommunityTogglePeerLinkResult, error)
+	DecideAllPeerLinkRequests(ctx context.Context, userID, communityID int64, reject bool, date int) ([]domain.CommunityTogglePeerLinkResult, error)
+	ToggleParticipantBanned(ctx context.Context, userID, communityID, participantUserID int64, unban bool, date int) (domain.CommunityParticipantBanResult, error)
+	ParticipantJoinedChats(ctx context.Context, userID, communityID, participantUserID int64) (domain.CommunityParticipantJoinedChats, error)
+	Participants(ctx context.Context, userID, communityID int64, filter domain.ChannelParticipantsFilter, offset, limit int) (domain.CommunityParticipantList, error)
+	EditTitle(ctx context.Context, userID, communityID int64, title string) (domain.CommunityView, bool, error)
+	EditAbout(ctx context.Context, userID, communityID int64, about string) (domain.CommunityView, bool, error)
+	EditAdmin(ctx context.Context, userID int64, req domain.CommunityEditAdminRequest) (domain.CommunityView, bool, error)
+	EditDefaultBannedRights(ctx context.Context, userID, communityID int64, rights domain.ChannelBannedRights) (domain.CommunityView, bool, error)
+	SetPhoto(ctx context.Context, userID, communityID int64, photo *domain.Photo, date int) (domain.CommunityView, bool, error)
+	Delete(ctx context.Context, userID, communityID int64, date int) (domain.CommunityView, []domain.Peer, error)
+	SetPinned(ctx context.Context, userID, communityID int64, pinned bool) (bool, error)
+	ReorderPinned(ctx context.Context, userID int64, order []domain.Peer, force bool) (bool, error)
+	SearchScope(ctx context.Context, userID, communityID int64) (domain.CommunitySearchScope, error)
+}
+
 // FilesService 抽象文件上传分片、下载与媒体（document/photo）组装。
 // 方法只用 domain 类型；rpc 层负责 tg.InputFileLocation / InputMedia ↔ domain 转换。
 type FilesService interface {
@@ -805,6 +859,22 @@ type AIComposeService interface {
 	Compose(ctx context.Context, req domain.AIComposeRequest) (domain.AIComposeResult, error)
 }
 
+// EphemeralService owns Layer 228 short-lived bot/member state. It must never
+// write ordinary messages, dialogs, pts/qts/seq logs or durable update outbox.
+type EphemeralService interface {
+	SendFromClient(ctx context.Context, request domain.SendClientEphemeralRequest) (domain.EphemeralMessage, bool, error)
+	SendFromBot(ctx context.Context, request domain.SendBotEphemeralRequest) (domain.EphemeralMessage, bool, error)
+	SendFromBotLazy(ctx context.Context, request domain.SendBotEphemeralRequest, build func(context.Context) (domain.EphemeralContent, error)) (domain.EphemeralMessage, bool, error)
+	EditFromBot(ctx context.Context, botUserID int64, peer domain.Peer, id int, content domain.EphemeralContent) (domain.EphemeralMessage, error)
+	EditFieldsFromBot(ctx context.Context, botUserID, receiverUserID int64, peer domain.Peer, id int, mode domain.EphemeralEditMode, fields domain.EditEphemeralFields) (domain.EphemeralMessage, error)
+	EditFieldsFromBotLazy(ctx context.Context, botUserID, receiverUserID int64, peer domain.Peer, id int, mode domain.EphemeralEditMode, build func(context.Context) (domain.EditEphemeralFields, error)) (domain.EphemeralMessage, error)
+	Delete(ctx context.Context, actorUserID, receiverUserID int64, peer domain.Peer, id int) (domain.EphemeralMessage, bool, error)
+	DeleteFromDevice(ctx context.Context, actorUserID, receiverUserID int64, device domain.EphemeralDevice, peer domain.Peer, id int) (domain.EphemeralMessage, bool, error)
+	Callback(ctx context.Context, userID int64, device domain.EphemeralDevice, peer domain.Peer, id int, data []byte) (domain.EphemeralCallback, error)
+	PutCallbackAction(ctx context.Context, action domain.EphemeralCallbackAction) (bool, error)
+	ReportTarget(ctx context.Context, userID int64, device domain.EphemeralDevice, peer domain.Peer, id int) (domain.EphemeralMessage, error)
+}
+
 // Deps 按业务域注入服务接口。各域的 handler 注册见对应文件（auth.go / users.go / updates.go）。
 type Deps struct {
 	Auth AuthService
@@ -817,7 +887,11 @@ type Deps struct {
 	Help                 HelpService
 	AccountFreeze        AccountFreezeService
 	AICompose            AIComposeService
+	Ephemeral            EphemeralService
+	EphemeralPush        store.EphemeralPushBroker
+	EphemeralReports     store.EphemeralReportStore
 	Users                UsersService
+	TelegramLogin        TelegramLoginService
 	Updates              UpdatesService
 	BootstrapUpdates     store.BootstrapUpdateJobStore
 	BotAPIUpdates        store.BotAPIUpdateStore
@@ -829,6 +903,7 @@ type Deps struct {
 	Translation          TranslationService
 	Stories              StoriesService
 	Channels             ChannelsService
+	Communities          CommunitiesService
 	Files                FilesService
 	Bots                 BotsService
 	Polls                PollsService

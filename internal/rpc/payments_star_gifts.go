@@ -12,6 +12,7 @@ import (
 	"github.com/iamxvbaba/td/tgerr"
 	"go.uber.org/zap"
 
+	"telesrv/internal/branding"
 	"telesrv/internal/domain"
 )
 
@@ -324,11 +325,11 @@ func (r *Router) starsTopupPaymentForm(userID int64, purpose *tg.InputStorePayme
 	return &tg.PaymentsPaymentFormStars{
 		FormID:      starsTopupFormID(userID, purpose.Stars, purpose.Currency, purpose.Amount),
 		BotID:       domain.OfficialSystemUserID,
-		Title:       "Telegram Stars",
+		Title:       branding.StarsName,
 		Description: "telesrv dev Stars top-up",
 		Invoice: tg.Invoice{
 			Currency: "XTR",
-			Prices:   []tg.LabeledPrice{{Label: "Telegram Stars", Amount: purpose.Stars}},
+			Prices:   []tg.LabeledPrice{{Label: branding.StarsName, Amount: purpose.Stars}},
 		},
 		Users: tgUsersForViewer(userID, []domain.User{domain.OfficialSystemUser()}),
 	}
@@ -1069,6 +1070,27 @@ func tgSavedStarGifts(gifts []domain.SavedStarGift, catalog map[int64]domain.Sta
 			if g.PrepaidUpgradeHash != "" && g.PrepaidUpgradeStars == 0 && canIssue {
 				item.SetPrepaidUpgradeHash(g.PrepaidUpgradeHash)
 			}
+		}
+		if g.CanExportAt > 0 {
+			item.SetCanExportAt(g.CanExportAt)
+		}
+		if g.TransferStars > 0 {
+			item.SetTransferStars(g.TransferStars)
+		}
+		if g.CanTransferAt > 0 {
+			item.SetCanTransferAt(g.CanTransferAt)
+		}
+		if g.CanResellAt > 0 {
+			item.SetCanResellAt(g.CanResellAt)
+		}
+		if g.DropOriginalDetailsStars > 0 {
+			item.SetDropOriginalDetailsStars(g.DropOriginalDetailsStars)
+		}
+		// Channel Craft execution is not implemented yet. Android uses this field
+		// as the entry/capability marker, so only advertise the currently
+		// executable user-owned path while retaining the durable DB entitlement.
+		if g.Owner.Type == domain.PeerTypeUser && g.CanCraftAt > 0 {
+			item.SetCanCraftAt(g.CanCraftAt)
 		}
 		if g.PinnedOrder > 0 {
 			item.PinnedToTop = true

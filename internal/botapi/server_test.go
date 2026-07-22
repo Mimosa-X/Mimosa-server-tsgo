@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -160,6 +161,62 @@ func TestGetMeUsesGateway(t *testing.T) {
 	}
 }
 
+func TestBotCommandsPreserveEphemeralFlag(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	h := (&handler{bots: bots}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "setMyCommands", `{
+		"commands": [
+			{"command":"private","description":"Private reply","is_ephemeral":true},
+			{"command":"public","description":"Public reply"}
+		]
+	}`)
+	if rec.Code != http.StatusOK || len(bots.commands) != 2 || !bots.commands[0].Ephemeral || bots.commands[1].Ephemeral {
+		t.Fatalf("setMyCommands status=%d body=%s commands=%#v", rec.Code, rec.Body.String(), bots.commands)
+	}
+
+	rec = performBotAPIRequest(t, h, bots.profile, "getMyCommands", `{}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("getMyCommands status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		OK     bool `json:"ok"`
+		Result []struct {
+			Command     string `json:"command"`
+			Description string `json:"description"`
+			IsEphemeral bool   `json:"is_ephemeral"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.OK || len(response.Result) != 2 || !response.Result[0].IsEphemeral || response.Result[1].IsEphemeral {
+		t.Fatalf("getMyCommands response=%s", rec.Body.String())
+	}
+
+	rec = performBotAPIRequest(t, h, bots.profile, "deleteMyCommands", `{}`)
+	if rec.Code != http.StatusOK || len(bots.commands) != 0 {
+		t.Fatalf("deleteMyCommands status=%d body=%s commands=%#v", rec.Code, rec.Body.String(), bots.commands)
+	}
+}
+
+func TestBotCommandsRejectUnsupportedScopeAndLanguage(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	h := (&handler{bots: bots}).routes()
+
+	for name, body := range map[string]string{
+		"scope":    `{"scope":{"type":"all_group_chats"},"commands":[]}`,
+		"language": `{"language_code":"en","commands":[]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := performBotAPIRequest(t, h, bots.profile, "setMyCommands", body)
+			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "BOT_COMMAND_SCOPE_UNSUPPORTED") {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestGetUpdatesProjectsIncomingPrivateText(t *testing.T) {
 	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
 	gateway := &fakeBotAPIGateway{
@@ -262,6 +319,221 @@ func TestGetUpdatesSkipsOutgoingBotMessage(t *testing.T) {
 	}
 }
 
+func TestGetUpdatesProjectsEphemeralMessageWithoutPts(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	message := domain.EphemeralMessage{
+		ID: 77, Peer: domain.Peer{Type: domain.PeerTypeChannel, ID: 3001},
+		SenderUserID: 2001, ReceiverUserID: 1001, Date: 1_900_000_000,
+		Content: domain.EphemeralContent{Message: "/private"},
+	}
+	gateway := &fakeBotAPIGateway{updates: []domain.UpdateEvent{{
+		Type: domain.UpdateEventNewMessage, BotAPIUpdateID: 901, EphemeralMessage: &message,
+		Users:    []domain.User{{ID: 2001, FirstName: "Alice"}, {ID: 1001, FirstName: "Bot", Bot: true}},
+		Channels: []domain.Channel{{ID: 3001, Title: "Group", Megagroup: true}},
+	}}}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+	rec := performBotAPIRequest(t, h, bots.profile, "getUpdates", `{}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		OK     bool `json:"ok"`
+		Result []struct {
+			UpdateID int64 `json:"update_id"`
+			Message  struct {
+				MessageID          int    `json:"message_id"`
+				EphemeralMessageID int    `json:"ephemeral_message_id"`
+				Text               string `json:"text"`
+				ReceiverUser       struct {
+					ID int64 `json:"id"`
+				} `json:"receiver_user"`
+			} `json:"message"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.OK || len(response.Result) != 1 || response.Result[0].UpdateID != 901 ||
+		response.Result[0].Message.MessageID != 0 || response.Result[0].Message.EphemeralMessageID != 77 ||
+		response.Result[0].Message.ReceiverUser.ID != 1001 || response.Result[0].Message.Text != "/private" {
+		t.Fatalf("response=%s", rec.Body.String())
+	}
+}
+
+func TestEphemeralReplyProjectionContainsValidOneLevelTarget(t *testing.T) {
+	target := domain.EphemeralMessage{
+		ID: 70, Peer: domain.Peer{Type: domain.PeerTypeChannel, ID: 3001},
+		SenderUserID: 1001, ReceiverUserID: 2001, Date: 1_900_000_000,
+		Content: domain.EphemeralContent{Message: "question"},
+	}
+	message := domain.EphemeralMessage{
+		ID: 71, Peer: target.Peer, SenderUserID: 2001, ReceiverUserID: 1001,
+		Date: 1_900_000_001, ReplyToEphemeralID: target.ID,
+		Content: domain.EphemeralContent{Message: "answer"}, BotAPIReply: &target,
+	}
+	projected, ok := apiEphemeralMessage(message, []domain.User{{ID: 1001, Bot: true}, {ID: 2001}}, []domain.Channel{{ID: 3001, Title: "Group", Megagroup: true}})
+	if !ok {
+		t.Fatal("reply was not projectable")
+	}
+	reply, ok := projected["reply_to_message"].(map[string]any)
+	if !ok || reply["message_id"] != 0 || reply["ephemeral_message_id"] != target.ID || reply["date"] != target.Date || reply["text"] != "question" {
+		t.Fatalf("reply_to_message=%#v", projected["reply_to_message"])
+	}
+}
+
+func TestEphemeralSendMethodsRouteAllOfficialMediaKinds(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{
+		self: domain.User{ID: 1001, FirstName: "Bot", Bot: true},
+		ephemeralMessage: domain.EphemeralMessage{
+			ID: 77, Peer: domain.Peer{Type: domain.PeerTypeChannel, ID: 3001},
+			SenderUserID: 1001, ReceiverUserID: 2001, Date: 1_900_000_000,
+			Content: domain.EphemeralContent{Message: "sent"},
+		},
+	}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+	chatID := int64(-1000000003001)
+	documentID := encodeBotAPIFileID("doc:7001")
+	photoID := encodeBotAPIFileID("photo:7002:m")
+	tests := []struct {
+		method string
+		kind   string
+		body   map[string]any
+	}{
+		{"sendMessage", "message", map[string]any{"text": "hello", "message_thread_id": 42}},
+		{"sendAnimation", "animation", map[string]any{"animation": documentID}},
+		{"sendAudio", "audio", map[string]any{"audio": documentID}},
+		{"sendDocument", "document", map[string]any{"document": documentID}},
+		{"sendLivePhoto", "live_photo", map[string]any{"photo": photoID, "live_photo": documentID}},
+		{"sendPhoto", "photo", map[string]any{"photo": photoID}},
+		{"sendSticker", "sticker", map[string]any{"sticker": documentID}},
+		{"sendVideo", "video", map[string]any{"video": documentID}},
+		{"sendVideoNote", "video_note", map[string]any{"video_note": documentID}},
+		{"sendVoice", "voice", map[string]any{"voice": documentID}},
+		{"sendContact", "contact", map[string]any{"phone_number": "+100", "first_name": "Alice"}},
+		{"sendLocation", "location", map[string]any{"latitude": 1.25, "longitude": 2.5}},
+		{"sendVenue", "location", map[string]any{"latitude": 1.25, "longitude": 2.5, "title": "Place", "address": "Street"}},
+	}
+	for _, test := range tests {
+		t.Run(test.method, func(t *testing.T) {
+			body := test.body
+			body["chat_id"] = chatID
+			body["receiver_user_id"] = int64(2001)
+			raw, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := performBotAPIRequest(t, h, bots.profile, test.method, string(raw))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			got := gateway.ephemeralSends[len(gateway.ephemeralSends)-1]
+			if got.Kind != test.kind || got.ChatID != chatID || got.ReceiverUserID != 2001 {
+				t.Fatalf("input=%+v", got)
+			}
+			var response struct {
+				OK     bool `json:"ok"`
+				Result struct {
+					MessageID          int `json:"message_id"`
+					EphemeralMessageID int `json:"ephemeral_message_id"`
+					ReceiverUser       struct {
+						ID int64 `json:"id"`
+					} `json:"receiver_user"`
+				} `json:"result"`
+			}
+			if json.Unmarshal(rec.Body.Bytes(), &response) != nil || !response.OK || response.Result.MessageID != 0 ||
+				response.Result.EphemeralMessageID != 77 || response.Result.ReceiverUser.ID != 2001 {
+				t.Fatalf("response=%s", rec.Body.String())
+			}
+		})
+	}
+	if gateway.ephemeralSends[0].TopMessageID != 42 {
+		t.Fatalf("message_thread_id=%d", gateway.ephemeralSends[0].TopMessageID)
+	}
+}
+
+func TestEphemeralSendRejectsOfficiallyUnsupportedMediaURLs(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+	photoID := encodeBotAPIFileID("photo:7002:m")
+
+	tests := []struct {
+		method string
+		body   map[string]any
+	}{
+		{"sendVideoNote", map[string]any{"video_note": "https://example.com/note.mp4"}},
+		{"sendLivePhoto", map[string]any{"photo": photoID, "live_photo": "https://example.com/live.mp4"}},
+	}
+	for _, test := range tests {
+		t.Run(test.method, func(t *testing.T) {
+			test.body["chat_id"] = int64(-1000000003001)
+			test.body["receiver_user_id"] = int64(2001)
+			raw, _ := json.Marshal(test.body)
+			rec := performBotAPIRequest(t, h, bots.profile, test.method, string(raw))
+			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "FILE_ID_INVALID") {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+	if len(gateway.ephemeralSends) != 0 {
+		t.Fatalf("gateway was called: %+v", gateway.ephemeralSends)
+	}
+}
+
+func TestEphemeralCallbackReplyEditAndDeleteContracts(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{
+		self: domain.User{ID: 1001, FirstName: "Bot", Bot: true},
+		ephemeralMessage: domain.EphemeralMessage{
+			ID: 77, Peer: domain.Peer{Type: domain.PeerTypeChannel, ID: 3001},
+			SenderUserID: 1001, ReceiverUserID: 2001, Date: 1_900_000_000,
+			Content: domain.EphemeralContent{Message: "sent"},
+		},
+	}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+	chatID := int64(-1000000003001)
+	rec := performBotAPIRequest(t, h, bots.profile, "sendMessage", `{"chat_id":-1000000003001,"receiver_user_id":2001,"callback_query_id":"991","text":"answer"}`)
+	if rec.Code != http.StatusOK || len(gateway.ephemeralSends) != 1 || gateway.ephemeralSends[0].CallbackQueryID != 991 {
+		t.Fatalf("callback send status=%d body=%s inputs=%+v", rec.Code, rec.Body.String(), gateway.ephemeralSends)
+	}
+	rec = performBotAPIRequest(t, h, bots.profile, "sendMessage", `{"chat_id":-1000000003001,"receiver_user_id":2001,"reply_parameters":{"ephemeral_message_id":66},"text":"reply"}`)
+	if rec.Code != http.StatusOK || gateway.ephemeralSends[1].ReplyToEphemeralID != 66 {
+		t.Fatalf("reply send status=%d body=%s input=%+v", rec.Code, rec.Body.String(), gateway.ephemeralSends[1])
+	}
+
+	photoID := encodeBotAPIFileID("photo:7002:m")
+	media, _ := json.Marshal(map[string]any{"type": "photo", "media": photoID, "caption": "new"})
+	edits := []struct {
+		method string
+		body   map[string]any
+	}{
+		{"editEphemeralMessageText", map[string]any{"text": "edited"}},
+		{"editEphemeralMessageMedia", map[string]any{"media": json.RawMessage(media)}},
+		{"editEphemeralMessageCaption", map[string]any{"caption": "caption"}},
+		{"editEphemeralMessageReplyMarkup", map[string]any{"reply_markup": map[string]any{"inline_keyboard": []any{}}}},
+	}
+	for _, edit := range edits {
+		body := edit.body
+		body["chat_id"], body["receiver_user_id"], body["ephemeral_message_id"] = chatID, int64(2001), 77
+		raw, _ := json.Marshal(body)
+		rec = performBotAPIRequest(t, h, bots.profile, edit.method, string(raw))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", edit.method, rec.Code, rec.Body.String())
+		}
+	}
+	if len(gateway.ephemeralEdits) != 4 || gateway.ephemeralEdits[0].Mode != domain.EphemeralEditText ||
+		gateway.ephemeralEdits[1].Mode != domain.EphemeralEditMedia || gateway.ephemeralEdits[1].MediaKind != "photo" ||
+		gateway.ephemeralEdits[2].Mode != domain.EphemeralEditCaption ||
+		gateway.ephemeralEdits[3].Mode != domain.EphemeralEditReplyMarkup || !gateway.ephemeralEdits[3].Fields.SetReplyMarkup {
+		t.Fatalf("edits=%+v", gateway.ephemeralEdits)
+	}
+	rec = performBotAPIRequest(t, h, bots.profile, "deleteEphemeralMessage", `{"chat_id":-1000000003001,"receiver_user_id":2001,"ephemeral_message_id":77}`)
+	if rec.Code != http.StatusOK || !gateway.ephemeralDeleteCalled || gateway.ephemeralDeleteMessageID != 77 {
+		t.Fatalf("delete status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestSendMessageParsesEntitiesMarkupAndCallsGateway(t *testing.T) {
 	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
 	gateway := &fakeBotAPIGateway{
@@ -326,6 +598,101 @@ func TestSendMessageParsesEntitiesMarkupAndCallsGateway(t *testing.T) {
 	}
 	if len(resp.Result.ReplyMarkup.InlineKeyboard) != 1 || resp.Result.ReplyMarkup.InlineKeyboard[0][0].CallbackData != "cb" {
 		t.Fatalf("reply_markup response = %#v", resp.Result.ReplyMarkup)
+	}
+}
+
+func TestSendRichMessageAndEditPreserveInlineKeyboardAndProjection(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	projection := json.RawMessage(`{"blocks":[{"type":"heading","size":4,"text":"Admin"}],"is_rtl":true}`)
+	markup := &domain.MessageReplyMarkup{Type: domain.MessageReplyMarkupInline, Inline: [][]domain.MarkupButton{{{
+		Type: domain.MarkupButtonCallback, Text: "Info", Data: []byte("menu:info"),
+	}}}}
+	message := domain.Message{
+		ID: 21, OwnerUserID: 1001,
+		Peer: domain.Peer{Type: domain.PeerTypeUser, ID: 2001},
+		From: domain.Peer{Type: domain.PeerTypeUser, ID: 1001},
+		Date: 1700000021, Out: true, ReplyMarkup: markup,
+		RichMessage: &domain.MessageRichMessage{Rtl: true, Blocks: []byte{1}, BotAPIProjection: projection},
+	}
+	gateway := &fakeBotAPIGateway{
+		self:        domain.User{ID: 1001, FirstName: "Bedolaga", Username: "bedolaga_bot", Bot: true},
+		sendMessage: message,
+		editMessage: message,
+	}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "sendRichMessage", `{
+		"chat_id":2001,
+		"rich_message":{"html":"<h4>Admin</h4>","is_rtl":true,"skip_entity_detection":true},
+		"reply_markup":{"inline_keyboard":[[{"text":"Info","callback_data":"menu:info"}]]},
+		"disable_notification":true,
+		"protect_content":true,
+		"reply_parameters":{"message_id":7}
+	}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sendRichMessage status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !gateway.sendRichCalled || gateway.sendChatID != 2001 || gateway.sendRichInput.HTML != "<h4>Admin</h4>" ||
+		!gateway.sendRichInput.RTL || !gateway.sendRichInput.SkipEntityDetection || !gateway.sendSilent || gateway.sendReplyTo != 7 {
+		t.Fatalf("send rich call = %#v", gateway)
+	}
+	if gateway.sendRichMarkup == nil || len(gateway.sendRichMarkup.Inline) != 1 ||
+		string(gateway.sendRichMarkup.Inline[0][0].Data) != "menu:info" {
+		t.Fatalf("send rich markup = %#v", gateway.sendRichMarkup)
+	}
+	assertBotAPIRichMenuResponse(t, rec.Body.Bytes(), 21)
+
+	gateway.editMessage.RichMessage.BotAPIProjection = json.RawMessage(`{"blocks":[{"type":"paragraph","text":"Updated"}]}`)
+	rec = performBotAPIRequest(t, h, bots.profile, "editMessageText", `{
+		"chat_id":2001,
+		"message_id":21,
+		"rich_message":{"markdown":"**Updated**","skip_entity_detection":true},
+		"reply_markup":{"inline_keyboard":[[{"text":"Info","callback_data":"menu:info"}]]}
+	}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("editMessageText rich status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !gateway.editRichCalled || gateway.editRichInput.Markdown != "**Updated**" || !gateway.editRichInput.SkipEntityDetection || !gateway.editSetMarkup {
+		t.Fatalf("edit rich call = %#v", gateway)
+	}
+	assertBotAPIRichMenuResponse(t, rec.Body.Bytes(), 21)
+}
+
+func TestEditMessageTextRejectsTextAndRichMessageTogether(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	h := (&handler{bots: bots, gateway: &fakeBotAPIGateway{}}).routes()
+	rec := performBotAPIRequest(t, h, bots.profile, "editMessageText", `{
+		"chat_id":2001,"message_id":21,"text":"plain","rich_message":{"html":"<p>rich</p>"}
+	}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "RICH_MESSAGE_INVALID") {
+		t.Fatalf("edit text+rich status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func assertBotAPIRichMenuResponse(t *testing.T, raw []byte, messageID int) {
+	t.Helper()
+	var response struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			MessageID   int `json:"message_id"`
+			RichMessage struct {
+				Blocks []struct {
+					Type string `json:"type"`
+				} `json:"blocks"`
+			} `json:"rich_message"`
+			ReplyMarkup struct {
+				InlineKeyboard [][]struct {
+					CallbackData string `json:"callback_data"`
+				} `json:"inline_keyboard"`
+			} `json:"reply_markup"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatalf("decode rich response: %v", err)
+	}
+	if !response.OK || response.Result.MessageID != messageID || len(response.Result.RichMessage.Blocks) != 1 ||
+		len(response.Result.ReplyMarkup.InlineKeyboard) != 1 || response.Result.ReplyMarkup.InlineKeyboard[0][0].CallbackData != "menu:info" {
+		t.Fatalf("rich response = %s", raw)
 	}
 }
 
@@ -520,6 +887,19 @@ func TestReplyMarkupFromAPIReplyKeyboardVariants(t *testing.T) {
 	if err != nil || webApp == nil || webApp.Inline[0][0].Type != domain.MarkupButtonWebView {
 		t.Fatalf("web_app inline button = %#v err=%v", webApp, err)
 	}
+	login, err := replyMarkupFromAPI(json.RawMessage(`{"inline_keyboard":[[{"text":"Log in","login_url":{"url":"https://example.com/login","forward_text":"Open","bot_username":"auth_bot","request_write_access":true}}]]}`))
+	if err != nil || login == nil {
+		t.Fatalf("login_url inline button = %#v err=%v", login, err)
+	}
+	loginButton := login.Inline[0][0]
+	if loginButton.Type != domain.MarkupButtonLoginURL || loginButton.URL != "https://example.com/login" || loginButton.ForwardText != "Open" ||
+		loginButton.LoginBotUsername != "auth_bot" || !loginButton.RequestWriteAccess {
+		t.Fatalf("login_url button = %#v", loginButton)
+	}
+	projectedLogin := apiReplyMarkup(login)["inline_keyboard"].([][]map[string]any)[0][0]["login_url"].(map[string]any)
+	if projectedLogin["url"] != "https://example.com/login" || projectedLogin["bot_username"] != "auth_bot" || projectedLogin["request_write_access"] != true {
+		t.Fatalf("projected login_url = %#v", projectedLogin)
+	}
 }
 
 func TestReplyMarkupFromAPIPreservesSemanticButtonStyles(t *testing.T) {
@@ -598,6 +978,23 @@ func TestSetWebhookPersistsConfigReportsInfoAndConflictsWithPolling(t *testing.T
 	}
 }
 
+func TestSetWebhookAcceptsHTTPHostIPAndArbitraryPort(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	for _, rawURL := range []string{
+		"http://bot.example.test:3000/hook",
+		"http://192.0.2.25:18080/hook",
+		"http://[2001:db8::25]:28080/hook",
+		"HTTP://bot.example.test:3100/hook",
+	} {
+		gateway := &fakeBotAPIGateway{}
+		h := (&handler{bots: bots, gateway: gateway}).routes()
+		rec := performBotAPIRequest(t, h, bots.profile, "setWebhook", fmt.Sprintf(`{"url":%q}`, rawURL))
+		if rec.Code != http.StatusOK || !gateway.webhookFound || gateway.webhook.URL != rawURL {
+			t.Fatalf("setWebhook url=%q status=%d body=%s config=%#v", rawURL, rec.Code, rec.Body.String(), gateway.webhook)
+		}
+	}
+}
+
 func TestSetWebhookRejectsUnsafeParameters(t *testing.T) {
 	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
 	h := (&handler{bots: bots, gateway: &fakeBotAPIGateway{}}).routes()
@@ -605,8 +1002,9 @@ func TestSetWebhookRejectsUnsafeParameters(t *testing.T) {
 		body string
 		want string
 	}{
-		{`{"url":"http://example.test/hook"}`, "WEBHOOK_URL_INVALID"},
-		{`{"url":"https://example.test:444/hook"}`, "WEBHOOK_PORT_NOT_ALLOWED"},
+		{`{"url":"ftp://example.test/hook"}`, "WEBHOOK_URL_INVALID"},
+		{`{"url":"http://user@example.test/hook"}`, "WEBHOOK_URL_INVALID"},
+		{`{"url":"http://example.test:0/hook"}`, "WEBHOOK_URL_INVALID"},
 		{`{"url":"https://example.test/hook","secret_token":"bad secret"}`, "SECRET_TOKEN_INVALID"},
 		{`{"url":"https://example.test/hook","max_connections":101}`, "MAX_CONNECTIONS_INVALID"},
 	}
@@ -980,11 +1378,21 @@ type apiResponse struct {
 }
 
 type fakeBotAPIBots struct {
-	profile domain.BotProfile
+	profile  domain.BotProfile
+	commands []domain.BotCommand
 }
 
 func (f *fakeBotAPIBots) BotInfo(context.Context, int64) (domain.BotProfile, bool, error) {
 	return f.profile, true, nil
+}
+
+func (f *fakeBotAPIBots) SetBotCommands(_ context.Context, _ int64, commands []domain.BotCommand) (int, error) {
+	f.commands = append([]domain.BotCommand(nil), commands...)
+	return 1, nil
+}
+
+func (f *fakeBotAPIBots) GetBotCommands(context.Context, int64) ([]domain.BotCommand, error) {
+	return append([]domain.BotCommand(nil), f.commands...), nil
 }
 
 func (f *fakeBotAPIBots) SetBotMenuButton(context.Context, int64, domain.BotMenuButton) (int, error) {
@@ -1038,41 +1446,56 @@ type fakeBotAPIGateway struct {
 	updateBotID  int64
 	updateOffset int64
 
-	sendCalled        bool
-	sendBotID         int64
-	sendChatID        int64
-	sendText          string
-	sendEntities      []domain.MessageEntity
-	sendMarkup        *domain.MessageReplyMarkup
-	sendNoWebpage     bool
-	sendSilent        bool
-	sendReplyTo       int
-	sendMessage       domain.Message
-	sendMediaCalled   bool
-	sendMediaKind     string
-	sendMediaChatID   int64
-	sendMediaFileName string
-	sendMediaBytes    []byte
-	sendMediaCaption  string
-	sendMediaMessage  domain.Message
-	editCalled        bool
-	editSetMarkup     bool
-	editMessage       domain.Message
-	editInlineCalled  bool
-	editInlineID      domain.BotInlineMessageID
-	deleteCalled      bool
-	callbackCalled    bool
-	callbackID        string
-	fileLocationKey   string
-	fileChunks        map[string]domain.FileChunk
-	allowedUpdates    []domain.BotAPIUpdateKind
-	dropPending       bool
-	pendingCount      int
-	webhook           domain.BotAPIWebhook
-	webhookFound      bool
-	webhookDeleted    bool
-	webhookDrop       bool
-	webhookConfirmed  int64
+	sendCalled               bool
+	sendBotID                int64
+	sendChatID               int64
+	sendText                 string
+	sendEntities             []domain.MessageEntity
+	sendMarkup               *domain.MessageReplyMarkup
+	sendNoWebpage            bool
+	sendSilent               bool
+	sendReplyTo              int
+	sendMessage              domain.Message
+	sendRichCalled           bool
+	sendRichInput            domain.BotAPIRichMessageInput
+	sendRichMarkup           *domain.MessageReplyMarkup
+	sendMediaCalled          bool
+	sendMediaKind            string
+	sendMediaChatID          int64
+	sendMediaFileName        string
+	sendMediaBytes           []byte
+	sendMediaCaption         string
+	sendMediaEntities        []domain.MessageEntity
+	sendMediaMessage         domain.Message
+	editCalled               bool
+	editText                 string
+	editEntities             []domain.MessageEntity
+	editSetMarkup            bool
+	editMessage              domain.Message
+	editRichCalled           bool
+	editRichInput            domain.BotAPIRichMessageInput
+	editInlineCalled         bool
+	editInlineID             domain.BotInlineMessageID
+	editInlineText           string
+	editInlineEntities       []domain.MessageEntity
+	deleteCalled             bool
+	callbackCalled           bool
+	callbackID               string
+	fileLocationKey          string
+	fileChunks               map[string]domain.FileChunk
+	allowedUpdates           []domain.BotAPIUpdateKind
+	dropPending              bool
+	pendingCount             int
+	webhook                  domain.BotAPIWebhook
+	webhookFound             bool
+	webhookDeleted           bool
+	webhookDrop              bool
+	webhookConfirmed         int64
+	ephemeralMessage         domain.EphemeralMessage
+	ephemeralSends           []domain.BotAPIEphemeralSendInput
+	ephemeralEdits           []domain.BotAPIEphemeralEditInput
+	ephemeralDeleteCalled    bool
+	ephemeralDeleteMessageID int
 }
 
 func (f *fakeBotAPIGateway) BotAPISelf(context.Context, int64) (domain.User, error) {
@@ -1157,6 +1580,17 @@ func (f *fakeBotAPIGateway) BotAPISendMessage(_ context.Context, botID, chatID i
 	return f.sendMessage, nil
 }
 
+func (f *fakeBotAPIGateway) BotAPISendRichMessage(_ context.Context, botID, chatID int64, rich domain.BotAPIRichMessageInput, replyMarkup *domain.MessageReplyMarkup, silent, noForwards bool, replyToMessageID int, effectID int64) (domain.Message, error) {
+	f.sendRichCalled = true
+	f.sendBotID = botID
+	f.sendChatID = chatID
+	f.sendRichInput = rich
+	f.sendRichMarkup = replyMarkup
+	f.sendSilent = silent
+	f.sendReplyTo = replyToMessageID
+	return f.sendMessage, nil
+}
+
 func (f *fakeBotAPIGateway) BotAPISendMedia(_ context.Context, botID, chatID int64, kind, locationKey, remoteURL, fileName, mimeType string, fileBytes []byte, caption string, entities []domain.MessageEntity, replyMarkup *domain.MessageReplyMarkup, silent bool, replyToMessageID int) (domain.Message, error) {
 	f.sendMediaCalled = true
 	f.sendMediaKind = kind
@@ -1164,17 +1598,35 @@ func (f *fakeBotAPIGateway) BotAPISendMedia(_ context.Context, botID, chatID int
 	f.sendMediaFileName = fileName
 	f.sendMediaBytes = append([]byte(nil), fileBytes...)
 	f.sendMediaCaption = caption
+	f.sendMediaEntities = append([]domain.MessageEntity(nil), entities...)
 	return f.sendMediaMessage, nil
 }
 
 func (f *fakeBotAPIGateway) BotAPIEditMessageText(_ context.Context, botID, chatID int64, messageID int, text string, entities []domain.MessageEntity, setReplyMarkup bool, replyMarkup *domain.MessageReplyMarkup, disableWebPagePreview bool) (domain.Message, error) {
 	f.editCalled = true
+	f.editText = text
+	f.editEntities = append([]domain.MessageEntity(nil), entities...)
 	f.editSetMarkup = setReplyMarkup
 	return f.editMessage, nil
 }
 
-func (f *fakeBotAPIGateway) BotAPIEditInlineMessageText(_ context.Context, _ int64, inlineMessageID domain.BotInlineMessageID, _ string, _ []domain.MessageEntity, _ bool, _ *domain.MessageReplyMarkup, _ bool) (bool, error) {
+func (f *fakeBotAPIGateway) BotAPIEditRichMessage(_ context.Context, botID, chatID int64, messageID int, rich domain.BotAPIRichMessageInput, setReplyMarkup bool, replyMarkup *domain.MessageReplyMarkup) (domain.Message, error) {
+	f.editRichCalled = true
+	f.editRichInput = rich
+	f.editSetMarkup = setReplyMarkup
+	return f.editMessage, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIEditInlineMessageText(_ context.Context, _ int64, inlineMessageID domain.BotInlineMessageID, text string, entities []domain.MessageEntity, _ bool, _ *domain.MessageReplyMarkup, _ bool) (bool, error) {
 	f.editInlineCalled, f.editInlineID = true, inlineMessageID
+	f.editInlineText = text
+	f.editInlineEntities = append([]domain.MessageEntity(nil), entities...)
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIEditInlineRichMessage(_ context.Context, _ int64, inlineMessageID domain.BotInlineMessageID, rich domain.BotAPIRichMessageInput, _ bool, _ *domain.MessageReplyMarkup) (bool, error) {
+	f.editInlineCalled, f.editInlineID = true, inlineMessageID
+	f.editRichInput = rich
 	return true, nil
 }
 
@@ -1205,4 +1657,20 @@ func (f *fakeBotAPIGateway) BotAPIGetFile(_ context.Context, _ int64, locationKe
 	out := chunk
 	out.Bytes = append([]byte(nil), chunk.Bytes[offset:end]...)
 	return out, true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPISendEphemeral(_ context.Context, input domain.BotAPIEphemeralSendInput) (domain.EphemeralMessage, error) {
+	f.ephemeralSends = append(f.ephemeralSends, input)
+	return f.ephemeralMessage, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIEditEphemeral(_ context.Context, input domain.BotAPIEphemeralEditInput) (bool, error) {
+	f.ephemeralEdits = append(f.ephemeralEdits, input)
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIDeleteEphemeral(_ context.Context, _ int64, _ int64, _ int64, messageID int) (bool, error) {
+	f.ephemeralDeleteCalled = true
+	f.ephemeralDeleteMessageID = messageID
+	return true, nil
 }

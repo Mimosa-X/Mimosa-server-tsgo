@@ -35,9 +35,6 @@ func (r *Router) onMessagesCreateChat(ctx context.Context, req *tg.MessagesCreat
 		zap.Int("member_ids", len(memberIDs)),
 		zap.Int64s("member_user_ids", memberIDs),
 	)
-	if len(memberIDs) == 0 {
-		return nil, usersTooFewErr()
-	}
 	createRes, err := r.deps.Channels.CreateMegagroupFromCreateChat(ctx, userID, domain.CreateChannelRequest{
 		CreatorUserID: userID,
 		Title:         req.Title,
@@ -63,16 +60,25 @@ func (r *Router) onMessagesCreateChat(ctx context.Context, req *tg.MessagesCreat
 	}
 
 	cache := newViewerPeerCache(r)
-	updates := r.channelOperationUpdatesWithPeerCache(ctx, userID, responseRes, cache)
+	canonicalUpdates := r.channelOperationUpdatesWithPeerCache(ctx, userID, responseRes, cache)
+	var inviteUpdates *tg.Updates
+	if inviteRes.Event.Pts != 0 {
+		inviteUpdates = r.channelOperationUpdatesWithPeerCache(ctx, userID, inviteRes, cache)
+		if inviteUpdates != nil {
+			canonicalUpdates.Updates = append(canonicalUpdates.Updates, inviteUpdates.Updates...)
+		}
+	}
+	updates := canonicalUpdates
 	if createChatNeedsLegacyChat(ctx) {
 		updates = r.tdesktopCreateChatUpdatesWithPeerCache(ctx, userID, responseRes, cache)
-	}
-	if inviteRes.Event.Pts != 0 {
-		inviteUpdates := r.channelOperationUpdatesWithPeerCache(ctx, userID, inviteRes, cache)
 		if inviteUpdates != nil {
 			updates.Updates = append(updates.Updates, inviteUpdates.Updates...)
 		}
 	}
+	// The rpc_result reaches only the calling session. Keep the creator's other
+	// sessions in sync with the same canonical channel state; compatibility-only
+	// legacy chat projection is needed solely by the synchronous create callback.
+	r.pushUserUpdates(ctx, userID, canonicalUpdates)
 	if inviteRes.Event.Pts != 0 {
 		r.pushChannelExplicitUpdates(ctx, userID, inviteRes.Channel.ID, memberIDs, func(viewerUserID int64) *tg.Updates {
 			return r.channelOperationUpdatesWithPeerCache(ctx, viewerUserID, inviteRes, cache)
@@ -227,7 +233,7 @@ func (r *Router) onMessagesEditChatAdmin(ctx context.Context, req *tg.MessagesEd
 }
 
 func (r *Router) onMessagesEditChatAbout(ctx context.Context, req *tg.MessagesEditChatAboutRequest) (bool, error) {
-	if r.deps.Channels == nil {
+	if r.deps.Channels == nil && r.deps.Communities == nil {
 		return false, notImplementedErr()
 	}
 	if utf8.RuneCountInString(req.About) > maxChannelAboutLength {
@@ -236,6 +242,22 @@ func (r *Router) onMessagesEditChatAbout(ctx context.Context, req *tg.MessagesEd
 	userID, _, err := r.currentUserID(ctx)
 	if err != nil {
 		return false, internalErr()
+	}
+	if community, ok, err := r.maybeCommunityFromInputPeer(ctx, userID, req.Peer); ok {
+		if err != nil {
+			return false, err
+		}
+		view, changed, err := r.deps.Communities.EditAbout(ctx, userID, community.Community.ID, req.About)
+		if err != nil {
+			return false, communityErr(err)
+		}
+		if changed {
+			r.pushCommunityState(ctx, userID, view)
+		}
+		return true, nil
+	}
+	if r.deps.Channels == nil {
+		return false, channelInvalidErr(domain.ErrChannelInvalid)
 	}
 	channelID, err := r.channelIDFromLegacyInputPeerChecked(ctx, userID, req.Peer)
 	if err != nil {
@@ -255,12 +277,25 @@ func (r *Router) onMessagesEditChatAbout(ctx context.Context, req *tg.MessagesEd
 }
 
 func (r *Router) onMessagesEditChatDefaultBannedRights(ctx context.Context, req *tg.MessagesEditChatDefaultBannedRightsRequest) (tg.UpdatesClass, error) {
-	if r.deps.Channels == nil {
+	if r.deps.Channels == nil && r.deps.Communities == nil {
 		return nil, notImplementedErr()
 	}
 	userID, _, err := r.currentUserID(ctx)
 	if err != nil {
 		return nil, internalErr()
+	}
+	if community, ok, err := r.maybeCommunityFromInputPeer(ctx, userID, req.Peer); ok {
+		if err != nil {
+			return nil, err
+		}
+		view, changed, err := r.deps.Communities.EditDefaultBannedRights(ctx, userID, community.Community.ID, domainChannelBannedRights(req.BannedRights))
+		if err != nil {
+			return nil, communityErr(err)
+		}
+		return r.communityMutationUpdates(ctx, userID, view, changed), nil
+	}
+	if r.deps.Channels == nil {
+		return nil, channelInvalidErr(domain.ErrChannelInvalid)
 	}
 	peer, err := r.checkedDomainPeerFromInputPeer(ctx, userID, req.Peer)
 	if err != nil {

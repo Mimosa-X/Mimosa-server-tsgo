@@ -10,6 +10,21 @@ $env:TELESRV_BOT_TOKEN = "<bot_id>:<secret>"
 python .\cmd\bots\aiogramecho\echo.py --drop-pending
 ```
 
+## Ephemeral echo（Bot API 10.2）
+
+先通过 `setMyCommands` 把 `private` 注册为 `is_ephemeral=true`，再在 TDesktop Layer 228
+的群组中发送：
+
+```text
+/private@你的Bot用户名
+```
+
+aiogram 3.30.0 原生解析 `ephemeral_message_id`。示例在 15 秒 action 窗口内携带
+`receiver_user_id` 和 `ReplyParameters(ephemeral_message_id=...)` 回复
+`ephemeral echo: ...`；失败不会降级成普通消息。Alice 应看到两条带
+可见性提示的消息：自己发出的命令显示“Only visible to @Bot”，bot 回复显示
+“Only visible to you”；Bob 不应看到其中任何一条。
+
 发送三种语义色的 reply keyboard 与 inline callback 按钮：
 
 ```powershell
@@ -41,10 +56,10 @@ python .\cmd\bots\aiogramecho\echo.py `
 ## Webhook 模式
 
 telesrv 现在会持久化 webhook 配置，通过跨实例租约投递，并且只在目标返回 2xx
-后推进 `update_id`。aiogram 可监听本机 HTTP，由 Caddy/Nginx/Tunnel 提供公网 HTTPS：
+后推进 `update_id`。aiogram 可直接登记 HTTP/HTTPS 域名或 IP，也可以由 Caddy/Nginx/Tunnel 提供公网 HTTPS：
 
 ```powershell
-$env:TELESRV_BOT_WEBHOOK_URL = "https://bot.example.com/webhook"
+$env:TELESRV_BOT_WEBHOOK_URL = "http://192.0.2.25:8080/webhook"
 $env:TELESRV_BOT_WEBHOOK_SECRET = "replace_with_a_random_secret"
 python .\cmd\bots\aiogramecho\echo.py `
   --mode webhook `
@@ -54,8 +69,8 @@ python .\cmd\bots\aiogramecho\echo.py `
   --drop-pending
 ```
 
-公网 URL 必须是 HTTPS，端口限 Telegram 标准的 443/80/88/8443；本机监听地址
-可以是 HTTP，因为 TLS 通常在反向代理终止。`secret_token` 会由 telesrv 放入
+Webhook URL 可使用任意合法 HTTP/HTTPS 域名或 IP 及 `1..65535` 端口；本机监听地址
+也可以直接使用 HTTP。`secret_token` 会由 telesrv 放入
 `X-Telegram-Bot-Api-Secret-Token`，aiogram 会自动校验。若希望进程退出时删除配置，
 再加 `--delete-webhook-on-exit`；默认保留配置，以免普通重启造成更新丢窗。
 

@@ -8,6 +8,7 @@ import (
 	"github.com/iamxvbaba/td/tg"
 
 	"github.com/iamxvbaba/td/tlprofile"
+	"telesrv/internal/branding"
 	ioscompat "telesrv/internal/compat/ios"
 	"telesrv/internal/compat/tdesktop"
 	"telesrv/internal/domain"
@@ -379,14 +380,10 @@ func (r *Router) registerAccount(d *tlprofile.Dispatcher) {
 			ID)
 	})
 	registerRPC[*tg.AccountGetWebAuthorizationsRequest](d, tlprofile.SemanticMethodAccountGetWebAuthorizations, func(ctx context.Context, layerRequest *tg.AccountGetWebAuthorizationsRequest) (any, error) {
-		return tdesktop.WebAuthorizations(), nil
+		return r.onAccountGetWebAuthorizations(ctx)
 	})
 	registerRPC[*tg.AccountResetWebAuthorizationRequest](d, tlprofile.SemanticMethodAccountResetWebAuthorization, func(ctx context.Context, layerRequest *tg.AccountResetWebAuthorizationRequest) (any, error) {
-		hash := layerRequest.
-			Hash
-		_ = hash
-
-		return true, nil
+		return r.onAccountResetWebAuthorization(ctx, layerRequest.Hash)
 	})
 	registerRPC[*tg.AccountResetWebAuthorizationsRequest](d, tlprofile.SemanticMethodAccountResetWebAuthorizations, func(ctx context.Context, layerRequest *tg.AccountResetWebAuthorizationsRequest) (
 
@@ -394,7 +391,7 @@ func (r *Router) registerAccount(d *tlprofile.Dispatcher) {
 		// （无内置浏览器例外、不强制外部浏览器）。Android 启动时会拉取，缺它会反复 500
 		// NOT_IMPLEMENTED。空结构 Hash=0，客户端按默认（内置浏览器、无例外）渲染。
 		any, error) {
-		return true, nil
+		return r.onAccountResetWebAuthorizations(ctx)
 	})
 	registerRPC[*tg.AccountGetWebBrowserSettingsRequest](d, tlprofile.SemanticMethodAccountGetWebBrowserSettings, func(ctx context.Context, layerRequest *tg.AccountGetWebBrowserSettingsRequest) (any, error) {
 		hash := layerRequest.
@@ -1889,12 +1886,12 @@ func tgAuthorization(a domain.Authorization, currentAuthKeyID [8]byte, now int) 
 		Current:       a.AuthKeyID == currentAuthKeyID,
 		OfficialApp:   true,
 		Hash:          a.Hash,
-		DeviceModel:   a.DeviceModel,
-		Platform:      a.Platform,
-		SystemVersion: a.SystemVersion,
+		DeviceModel:   branding.UserVisibleText(a.DeviceModel, ""),
+		Platform:      branding.UserVisibleClientPlatform(a.Platform),
+		SystemVersion: branding.UserVisibleText(a.SystemVersion, ""),
 		APIID:         a.APIID,
-		AppName:       "Telegram Desktop",
-		AppVersion:    a.AppVersion,
+		AppName:       branding.ClientAppName(a.Platform),
+		AppVersion:    branding.UserVisibleText(a.AppVersion, ""),
 		DateCreated:   created,
 		DateActive:    active,
 		IP:            a.IP,

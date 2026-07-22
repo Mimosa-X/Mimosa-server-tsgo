@@ -6,7 +6,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"telesrv/internal/domain"
 	"telesrv/internal/store"
@@ -62,17 +61,7 @@ func inputTextMessageContentFromAPI(payload apiInlineResult) (string, []domain.M
 	} else if payload.MessageText != "" {
 		content.MessageText = payload.MessageText
 	}
-	if content.ParseMode != "" {
-		return "", nil, false, errors.New("ENTITY_PARSE_UNSUPPORTED")
-	}
-	message := content.MessageText
-	if message == "" {
-		return "", nil, false, errors.New("MESSAGE_EMPTY")
-	}
-	if utf8.RuneCountInString(message) > domain.MaxMessageTextLength {
-		return "", nil, false, errors.New("MESSAGE_TOO_LONG")
-	}
-	entities, err := messageEntitiesFromAPI(content.Entities)
+	message, entities, err := botAPIFormattedText(content.MessageText, content.ParseMode, content.Entities, domain.MaxMessageTextLength, true)
 	if err != nil {
 		return "", nil, false, err
 	}
@@ -97,21 +86,41 @@ func messageEntitiesFromAPI(in []apiMessageEntity) ([]domain.MessageEntity, erro
 			return nil, errors.New("ENTITY_TYPE_UNSUPPORTED")
 		}
 		item := domain.MessageEntity{
-			Type:     mapped,
-			Offset:   entity.Offset,
-			Length:   entity.Length,
-			URL:      entity.URL,
-			Language: entity.Language,
+			Type:   mapped,
+			Offset: entity.Offset,
+			Length: entity.Length,
 		}
-		if entity.User != nil {
-			item.UserID = entity.User.ID
-		}
-		if entity.CustomEmojiID != "" {
+		switch mapped {
+		case domain.MessageEntityTextURL:
+			resolved, ok := botAPITextLinkEntity(entity.URL, entity.Offset, entity.Length)
+			if !ok {
+				return nil, errors.New("ENTITY_TYPE_UNSUPPORTED")
+			}
+			item = resolved
+		case domain.MessageEntityMentionName:
+			if entity.User != nil {
+				item.UserID = entity.User.ID
+			}
+			if item.UserID <= 0 {
+				return nil, errors.New("ENTITY_TYPE_UNSUPPORTED")
+			}
+		case domain.MessageEntityPre:
+			item.Language = entity.Language
+		case domain.MessageEntityBlockquote:
+			item.Collapsed = entity.Type == "expandable_blockquote"
+		case domain.MessageEntityCustomEmoji:
 			id, err := strconv.ParseInt(entity.CustomEmojiID, 10, 64)
 			if err != nil || id <= 0 {
 				return nil, errors.New("ENTITY_TYPE_UNSUPPORTED")
 			}
 			item.DocumentID = id
+		case domain.MessageEntityFormattedDate:
+			formatted, err := botAPIFormattedDate(entity.UnixTime, entity.DateTimeFormat)
+			if err != nil {
+				return nil, errors.New("ENTITY_TYPE_UNSUPPORTED")
+			}
+			formatted.Offset, formatted.Length = entity.Offset, entity.Length
+			item = formatted
 		}
 		out = append(out, item)
 	}
@@ -140,6 +149,8 @@ func apiEntityType(in string) (domain.MessageEntityType, bool) {
 		return domain.MessageEntitySpoiler, true
 	case "blockquote":
 		return domain.MessageEntityBlockquote, true
+	case "expandable_blockquote":
+		return domain.MessageEntityBlockquote, true
 	case "custom_emoji":
 		return domain.MessageEntityCustomEmoji, true
 	case "mention":
@@ -156,6 +167,10 @@ func apiEntityType(in string) (domain.MessageEntityType, bool) {
 		return domain.MessageEntityEmail, true
 	case "phone_number":
 		return domain.MessageEntityPhone, true
+	case "bank_card_number":
+		return domain.MessageEntityBankCard, true
+	case "date_time":
+		return domain.MessageEntityFormattedDate, true
 	default:
 		return "", false
 	}
@@ -332,6 +347,9 @@ func markupButtonFromAPI(button apiInlineKeyboardButton) (domain.MarkupButton, e
 	if button.CopyTextSet {
 		constructors++
 	}
+	if button.LoginURLSet {
+		constructors++
+	}
 	if constructors != 1 {
 		return domain.MarkupButton{}, errors.New("BUTTON_INVALID")
 	}
@@ -341,6 +359,13 @@ func markupButtonFromAPI(button apiInlineKeyboardButton) (domain.MarkupButton, e
 	}
 	if button.URLSet {
 		return domain.MarkupButton{Type: domain.MarkupButtonURL, Text: button.Text, URL: button.URL, Style: style, IconCustomEmojiID: icon}, nil
+	}
+	if button.LoginURLSet {
+		return domain.MarkupButton{
+			Type: domain.MarkupButtonLoginURL, Text: button.Text, URL: button.LoginURL,
+			ForwardText: button.LoginForwardText, LoginBotUsername: button.LoginBotUsername,
+			RequestWriteAccess: button.LoginRequestWriteAccess, Style: style, IconCustomEmojiID: icon,
+		}, nil
 	}
 	if button.CallbackDataSet {
 		if button.CallbackData == "" || len([]byte(button.CallbackData)) > domain.MaxCallbackDataLen {
@@ -450,8 +475,10 @@ type apiMessageEntity struct {
 	User   *struct {
 		ID int64 `json:"id"`
 	} `json:"user"`
-	Language      string `json:"language"`
-	CustomEmojiID string `json:"custom_emoji_id"`
+	Language       string `json:"language"`
+	CustomEmojiID  string `json:"custom_emoji_id"`
+	UnixTime       int    `json:"unix_time"`
+	DateTimeFormat string `json:"date_time_format"`
 }
 
 type apiInlineKeyboardMarkup struct {
@@ -672,23 +699,28 @@ type apiForceReply struct {
 }
 
 type apiInlineKeyboardButton struct {
-	Text                  string
-	URL                   string
-	URLSet                bool
-	CallbackData          string
-	CallbackDataSet       bool
-	Style                 string
-	IconCustomEmojiID     string
-	IconCustomEmojiIDSet  bool
-	Unsupported           bool
-	WebAppURL             string
-	WebAppSet             bool
-	SwitchInlineQuery     string
-	SwitchInlineSet       bool
-	SwitchInlineSamePeer  bool
-	SwitchInlinePeerTypes []string
-	CopyText              string
-	CopyTextSet           bool
+	Text                    string
+	URL                     string
+	URLSet                  bool
+	CallbackData            string
+	CallbackDataSet         bool
+	Style                   string
+	IconCustomEmojiID       string
+	IconCustomEmojiIDSet    bool
+	Unsupported             bool
+	WebAppURL               string
+	WebAppSet               bool
+	SwitchInlineQuery       string
+	SwitchInlineSet         bool
+	SwitchInlineSamePeer    bool
+	SwitchInlinePeerTypes   []string
+	CopyText                string
+	CopyTextSet             bool
+	LoginURL                string
+	LoginForwardText        string
+	LoginBotUsername        string
+	LoginRequestWriteAccess bool
+	LoginURLSet             bool
 }
 
 func (b *apiInlineKeyboardButton) UnmarshalJSON(data []byte) error {
@@ -721,6 +753,20 @@ func (b *apiInlineKeyboardButton) UnmarshalJSON(data []byte) error {
 			return errors.New("invalid web app")
 		}
 		b.WebAppURL = app.URL
+	}
+	if raw, ok := fields["login_url"]; ok {
+		b.LoginURLSet = true
+		var login struct {
+			URL                string `json:"url"`
+			ForwardText        string `json:"forward_text"`
+			BotUsername        string `json:"bot_username"`
+			RequestWriteAccess bool   `json:"request_write_access"`
+		}
+		if json.Unmarshal(raw, &login) != nil {
+			return errors.New("invalid login url")
+		}
+		b.LoginURL, b.LoginForwardText = login.URL, login.ForwardText
+		b.LoginBotUsername, b.LoginRequestWriteAccess = login.BotUsername, login.RequestWriteAccess
 	}
 	switchActions := 0
 	if raw, ok := fields["switch_inline_query"]; ok {
@@ -790,7 +836,7 @@ func (b *apiInlineKeyboardButton) UnmarshalJSON(data []byte) error {
 	}
 	for key := range fields {
 		switch key {
-		case "text", "url", "callback_data", "web_app", "switch_inline_query", "switch_inline_query_current_chat", "switch_inline_query_chosen_chat", "copy_text", "style", "icon_custom_emoji_id":
+		case "text", "url", "callback_data", "web_app", "login_url", "switch_inline_query", "switch_inline_query_current_chat", "switch_inline_query_chosen_chat", "copy_text", "style", "icon_custom_emoji_id":
 		default:
 			b.Unsupported = true
 		}

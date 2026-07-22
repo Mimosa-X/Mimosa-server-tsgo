@@ -30,8 +30,10 @@ import (
 	botsapp "telesrv/internal/app/bots"
 	channelapp "telesrv/internal/app/channels"
 	chatlistsapp "telesrv/internal/app/chatlists"
+	communitiesapp "telesrv/internal/app/communities"
 	"telesrv/internal/app/contacts"
 	"telesrv/internal/app/dialogs"
+	ephemeralapp "telesrv/internal/app/ephemeral"
 	filesapp "telesrv/internal/app/files"
 	groupcallsapp "telesrv/internal/app/groupcalls"
 	"telesrv/internal/app/help"
@@ -47,6 +49,7 @@ import (
 	"telesrv/internal/app/stargifts"
 	"telesrv/internal/app/stars"
 	storiesapp "telesrv/internal/app/stories"
+	telegramloginapp "telesrv/internal/app/telegramlogin"
 	themesapp "telesrv/internal/app/themes"
 	translationapp "telesrv/internal/app/translation"
 	"telesrv/internal/app/updates"
@@ -67,6 +70,7 @@ import (
 	"telesrv/internal/store/memory"
 	"telesrv/internal/store/postgres"
 	"telesrv/internal/store/redisstore"
+	"telesrv/internal/telegramloginhttp"
 	"telesrv/internal/turnsrv"
 	"telesrv/internal/web"
 )
@@ -344,12 +348,60 @@ func run(logger *zap.Logger) error {
 	}
 	defer pool.Close()
 
+	var telegramLoginService *telegramloginapp.Service
+	var telegramLoginIDTokens *telegramloginapp.IDTokenIssuer
+	var telegramLoginHTTPHandler http.Handler
+	if cfg.TelegramLoginEnabled {
+		codeSealer, err := telegramloginapp.LoadCodeSealer(cfg.TelegramLoginCodeKeysFile)
+		if err != nil {
+			return fmt.Errorf("load telegram login code keys: %w", err)
+		}
+		clientSecretPepper, err := telegramloginapp.LoadClientSecretPepper(cfg.TelegramLoginSecretPepperFile)
+		if err != nil {
+			return fmt.Errorf("load telegram login client-secret pepper: %w", err)
+		}
+		signingKeys, err := telegramloginapp.LoadSigningKeyRing(cfg.TelegramLoginSigningKeysFile, time.Now)
+		if err != nil {
+			return fmt.Errorf("load telegram login signing keys: %w", err)
+		}
+		telegramLoginService, err = telegramloginapp.NewService(postgres.NewTelegramLoginStore(pool), codeSealer, telegramloginapp.Config{
+			Issuer: cfg.TelegramLoginIssuer, AppScheme: cfg.PublicAppScheme,
+			AllowHTTP:                  cfg.TelegramLoginAllowHTTP,
+			ClientSecretPepper:         clientSecretPepper,
+			SupportedSigningAlgorithms: signingKeys.ActiveAlgorithms(),
+			RequestTTL:                 cfg.TelegramLoginRequestTTL, CodeTTL: cfg.TelegramLoginCodeTTL,
+		})
+		if err != nil {
+			return fmt.Errorf("initialize telegram login service: %w", err)
+		}
+		telegramLoginIDTokens, err = telegramloginapp.NewIDTokenIssuer(signingKeys, telegramloginapp.IDTokenIssuerConfig{
+			Issuer: cfg.TelegramLoginIssuer, TTL: cfg.TelegramLoginIDTokenTTL, AllowHTTP: cfg.TelegramLoginAllowHTTP,
+		})
+		if err != nil {
+			return fmt.Errorf("initialize telegram login ID-token issuer: %w", err)
+		}
+	}
+
 	rdb, err := redisstore.Open(ctx, cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
 	if err != nil {
 		return fmt.Errorf("connect redis: %w", err)
 	}
 	defer func() { _ = rdb.Close() }()
 	logger.Info("持久化依赖就绪", zap.String("redis", cfg.RedisAddr))
+	if cfg.TelegramLoginEnabled {
+		telegramLoginHTTPHandler, err = telegramloginhttp.NewHandler(telegramloginhttp.Config{
+			Service: telegramLoginService, Tokens: telegramLoginIDTokens,
+			Limiter: redisstore.NewRateLimiter(rdb), AppName: cfg.PublicAppName,
+			Logger: logger.Named("telegram-login-http"), TrustedProxyCIDRs: cfg.TelegramLoginTrustedProxyCIDRs,
+			AllowHTTP: cfg.TelegramLoginAllowHTTP,
+		})
+		if err != nil {
+			return fmt.Errorf("initialize telegram login HTTP provider: %w", err)
+		}
+		logger.Info("Telegram Login/OIDC provider enabled",
+			zap.String("issuer", telegramLoginIDTokens.Issuer()),
+			zap.Strings("signing_algorithms", telegramLoginIDTokens.SupportedAlgorithms()))
+	}
 
 	authKeyStore := postgres.NewAuthKeyStore(pool)
 	userStore := postgres.NewUserStore(pool)
@@ -363,6 +415,8 @@ func run(logger *zap.Logger) error {
 	bootstrapUpdateStore := postgres.NewBootstrapUpdateJobStore(pool)
 	botAPIUpdateStore := postgres.NewBotAPIUpdateStore(pool)
 	botCallbackStore := redisstore.NewBotCallbackRegistryStore(rdb)
+	ephemeralStore := redisstore.NewEphemeralMessageStore(rdb)
+	ephemeralReportStore := postgres.NewEphemeralReportStore(pool)
 	boxIDAllocator := redisstore.NewBoxIDAllocator(rdb, postgres.NewMessageBoxCounterSource(pool))
 	channelIDAllocator := redisstore.NewChannelIDAllocator(rdb, postgres.NewChannelIDCounterSource(pool))
 	channelMessageIDAllocator := redisstore.NewChannelMessageIDAllocator(rdb, postgres.NewChannelMessageIDCounterSource(pool))
@@ -386,6 +440,7 @@ func run(logger *zap.Logger) error {
 		postgres.WithChannelMemberCache(channelMemberCache),
 		postgres.WithChannelDialogCache(channelDialogCache),
 		postgres.WithChannelBoostCache(channelBoostCache))
+	communityStore := postgres.NewCommunityStore(pool, channelIDAllocator, channelMessageIDAllocator)
 	pollStore := postgres.NewPollStore(pool)
 	mediaStore := postgres.NewMediaStore(pool)
 	// 头像投影缓存：所有 projector 共用一层短 TTL owner→头像缓存，消除高频「返回用户」RPC
@@ -490,11 +545,12 @@ func run(logger *zap.Logger) error {
 		cfg.UploadPartGCInterval,
 		cfg.UploadPartGCBatch,
 	).Run(ctx)
-	langPackService := langpack.NewService(langPackStore)
+	langPackService := langpack.NewService(langPackStore, langpack.WithPublicBaseURL(cfg.PublicBaseURL))
 	privacyService := privacyapp.NewService(privacyStore, contactStore)
 	contactsService := contacts.NewService(contactStore, userStore).Configure(
 		contacts.WithPhotoProvider(cachedPhotos),
 		contacts.WithPrivacyEvaluator(privacyService),
+		contacts.WithAccountFreezeProvider(adminService),
 		contacts.WithReadModelVersions(readModelVersionStore),
 	)
 	if seeded, err := langPackService.SeedDirectory(ctx, cfg.LangPackSeedDir); err != nil {
@@ -580,6 +636,7 @@ func run(logger *zap.Logger) error {
 		botsapp.WithUserCache(userCache),
 		botsapp.WithStickerSetCreator(filesService),
 		botsapp.WithUserStickerSets(accountService),
+		botsapp.WithTelegramLogin(telegramLoginService),
 		botsapp.WithPublicBaseURL(cfg.PublicBaseURL))
 	groupCallStore := postgres.NewGroupCallStore(pool)
 	groupCallsService := groupcallsapp.NewService(groupCallStore, groupcallsapp.WithPublicBaseURL(cfg.PublicBaseURL))
@@ -695,13 +752,14 @@ func run(logger *zap.Logger) error {
 		passkeyapp.WithAllowedOrigins(cfg.PasskeyAllowedOrigins))
 	// 自定义云主题(Create a New Theme):主题目录与每用户已安装列表均持久化到 postgres。
 	themeService := themesapp.NewService(postgres.NewThemeStore(pool))
-	usersService := users.NewService(userStore, users.WithBaseUserCache(userCache), users.WithContactStore(contactStore), users.WithPhotoProvider(cachedPhotos), users.WithPrivacyEvaluator(privacyService))
+	usersService := users.NewService(userStore, users.WithBaseUserCache(userCache), users.WithContactStore(contactStore), users.WithPhotoProvider(cachedPhotos), users.WithPrivacyEvaluator(privacyService), users.WithAccountFreezeProvider(adminService))
 	aiComposeService := aiapp.NewService(aiComposeStore, newAIComposeOptions(cfg, rateLimiter, usersService.PremiumActive, logger)...)
 	botsService.SetAIChatGenerator(aiComposeService)
 	dialogsService := dialogs.NewService(dialogStore, channelStore).Configure(
 		dialogs.WithContactStore(contactStore),
 		dialogs.WithPhotoProvider(cachedPhotos),
 		dialogs.WithPrivacyEvaluator(privacyService),
+		dialogs.WithAccountFreezeProvider(adminService),
 		dialogs.WithPremiumChecker(usersService.PremiumActive),
 		dialogs.WithReadModelVersions(readModelVersionStore),
 	)
@@ -713,6 +771,8 @@ func run(logger *zap.Logger) error {
 		channelapp.WithReadModelVersions(readModelVersionStore),
 		channelapp.WithSendPermissionChecker(adminService),
 	)
+	communitiesService := communitiesapp.NewService(communityStore)
+	ephemeralService := ephemeralapp.NewService(ephemeralStore, channelsService, usersService, botsService)
 	chatlistsService := chatlistsapp.NewService(
 		chatlistStore,
 		dialogStore,
@@ -724,6 +784,7 @@ func run(logger *zap.Logger) error {
 		messageapp.WithContactStore(contactStore),
 		messageapp.WithPhotoProvider(cachedPhotos),
 		messageapp.WithPrivacyEvaluator(privacyService),
+		messageapp.WithAccountFreezeProvider(adminService),
 		messageapp.WithReadModelVersions(readModelVersionStore),
 		messageapp.WithBotResponder(botsService),
 		messageapp.WithSendPermissionChecker(adminService),
@@ -789,7 +850,11 @@ func run(logger *zap.Logger) error {
 		Help:                 help.NewService(helpStore, helpStore, help.WithMapboxToken(cfg.MapboxToken), help.WithAccountFreezeProvider(adminService)),
 		AccountFreeze:        adminService,
 		AICompose:            aiComposeService,
+		Ephemeral:            ephemeralService,
+		EphemeralPush:        ephemeralStore,
+		EphemeralReports:     ephemeralReportStore,
 		Users:                usersService,
+		TelegramLogin:        telegramLoginService,
 		Updates:              updatesService,
 		BootstrapUpdates:     bootstrapUpdateStore,
 		BotAPIUpdates:        botAPIUpdateStore,
@@ -800,6 +865,7 @@ func run(logger *zap.Logger) error {
 		Messages:             messagesService,
 		Translation:          translationService,
 		Channels:             channelsService,
+		Communities:          communitiesService,
 		Files:                filesService,
 		Bots:                 botsService,
 		Polls:                pollsapp.NewService(pollStore),
@@ -848,6 +914,7 @@ func run(logger *zap.Logger) error {
 		Stars:           starsService,
 		StarsNotifier:   router,
 		UserNotifier:    router,
+		FreezeNotifier:  router,
 		Channels:        channelsService,
 		ChannelNotifier: router,
 		Messages:        messagesService,
@@ -875,6 +942,10 @@ func run(logger *zap.Logger) error {
 	go activeSessions.RunPendingSweeper(ctx, time.Minute)
 	go router.RunPremiumSweeper(ctx, cfg.PremiumSweepInterval, cfg.PremiumSweepBatch)
 	go router.RunAccountLifecycle(ctx, time.Minute, 500)
+	go router.RunAccountFreezeNotifications(ctx, time.Minute, 500)
+	if telegramLoginService != nil {
+		go runTelegramLoginRetention(ctx, telegramLoginService, cfg.TelegramLoginRetention, cfg.TelegramLoginSweepInterval, cfg.TelegramLoginSweepBatch, logger.Named("telegram-login-retention"))
+	}
 	go func() {
 		interval := cfg.StarGiftSweepInterval
 		if interval <= 0 {
@@ -903,6 +974,7 @@ func run(logger *zap.Logger) error {
 	}()
 	go router.RunInlineBotPushSubscriber(ctx)
 	go router.RunBotCallbackAnswerSubscriber(ctx)
+	go router.RunEphemeralPushSubscriber(ctx)
 	if _, err := botapi.Start(ctx, cfg.BotAPIAddr, botsService, usersService, router, router, logger.Named("botapi")); err != nil {
 		return fmt.Errorf("start bot api: %w", err)
 	}
@@ -922,6 +994,7 @@ func run(logger *zap.Logger) error {
 		Photos:          filesService,
 		UniqueGifts:     giftsService,
 		GiftWithdrawals: giftsService,
+		TelegramLogin:   telegramLoginHTTPHandler,
 	}, logger.Named("public-web")); err != nil {
 		return fmt.Errorf("start public Web: %w", err)
 	}
@@ -971,4 +1044,39 @@ func run(logger *zap.Logger) error {
 	// This is intentionally the final startup operation. ListenAndServe owns the
 	// public listener so no seed/prewarm work can run after port 2398 is exposed.
 	return srv.ListenAndServe(ctx, cfg.ListenAddr)
+}
+
+func runTelegramLoginRetention(ctx context.Context, service *telegramloginapp.Service, retention, interval time.Duration, batch int, logger *zap.Logger) {
+	run := func() {
+		var total int64
+		// Bound one tick even when a deployment accumulated years of stale data;
+		// subsequent ticks continue without monopolizing the database pool.
+		for range 10 {
+			deleted, err := service.DeleteExpiredArtifacts(ctx, time.Now().UTC().Add(-retention), batch)
+			if err != nil {
+				if ctx.Err() == nil {
+					logger.Warn("telegram_login_retention_failed", zap.Error(err))
+				}
+				return
+			}
+			total += deleted
+			if deleted < int64(batch) {
+				break
+			}
+		}
+		if total > 0 {
+			logger.Info("telegram_login_retention_completed", zap.Int64("deleted", total))
+		}
+	}
+	run()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
 }
