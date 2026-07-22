@@ -7,33 +7,23 @@ package branding
 
 import (
 	"net/url"
-	"os"
 	"regexp"
 	"strings"
 )
 
-var (
-	ProductName      = publicAppName()
-	ProductUsername  = strings.ToLower(ProductName)
-	DesktopAppName   = ProductName + " Desktop"
-	AndroidAppName   = ProductName + " Android"
-	IOSAppName       = ProductName + " iOS"
-	MacOSAppName     = ProductName + " macOS"
-	WebAAppName      = ProductName + " Web A"
-	WebKAppName      = ProductName + " Web K"
-	PremiumName      = ProductName + " Premium"
-	StarsName        = ProductName + " Stars"
+const (
+	ProductName      = "Telesrv"
+	ProductUsername  = "telesrv"
+	DesktopAppName   = "Telesrv Desktop"
+	AndroidAppName   = "Telesrv Android"
+	IOSAppName       = "Telesrv iOS"
+	MacOSAppName     = "Telesrv macOS"
+	WebAAppName      = "Telesrv Web A"
+	WebKAppName      = "Telesrv Web K"
+	PremiumName      = "Telesrv Premium"
+	StarsName        = "Telesrv Stars"
 	DefaultPublicURL = "https://telesrv.net"
 )
-
-// publicAppName 从环境变量 TELESRV_PUBLIC_APP_NAME 读取品牌名；
-// 未配置或为空时回退到默认名称 "Telesrv"。
-func publicAppName() string {
-	if name := strings.TrimSpace(os.Getenv("TELESRV_PUBLIC_APP_NAME")); name != "" {
-		return name
-	}
-	return "Telesrv"
-}
 
 // ClientAppName returns the branded display name for a stored client platform.
 // Stored detection tokens remain unchanged; this is only used at presentation
