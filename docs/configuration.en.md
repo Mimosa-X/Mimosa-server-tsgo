@@ -21,7 +21,8 @@ This document describes every setting loaded by `internal/config`. Defaults and 
 | `TELESRV_LISTEN` | string / `0.0.0.0:2398` | MTProto TCP listen address. Must match the address/port reachable by patched clients. |
 | `TELESRV_ADVERTISE_IP` | string / `127.0.0.1` | Client-reachable server IP used by media/call fallbacks. The current static Desktop DC patch does not derive its MTProto endpoint from this value. |
 | `TELESRV_RSA_KEY` | path / `data/server_rsa.pem` | MTProto RSA private key. Generated when missing. Treat the file as a secret and keep it stable across restarts. |
-| `TELESRV_DC` | int / `2` | Server DC ID. Must match patched client expectations and stored media/DC metadata. |
+| `TELESRV_DC` | int / `2` | Canonical server DC ID used in server-originated configuration and media/DC metadata. It does not partition key-exchange state on the current single backend. |
+| `TELESRV_STRICT_DC_CHECK` | bool / `false` | Default `false` accepts every wire int32 DC label for permanent and temporary key exchange. `true` requires permanent `dc_id == TELESRV_DC` and temporary `abs(dc_id) == TELESRV_DC`; it is only a diagnostic and does not provide multi-DC isolation. |
 | `TELESRV_WEBSOCKET_ENABLE` | bool / `true` | Enables MTProto-over-WebSocket demultiplexing on the MTProto listener. |
 | `TELESRV_WEBSOCKET_ALLOWED_ORIGINS` | list / `http://localhost:1234,http://127.0.0.1:1234` | Browser WebSocket origin allow-list. `*` is for temporary debugging only. |
 | `TELESRV_MTPROTO_MAX_CONNECTIONS` | int / `200000` | Global physical connection admission limit. Negative disables this gate. |
@@ -61,11 +62,9 @@ This document describes every setting loaded by `internal/config`. Defaults and 
 | `TELESRV_PUBLIC_BASE_URL` | HTTP(S) URL / `https://telesrv.net` | Client-visible canonical public-link root. Paths are allowed; credentials, query, and fragment are rejected. Local example: `http://127.0.0.1:2401`. |
 | `TELESRV_PUBLIC_APP_SCHEME` | URL scheme / `telesrv` | Automatic app-open scheme on landing pages. Must match patched client registration. `tg`, `http`, and `https` are rejected. |
 | `TELESRV_PUBLIC_APP_LINK_BASE` | nullable custom URL base / empty | Optional host-based root for multi-server clients, for example `owpg://example.com`. When set, links use `owpg://example.com/oauth`, `owpg://example.com/<username>`, and equivalent route paths. Only exact `<custom-scheme>://<host>` values are accepted; ports, paths, queries, and fragments are rejected. `TELESRV_PUBLIC_APP_SCHEME` remains an accepted legacy input. |
-| `TELESRV_PUBLIC_WEB_BASE_URL` | HTTP(S) URL / `https://web.telesrv.net` | Web-client root used by public username pages. Same URL validation as `TELESRV_PUBLIC_BASE_URL`. |
+| `TELESRV_PUBLIC_WEB_BASE_URL` | HTTP(S) URL / `https://weba.telesrv.net` | Web-client root used by public username pages. Same URL validation as `TELESRV_PUBLIC_BASE_URL`. |
 | `TELESRV_PUBLIC_APP_NAME` | string / `telesrv` | Public landing-page product name; trimmed, non-empty, no control characters, maximum 64 Unicode characters. |
-| `TELESRV_SCAM_WARNING` | string / empty | Overrides the profile warning injected into `getFullUser`/`getFullChannel` About for SCAM-flagged peers. Empty keeps the built-in per-peer-type English default. Non-destructive: the stored bio/description is never overwritten and the warning is re-applied from the flag on every read. Clients cannot localize server-provided text. |
-| `TELESRV_FAKE_WARNING` | string / empty | Same as `TELESRV_SCAM_WARNING`, for FAKE-flagged peers. |
-| `TELESRV_PUBLIC_LINK_WEB_ADDR` | nullable address / empty | Read-only username/avatar/sticker/emoji/chatlist/collectible-gift landing-page listener. Empty disables it. Production should bind loopback behind exact nginx routes. `.env.example` enables `127.0.0.1:2401` for development. |
+| `TELESRV_PUBLIC_LINK_WEB_ADDR` | nullable address / empty | Username/avatar/sticker/emoji/chatlist/collectible-gift landing pages plus the hash-only moderation appeal form. Empty disables it. Production should bind loopback behind exact nginx routes. Moderation `freeze_account` actions fail closed when this listener is disabled because telesrv cannot issue a reachable appeal URL. `.env.example` enables `127.0.0.1:2401` for development. |
 | `TELESRV_TELEGRAM_LOGIN_ENABLE` | bool / `false` | Mount the self-hosted Telegram Login/OIDC provider on `TELESRV_PUBLIC_LINK_WEB_ADDR`. Enabling it requires that listener and all key files below. |
 | `TELESRV_TELEGRAM_LOGIN_ISSUER` | absolute origin URL / `TELESRV_PUBLIC_BASE_URL` | Exact public issuer used in discovery and tokens. HTTPS is required by default; paths, credentials, query, and fragment are rejected. The next setting permits any HTTP host/IP. |
 | `TELESRV_TELEGRAM_LOGIN_ALLOW_HTTP` | bool / `false` | When enabled, permits any valid HTTP issuer, BotFather Web origin, redirect URI, and native HTTP callback, without loopback, subnet, or port restrictions. When disabled, those Web URLs still require HTTPS. |
@@ -390,6 +389,7 @@ key rings independently on different instances.
 | `TELESRV_BLOB_DIR` | path / `data/blobs` | Local development blob-backend root for media bytes. |
 | `TELESRV_STICKER_SEED_DIR` | path / `data/sticker-seed` | Sticker/reaction seed packages imported into documents, sticker sets, and blobs. |
 | `TELESRV_STICKER_SEED_MAX_SETS` | int / `300` | Maximum regular sticker sets imported at startup; `<=0` means unlimited. |
+| `TELESRV_PREMIUM_PROMO_SEED_DIR` | path / `data/premium-promo` | Exported `help.getPremiumPromo` manifest, MP4 videos, and JPEG thumbnails. A missing directory keeps the no-video fallback; an existing invalid/incomplete directory fails startup. |
 
 The language-pack file manifest is authoritative. To add a language, place `data/langpack/<pack>/<pack>_<lang>_v<version>.strings` and restart `telesrv`. The `pack` must match its first-level directory and may use the letters, digits, `-`, and `_` already used by Telegram (for example, `android_x`); `lang` is canonicalized to lowercase with hyphens (`pt_BR` becomes `pt-br`). Only the highest file version for each language is loaded. Effective content changes require a version bump; same-version effective mutations and version rollbacks stop startup. Removing a language file or an entire pack subdirectory atomically removes its database catalog and strings on the next restart. Startup streams a source-file SHA-256 first: unchanged files reuse the last atomic manifest without parsing strings or writing the database, while only new or changed files are parsed and replaced through PostgreSQL `COPY`.
 
@@ -510,6 +510,13 @@ The following fallback keys are accepted from the **process environment only**. 
 | `TELESRV_RETENTION_INTERVAL` | duration / `1h` | General retention worker interval. |
 | `TELESRV_RETENTION_BATCH` | int / `10000` | Maximum rows deleted by one general retention batch. |
 
+Moderation report/evidence/case/decision/action/appeal rows are durable audit facts and are not removed by the
+general retention worker. The same worker deletes expired sponsored impressions and appeal links in bounded seek
+batches, and deletes auth-delivery diagnostics and client telemetry after their fixed 30-day privacy retention.
+The raw appeal token is never persisted. Production reverse proxies must expose only `/appeal/<token>` to the
+public-link listener, preserve HTTPS in `TELESRV_PUBLIC_BASE_URL`, cap request bodies, and must not log the tokenized
+path. `TELESRV_PUBLIC_BASE_URL` must resolve to that proxy for moderation freeze actions.
+
 ## 10. Premium and Stars development grants
 
 | Setting | Type / code default | Description and constraints |
@@ -539,6 +546,7 @@ The following fallback keys are accepted from the **process environment only**. 
 | `TELESRV_CALL_RING_TIMEOUT` | duration / `90s` | Server fallback timeout for ringing/accepted private calls; should remain aligned with the client `callRingTimeoutMs`. |
 | `TELESRV_CALL_TOMBSTONE_TTL` | duration / `60s` | Terminal-call tombstone window for idempotency and late RPC absorption. |
 | `TELESRV_CALL_MAX_ACTIVE_PER_USER` | int / `4` | Maximum non-terminal private calls per user. Non-positive values are normalized by the phone service. |
+| `TELESRV_CALL_REGISTRY_MAX_ENTRIES` | int / `10000` | Process-wide private-call registry hard limit. At capacity, new calls fail with `CALL_OCCUPY_FAILED`; established calls are never evicted by age. |
 | `TELESRV_CALL_SIGNALING_MAX_BYTES` | int bytes / `65536` | Maximum payload for one `phone.sendSignalingData`. |
 | `TELESRV_CALL_SIGNALING_RATE` | int / `50` | Signaling forwards per call per second; excess is silently dropped. |
 | `TELESRV_CALL_EXPIRY_INTERVAL` | duration / `1s` | Call-expiry dispatcher polling interval. |

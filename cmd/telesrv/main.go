@@ -27,9 +27,11 @@ import (
 	"telesrv/internal/app/account"
 	aiapp "telesrv/internal/app/ai"
 	"telesrv/internal/app/auth"
+	authdiagnosticsapp "telesrv/internal/app/authdiagnostics"
 	botsapp "telesrv/internal/app/bots"
 	channelapp "telesrv/internal/app/channels"
 	chatlistsapp "telesrv/internal/app/chatlists"
+	clienttelemetryapp "telesrv/internal/app/clienttelemetry"
 	communitiesapp "telesrv/internal/app/communities"
 	"telesrv/internal/app/contacts"
 	"telesrv/internal/app/dialogs"
@@ -41,6 +43,7 @@ import (
 	"telesrv/internal/app/livestream"
 	"telesrv/internal/app/maintenance"
 	messageapp "telesrv/internal/app/messages"
+	moderationapp "telesrv/internal/app/moderation"
 	passkeyapp "telesrv/internal/app/passkey"
 	phoneapp "telesrv/internal/app/phone"
 	pollsapp "telesrv/internal/app/polls"
@@ -417,6 +420,9 @@ func run(logger *zap.Logger) error {
 	botCallbackStore := redisstore.NewBotCallbackRegistryStore(rdb)
 	ephemeralStore := redisstore.NewEphemeralMessageStore(rdb)
 	ephemeralReportStore := postgres.NewEphemeralReportStore(pool)
+	moderationReportStore := postgres.NewModerationReportStore(pool)
+	authDeliveryReportStore := postgres.NewAuthDeliveryReportStore(pool)
+	clientTelemetryStore := postgres.NewClientTelemetryStore(pool)
 	boxIDAllocator := redisstore.NewBoxIDAllocator(rdb, postgres.NewMessageBoxCounterSource(pool))
 	channelIDAllocator := redisstore.NewChannelIDAllocator(rdb, postgres.NewChannelIDCounterSource(pool))
 	channelMessageIDAllocator := redisstore.NewChannelMessageIDAllocator(rdb, postgres.NewChannelMessageIDCounterSource(pool))
@@ -488,6 +494,15 @@ func run(logger *zap.Logger) error {
 			zap.Int("blobs", stats.Blobs),
 		)
 	}
+	if stats, err := filesService.SeedPremiumPromo(ctx, cfg.PremiumPromoSeedDir); err != nil {
+		return fmt.Errorf("seed premium promo: %w", err)
+	} else if !stats.Skipped {
+		logger.Info("Premium promo 视频种子导入完成",
+			zap.String("dir", cfg.PremiumPromoSeedDir),
+			zap.Int("videos", stats.Videos),
+			zap.Int("blobs", stats.Blobs),
+		)
+	}
 	if stats, err := filesService.SeedAppearance(ctx); err != nil {
 		return fmt.Errorf("seed appearance: %w", err)
 	} else if !stats.Skipped {
@@ -521,6 +536,8 @@ func run(logger *zap.Logger) error {
 	tempAuthKeyStore := postgres.NewTempAuthKeyBindingStore(pool)
 	inlineRegistryStore := redisstore.NewInlineRegistryStore(rdb)
 	codeStore := redisstore.NewCodeStore(rdb)
+	authDeliveryReportService := authdiagnosticsapp.NewService(codeStore, authDeliveryReportStore)
+	clientTelemetryService := clienttelemetryapp.NewService(clientTelemetryStore)
 	rateLimiter := redisstore.NewRateLimiter(rdb)
 	activeSessions := mtprotoedge.NewSessionManager(logger.Named("mtprotoedge").Named("sessions"))
 	adminService := adminapp.NewService(adminapp.Dependencies{
@@ -536,6 +553,9 @@ func run(logger *zap.Logger) error {
 		WithBotAPIUpdateRetention(botAPIUpdateStore, cfg.BotAPIUpdateRetention).
 		WithAuthKeySessionLayerRetention(authKeyStore).
 		WithLoginCodeDeliveryRetention(messageStore).
+		WithClientTelemetryRetention(clientTelemetryStore, 30*24*time.Hour).
+		WithAuthDeliveryReportRetention(authDeliveryReportStore, 30*24*time.Hour).
+		WithModerationRetention(moderationReportStore).
 		WithUserUpdateRetention(updateEventStore).
 		WithChannelUpdateRetention(channelStore).
 		WithOrphanAuthKeyRetention(authKeyStore, activeSessions, cfg.OrphanAuthKeyRetention).
@@ -573,6 +593,7 @@ func run(logger *zap.Logger) error {
 	// userCache 与 users 服务共享同一实例：bot 元数据写入（version bump）后必须
 	// 失效缓存，否则 TTL 内 getUsers 回旧 first_name/旧 bot_info_version。
 	userCache := redisstore.NewUserCache(rdb, redisstore.DefaultUserCacheTTL)
+	accountLifecycleStore := postgres.NewAccountLifecycleStore(pool)
 	accountOptions := []account.ServiceOption{
 		account.WithReactionSettings(passwordStore),
 		account.WithAccountSettings(passwordStore),
@@ -583,7 +604,7 @@ func run(logger *zap.Logger) error {
 		account.WithBusinessAutomation(passwordStore),
 		account.WithUsers(userStore),
 		account.WithPhoneChange(phoneChangeStore, authzStore, codeStore, userCache, cfg.DevAuthCode, cfg.AuthCodeTTL, cfg.AuthCodeMaxAttempts),
-		account.WithAccountLifecycle(postgres.NewAccountLifecycleStore(pool)),
+		account.WithAccountLifecycle(accountLifecycleStore),
 		account.WithPublicBaseURL(cfg.PublicBaseURL),
 	}
 	var webhookSender otpdelivery.Sender
@@ -715,6 +736,7 @@ func run(logger *zap.Logger) error {
 		RingTimeout:            cfg.CallRingTimeout,
 		TombstoneTTL:           cfg.CallTombstoneTTL,
 		MaxActivePerUser:       cfg.CallMaxActivePerUser,
+		MaxRegistryEntries:     cfg.CallRegistryMaxEntries,
 		SignalingRatePerSecond: cfg.CallSignalingRate,
 	})
 	// 私聊端对端加密（Secret Chat）握手状态机 + qts 投递队列（盲中继）。
@@ -753,6 +775,7 @@ func run(logger *zap.Logger) error {
 	// 自定义云主题(Create a New Theme):主题目录与每用户已安装列表均持久化到 postgres。
 	themeService := themesapp.NewService(postgres.NewThemeStore(pool))
 	usersService := users.NewService(userStore, users.WithBaseUserCache(userCache), users.WithContactStore(contactStore), users.WithPhotoProvider(cachedPhotos), users.WithPrivacyEvaluator(privacyService), users.WithAccountFreezeProvider(adminService))
+	privacyService.ConfigureReadModels(usersService, channelStore)
 	aiComposeService := aiapp.NewService(aiComposeStore, newAIComposeOptions(cfg, rateLimiter, usersService.PremiumActive, logger)...)
 	botsService.SetAIChatGenerator(aiComposeService)
 	dialogsService := dialogs.NewService(dialogStore, channelStore).Configure(
@@ -773,6 +796,7 @@ func run(logger *zap.Logger) error {
 	)
 	communitiesService := communitiesapp.NewService(communityStore)
 	ephemeralService := ephemeralapp.NewService(ephemeralStore, channelsService, usersService, botsService)
+	storiesService := storiesapp.NewService(storyStore, storiesapp.WithChannelStoryAccess(channelsService))
 	chatlistsService := chatlistsapp.NewService(
 		chatlistStore,
 		dialogStore,
@@ -790,6 +814,21 @@ func run(logger *zap.Logger) error {
 		messageapp.WithSendPermissionChecker(adminService),
 		messageapp.WithBusinessAutomation(passwordStore, businessAutomationOptions...),
 	)
+	moderationService := moderationapp.NewService(
+		moderationReportStore,
+		moderationapp.WithMessageReaders(messagesService, channelsService),
+		moderationapp.WithStoryReader(storiesService),
+		moderationapp.WithPeerReaders(usersService, channelsService),
+		moderationapp.WithProfilePhotoReader(filesService),
+	)
+	legacyReportsMigrated, err := moderationService.MigrateLegacyEphemeralReports(ctx, ephemeralReportStore, 500)
+	if err != nil {
+		return fmt.Errorf("migrate legacy ephemeral reports: %w", err)
+	}
+	if legacyReportsMigrated > 0 {
+		logger.Info("旧 ephemeral 举报已迁移到统一审核管线",
+			zap.Int("reports", legacyReportsMigrated))
+	}
 	translationService := translationapp.NewService(
 		messagesService,
 		channelsService,
@@ -820,7 +859,6 @@ func run(logger *zap.Logger) error {
 			Sender:       loginEmailSender,
 		}))
 	updatesService := updates.NewService(updateStateStore, updateEventStore, updates.WithLogger(logger.Named("app").Named("updates")))
-	rpc.SetModerationWarnings(cfg.ScamWarning, cfg.FakeWarning)
 	router := rpc.New(rpc.Config{
 		DC:                       cfg.DC,
 		IP:                       cfg.AdvertiseIP,
@@ -847,6 +885,8 @@ func run(logger *zap.Logger) error {
 		TempKeyResolveCacheMaxEntries: cfg.TempKeyResolveCacheMaxEntries,
 	}, rpc.Deps{
 		Auth:                 authService,
+		AuthDeliveryReports:  authDeliveryReportService,
+		ClientTelemetry:      clientTelemetryService,
 		AuthKeySessionLayers: authKeyStore,
 		Account:              accountService,
 		Privacy:              privacyService,
@@ -855,7 +895,7 @@ func run(logger *zap.Logger) error {
 		AICompose:            aiComposeService,
 		Ephemeral:            ephemeralService,
 		EphemeralPush:        ephemeralStore,
-		EphemeralReports:     ephemeralReportStore,
+		Moderation:           moderationService,
 		Users:                usersService,
 		TelegramLogin:        telegramLoginRPCDependency(telegramLoginService),
 		Updates:              updatesService,
@@ -870,9 +910,10 @@ func run(logger *zap.Logger) error {
 		Channels:             channelsService,
 		Communities:          communitiesService,
 		Files:                filesService,
+		PremiumPromo:         filesService,
 		Bots:                 botsService,
 		Polls:                pollsapp.NewService(pollStore),
-		Stories:              storiesapp.NewService(storyStore, storiesapp.WithChannelStoryAccess(channelsService)),
+		Stories:              storiesService,
 		Phone:                phoneService,
 		SecretChats:          secretChatService,
 		Stars:                starsService,
@@ -896,7 +937,7 @@ func run(logger *zap.Logger) error {
 		ChannelBoosts:      channelBoostCache,
 		Contacts:           postgres.ContactReadModelCaches{contactStore, contactsService},
 		Dialogs:            dialogsService,
-		Privacy:            privacyStore,
+		Privacy:            privacyService,
 		ProfilePhotos:      cachedPhotos,
 		Stories:            router,
 		ChannelFullBots:    router,
@@ -907,25 +948,44 @@ func run(logger *zap.Logger) error {
 		BaseUsers:          userCache,
 		BotProfiles:        botsService,
 		StarGifts:          giftsService,
+		AccountSettings:    router,
 	}, logger.Named("store").Named("read-model-listener"))
 	go readModelListener.Run(ctx)
 	activeSessions.SetLifecycleObserver(router)
 	adminService.Configure(adminapp.Dependencies{
-		Auth:            authService,
-		Revoker:         router,
-		Users:           usersService,
-		Stars:           starsService,
-		StarsNotifier:   router,
-		UserNotifier:    router,
-		FreezeNotifier:  router,
-		Channels:        channelsService,
-		ChannelNotifier: router,
-		Messages:        messagesService,
-		Gifts:           giftsService,
-		GiftGranter:     router,
-		Bots:            botsService,
-		Emoji:           filesService,
+		Auth:                   authService,
+		Revoker:                router,
+		Users:                  usersService,
+		Stars:                  starsService,
+		StarsNotifier:          router,
+		UserNotifier:           router,
+		UserModerationNotifier: router,
+		FreezeNotifier:         router,
+		Channels:               channelsService,
+		ChannelNotifier:        router,
+		Messages:               messagesService,
+		Gifts:                  giftsService,
+		GiftGranter:            router,
+		Bots:                   botsService,
+		Emoji:                  filesService,
+		Moderation:             moderationService,
 	})
+	moderationActionOptions := []moderationapp.ActionExecutorOption{}
+	if cfg.PublicLinkWebAddr != "" {
+		moderationActionOptions = append(
+			moderationActionOptions,
+			moderationapp.WithAppealLinks(moderationService, cfg.PublicBaseURL),
+		)
+	}
+	moderationActionExecutor := moderationapp.NewActionExecutor(
+		adminService, channelsService, router, accountLifecycleStore,
+		moderationActionOptions...,
+	)
+	go moderationapp.NewActionWorker(
+		moderationReportStore,
+		moderationActionExecutor,
+		logger.Named("moderation").Named("actions"),
+	).Run(ctx)
 	// bot session 撤销、在线通知与 @ChatBot 流式草稿推送经 router 实现（需 tg.* 边界），
 	// router 创建后注入。
 	botsService.SetRouterHooks(router)
@@ -989,20 +1049,21 @@ func run(logger *zap.Logger) error {
 		return fmt.Errorf("start admin api: %w", err)
 	}
 	if _, err := web.Start(ctx, web.Config{
-		Addr:            cfg.PublicLinkWebAddr,
-		PublicBaseURL:   cfg.PublicBaseURL,
-		AppScheme:       cfg.PublicAppScheme,
-		AppLinkBase:     cfg.PublicAppLinkBase,
-		WebBaseURL:      cfg.PublicWebBaseURL,
-		AppName:         cfg.PublicAppName,
-		StickerSets:     filesService,
-		Users:           userStore,
-		Channels:        channelStore,
-		Privacy:         privacyService,
-		Photos:          filesService,
-		UniqueGifts:     giftsService,
-		GiftWithdrawals: giftsService,
-		TelegramLogin:   telegramLoginHTTPHandler,
+		Addr:              cfg.PublicLinkWebAddr,
+		PublicBaseURL:     cfg.PublicBaseURL,
+		AppScheme:         cfg.PublicAppScheme,
+		AppLinkBase:       cfg.PublicAppLinkBase,
+		WebBaseURL:        cfg.PublicWebBaseURL,
+		AppName:           cfg.PublicAppName,
+		StickerSets:       filesService,
+		Users:             userStore,
+		Channels:          channelStore,
+		Privacy:           privacyService,
+		Photos:            filesService,
+		UniqueGifts:       giftsService,
+		GiftWithdrawals:   giftsService,
+		ModerationAppeals: moderationService,
+		TelegramLogin:     telegramLoginHTTPHandler,
 	}, logger.Named("public-web")); err != nil {
 		return fmt.Errorf("start public Web: %w", err)
 	}
@@ -1010,6 +1071,7 @@ func run(logger *zap.Logger) error {
 	srv := mtprotoedge.New(mtprotoedge.Options{
 		Logger:                          logger.Named("mtprotoedge"),
 		DC:                              cfg.DC,
+		StrictDC:                        cfg.StrictDCCheck,
 		RSAKey:                          rsaKey,
 		LayerRPC:                        router,
 		AuthKeys:                        authKeyStore,

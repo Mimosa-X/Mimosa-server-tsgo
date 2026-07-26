@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
+
 	"telesrv/internal/domain"
 )
 
@@ -292,16 +295,52 @@ func (s *ChannelStore) SetChannelScamFake(ctx context.Context, channelID int64, 
 	if scam && fake {
 		return domain.Channel{}, domain.ErrPeerModerationFlagsInvalid
 	}
-	channel, err := s.channelByID(ctx, s.db, channelID)
+	beginner, ok := s.db.(txBeginner)
+	if !ok {
+		return domain.Channel{}, fmt.Errorf("set channel scam/fake: db does not support transactions")
+	}
+	tx, err := beginner.Begin(ctx)
+	if err != nil {
+		return domain.Channel{}, fmt.Errorf("begin set channel scam/fake: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	var currentScam, currentFake bool
+	if err := tx.QueryRow(ctx, `
+SELECT scam, fake
+FROM channels
+WHERE id = $1 AND NOT deleted
+FOR UPDATE`, channelID).Scan(&currentScam, &currentFake); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Channel{}, domain.ErrChannelInvalid
+		}
+		return domain.Channel{}, fmt.Errorf("lock channel scam/fake: %w", err)
+	}
+	channel, err := s.channelByID(ctx, tx, channelID)
 	if err != nil {
 		return domain.Channel{}, err
 	}
 	if channel.Scam == scam && channel.Fake == fake {
+		if err := tx.Commit(ctx); err != nil {
+			return domain.Channel{}, fmt.Errorf("commit unchanged channel scam/fake: %w", err)
+		}
+		committed = true
 		return channel, nil
 	}
-	if _, err := s.db.Exec(ctx, `UPDATE channels SET scam = $2, fake = $3, updated_at = now() WHERE id = $1 AND NOT deleted`, channelID, scam, fake); err != nil {
+	if currentScam != channel.Scam || currentFake != channel.Fake {
+		return domain.Channel{}, fmt.Errorf("channel scam/fake snapshot changed while locked")
+	}
+	if _, err := tx.Exec(ctx, `UPDATE channels SET scam = $2, fake = $3, updated_at = now() WHERE id = $1 AND NOT deleted`, channelID, scam, fake); err != nil {
 		return domain.Channel{}, fmt.Errorf("set channel scam/fake: %w", err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Channel{}, fmt.Errorf("commit channel scam/fake: %w", err)
+	}
+	committed = true
 	if s.rowCache != nil {
 		s.rowCache.delete(channelID)
 	}

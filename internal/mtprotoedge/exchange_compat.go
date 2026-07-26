@@ -25,11 +25,12 @@ import (
 
 // runServerExchange is a gotd server exchange compatibility shim.
 //
-// DrKLO Android marks media temporary auth-key exchange with a negative DC in
-// p_q_inner_data_temp_dc (for example DC 2 -> -2). gotd v0.158.0 validates this
-// field by exact equality and rejects that legitimate media-temp path. Keep the
-// permanent-key check strict, but allow temp-key DC values whose absolute value
-// matches this server DC.
+// In the default single-backend mode, p_q_inner_data_dc and
+// p_q_inner_data_temp_dc carry client routing labels only: every int32 value is
+// admitted and the label is not persisted or used for key/session identity.
+// This also covers DrKLO Android's negative media-temp labels. StrictDC retains
+// exact permanent / absolute-value temporary validation as an explicit,
+// default-off diagnostic for a future real multi-DC deployment.
 func (s *Server) runServerExchange(ctx context.Context, conn transport.Conn) (exchange.ServerExchangeResult, error) {
 	ex := serverExchangeCompat{
 		conn:      conn,
@@ -38,6 +39,7 @@ func (s *Server) runServerExchange(ctx context.Context, conn transport.Conn) (ex
 		timeout:   exchange.DefaultTimeout,
 		key:       s.key,
 		dc:        s.dc,
+		strictDC:  s.strictDC,
 		log:       s.log.Named("exchange"),
 		rng:       compatServerRNG{rand: s.rand},
 		commitKey: s.commitExchangeAuthKey,
@@ -65,6 +67,7 @@ type serverExchangeCompat struct {
 	timeout   time.Duration
 	key       exchange.PrivateKey
 	dc        int
+	strictDC  bool
 	log       *zap.Logger
 	rng       compatServerRNG
 	commitKey func(context.Context, exchange.ServerExchangeResult, int) error
@@ -345,14 +348,20 @@ func (s serverExchangeCompat) validatePQInnerDataDC(d mt.PQInnerDataClass) error
 	switch innerDataDC := d.(type) {
 	case *mt.PQInnerDataDC:
 		if innerDataDC.DC != s.dc {
+			if !s.strictDC {
+				s.log.Debug("Accepted permanent auth key DC alias",
+					zap.Int("server_dc", s.dc),
+					zap.Int("client_dc", innerDataDC.DC))
+				return nil
+			}
 			return wrongDCError(s.dc, innerDataDC.DC)
 		}
 	case *mt.PQInnerDataTempDC:
-		if !sameDCByAbs(innerDataDC.DC, s.dc) {
+		if !sameDCByAbs(innerDataDC.DC, s.dc) && s.strictDC {
 			return wrongDCError(s.dc, innerDataDC.DC)
 		}
-		if innerDataDC.DC < 0 {
-			s.log.Warn("Accepted Android media temp auth key negative DC",
+		if !sameDCByAbs(innerDataDC.DC, s.dc) {
+			s.log.Debug("Accepted temporary auth key DC alias",
 				zap.Int("server_dc", s.dc),
 				zap.Int("client_dc", innerDataDC.DC),
 				zap.Int("expires_in", innerDataDC.ExpiresIn))

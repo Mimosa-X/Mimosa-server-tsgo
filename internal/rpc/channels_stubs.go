@@ -18,6 +18,12 @@ func validateEmptyChannelStickerSet(stickerset tg.InputStickerSetClass) error {
 }
 
 func (r *Router) onChannelsReportSpam(ctx context.Context, req *tg.ChannelsReportSpamRequest) (bool, error) {
+	if req == nil {
+		return false, inputRequestInvalidErr()
+	}
+	if len(req.ID) == 0 {
+		return false, tgerr.New(400, "MESSAGE_ID_REQUIRED")
+	}
 	if len(req.ID) > maxChannelReportMessageIDs {
 		return false, limitInvalidErr()
 	}
@@ -26,11 +32,29 @@ func (r *Router) onChannelsReportSpam(ctx context.Context, req *tg.ChannelsRepor
 			return false, messageIDInvalidErr()
 		}
 	}
-	if _, _, err := r.channelView(ctx, req.Channel); err != nil {
+	userID, view, err := r.channelChangeInfoView(ctx, req.Channel)
+	if err != nil {
 		return false, err
 	}
-	if peer, ok := r.domainPeerFromInputPeer(0, req.Participant); !ok || peer.Type != domain.PeerTypeUser || peer.ID == 0 {
+	if !view.Channel.Megagroup {
+		return false, channelInvalidErr(domain.ErrChannelInvalid)
+	}
+	peer, err := r.checkedDomainPeerFromInputPeer(ctx, userID, req.Participant)
+	if err != nil {
+		return false, err
+	}
+	if peer.Type != domain.PeerTypeUser || peer.ID == 0 {
 		return false, peerIDInvalidErr()
+	}
+	if r.deps.Moderation == nil {
+		return false, internalErr()
+	}
+	if _, _, err := r.deps.Moderation.ReportChannelSpam(ctx, domain.ModerationChannelSpamReportRequest{
+		ReporterUserID: userID, ChannelID: view.Channel.ID,
+		ParticipantUserID: peer.ID, MessageIDs: req.ID,
+		CreatedAt: r.clock.Now(),
+	}); err != nil {
+		return false, moderationReportError(err)
 	}
 	return true, nil
 }
@@ -177,7 +201,7 @@ func (r *Router) onMessagesUnpinAllMessages(ctx context.Context, req *tg.Message
 		return nil, channelAdminErr(err)
 	}
 	r.invalidateRPCProjectionForChannel(res.Channel.ID)
-	r.enqueueChannelFanout(ctx, channelFanoutMembers, userID, res.Channel.ID, res.Event.Pts, res.Recipients, func(_ context.Context, viewerUserID int64) *tg.Updates {
+	r.enqueueChannelFanout(ctx, channelFanoutMessageBox, userID, res.Channel.ID, res.Event.Pts, res.Recipients, func(_ context.Context, viewerUserID int64) *tg.Updates {
 		return r.channelPinnedUpdates(viewerUserID, res)
 	})
 	return &tg.MessagesAffectedHistory{
@@ -346,23 +370,41 @@ func (r *Router) channelFanoutRecipients(ctx context.Context, scope channelFanou
 		online = provider.OnlineChannelMemberUserIDs(channelID, domain.MaxChannelRealtimeFanout)
 	case channelFanoutViewers:
 		online = provider.OnlineChannelUserIDs(channelID, domain.MaxChannelRealtimeFanout)
+	case channelFanoutMessageBox:
+		online = provider.OnlineChannelMemberUserIDs(channelID, domain.MaxChannelRealtimeFanout)
+		if subscriptions, ok := r.deps.Sessions.(ChannelSubscriptionProvider); ok {
+			online = append(online, subscriptions.OnlineChannelSubscriberUserIDs(channelID, domain.MaxChannelRealtimeFanout)...)
+		}
 	}
 	if len(online) == 0 {
 		return uniqueRecipientIDs(explicit)
 	}
-	active, err := r.deps.Channels.FilterActiveMemberIDs(ctx, channelID, online)
+	var (
+		authorized []int64
+		err        error
+	)
+	if scope == channelFanoutMembers {
+		authorized, err = r.deps.Channels.FilterActiveMemberIDs(ctx, channelID, online)
+	} else if audience, ok := r.deps.Channels.(ChannelMessageAudienceService); ok {
+		authorized, err = audience.FilterMessageAudienceIDs(ctx, channelID, online)
+	} else {
+		// Test/minimal adapters without public-preview authorization retain the
+		// former member-only behavior; production channels.Service implements
+		// ChannelMessageAudienceService.
+		authorized, err = r.deps.Channels.FilterActiveMemberIDs(ctx, channelID, online)
+	}
 	if err != nil {
 		return uniqueRecipientIDs(explicit)
 	}
-	if len(active) == 0 && len(explicit) == 0 {
+	if len(authorized) == 0 && len(explicit) == 0 {
 		return nil
 	}
-	if len(active) > domain.MaxChannelRealtimeFanout {
-		active = active[:domain.MaxChannelRealtimeFanout]
+	if len(authorized) > domain.MaxChannelRealtimeFanout {
+		authorized = authorized[:domain.MaxChannelRealtimeFanout]
 	}
-	out := uniqueRecipientIDs(active)
+	out := uniqueRecipientIDs(authorized)
 	seen := make(map[int64]struct{}, len(out)+len(explicit))
-	for _, userID := range active {
+	for _, userID := range authorized {
 		if userID == 0 {
 			continue
 		}

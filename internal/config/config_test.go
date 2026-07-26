@@ -28,11 +28,30 @@ func TestLoadDefaultsAdvertiseIPToLoopback(t *testing.T) {
 	if cfg.PublicAppLinkBase != "" {
 		t.Fatalf("PublicAppLinkBase = %q, want disabled", cfg.PublicAppLinkBase)
 	}
-	if cfg.PublicWebBaseURL != "https://web.telesrv.net" {
-		t.Fatalf("PublicWebBaseURL = %q, want https://web.telesrv.net", cfg.PublicWebBaseURL)
+	if cfg.PublicWebBaseURL != "https://weba.telesrv.net" {
+		t.Fatalf("PublicWebBaseURL = %q, want https://weba.telesrv.net", cfg.PublicWebBaseURL)
 	}
 	if cfg.PublicAppName != "telesrv" {
 		t.Fatalf("PublicAppName = %q, want telesrv", cfg.PublicAppName)
+	}
+	if cfg.CallRegistryMaxEntries != 10_000 {
+		t.Fatalf("CallRegistryMaxEntries = %d, want 10000", cfg.CallRegistryMaxEntries)
+	}
+	if cfg.PremiumPromoSeedDir != "data/premium-promo" {
+		t.Fatalf("PremiumPromoSeedDir = %q, want data/premium-promo", cfg.PremiumPromoSeedDir)
+	}
+}
+
+func TestLoadPremiumPromoSeedDirOverride(t *testing.T) {
+	disableDefaultConfigFile(t)
+	t.Setenv("TELESRV_PREMIUM_PROMO_SEED_DIR", `D:\seed\premium-promo`)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.PremiumPromoSeedDir != `D:\seed\premium-promo` {
+		t.Fatalf("PremiumPromoSeedDir = %q", cfg.PremiumPromoSeedDir)
 	}
 }
 
@@ -47,6 +66,34 @@ func TestLoadUsesExplicitAdvertiseIP(t *testing.T) {
 	if cfg.AdvertiseIP != "203.0.113.10" {
 		t.Fatalf("AdvertiseIP = %q, want explicit env", cfg.AdvertiseIP)
 	}
+}
+
+func TestLoadStrictDCCheck(t *testing.T) {
+	t.Run("defaults off", func(t *testing.T) {
+		disableDefaultConfigFile(t)
+		t.Setenv("TELESRV_STRICT_DC_CHECK", "")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.StrictDCCheck {
+			t.Fatal("StrictDCCheck = true, want default false")
+		}
+	})
+
+	t.Run("explicitly enabled", func(t *testing.T) {
+		disableDefaultConfigFile(t)
+		t.Setenv("TELESRV_STRICT_DC_CHECK", "true")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.StrictDCCheck {
+			t.Fatal("StrictDCCheck = false, want true")
+		}
+	})
 }
 
 func TestLoadMTProtoAdmissionAndRPCBudgets(t *testing.T) {

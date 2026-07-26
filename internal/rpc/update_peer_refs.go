@@ -3,6 +3,8 @@ package rpc
 import (
 	"context"
 
+	"go.uber.org/zap"
+
 	"telesrv/internal/domain"
 )
 
@@ -25,8 +27,23 @@ func (r *Router) enrichUpdateEventsWithPeerCache(ctx context.Context, viewerUser
 	allUserIDs := make(map[int64]struct{})
 	allChannelIDs := make(map[int64]struct{})
 	for i := range out {
-		if out[i].Type == domain.UpdateEventMessageReactions {
-			out[i] = r.enrichMessageReactionEvent(ctx, viewerUserID, out[i])
+		if out[i].Type == domain.UpdateEventChannelState {
+			if service, ok := r.deps.Channels.(ChannelAuthoritativeProjectionService); ok {
+				views, err := service.GetChannelsAuthoritative(ctx, viewerUserID, []int64{out[i].Peer.ID})
+				if err != nil {
+					r.log.Warn("reload authoritative channel state event",
+						zap.Int64("viewer_user_id", viewerUserID),
+						zap.Int64("channel_id", out[i].Peer.ID),
+						zap.Error(err))
+				} else {
+					out[i].Channels = out[i].Channels[:0]
+					for _, view := range views {
+						if view.Channel.ID != 0 {
+							out[i].Channels = append(out[i].Channels, view.Channel)
+						}
+					}
+				}
+			}
 		}
 		if out[i].Type == domain.UpdateEventMessagePoll {
 			out[i] = r.enrichMessagePollEvent(ctx, viewerUserID, out[i])
@@ -93,36 +110,6 @@ func collectEphemeralMessagePeerRefs(message domain.EphemeralMessage, userIDs, c
 type updateEventPeerRefs struct {
 	userIDs    map[int64]struct{}
 	channelIDs map[int64]struct{}
-}
-
-func (r *Router) enrichMessageReactionEvent(ctx context.Context, viewerUserID int64, event domain.UpdateEvent) domain.UpdateEvent {
-	if r.deps.Messages == nil || event.Message.ID <= 0 {
-		return event
-	}
-	peer := event.Message.Peer
-	if peer.Type == "" || peer.ID == 0 {
-		peer = event.Peer
-	}
-	if peer.Type != domain.PeerTypeUser || peer.ID == 0 {
-		return event
-	}
-	res, err := r.deps.Messages.GetMessageReactions(ctx, viewerUserID, domain.PrivateMessageReactionsRequest{
-		OwnerUserID: viewerUserID,
-		Peer:        peer,
-		IDs:         []int{event.Message.ID},
-	})
-	if err != nil {
-		return event
-	}
-	for _, msg := range res.Messages {
-		if msg.OwnerUserID == viewerUserID && msg.ID == event.Message.ID {
-			msg.Pts = event.Pts
-			event.Message = msg
-			event.Peer = msg.Peer
-			return event
-		}
-	}
-	return event
 }
 
 // enrichMessagePollEvent 在 difference 重放时按 viewer 重载消息（media 含最新 poll 权威态与

@@ -508,6 +508,21 @@ type ChannelMember struct {
 	Guest bool
 }
 
+// CanInviteUsers reports whether this active member may directly add users.
+// Keep this predicate aligned with both memory/postgres write boundaries so an
+// RPC cannot expose another user's privacy decision before authorizing the
+// actor.
+func (m ChannelMember) CanInviteUsers(channel Channel) bool {
+	if m.Status != ChannelMemberActive {
+		return false
+	}
+	if m.Role == ChannelRoleCreator ||
+		(m.Role == ChannelRoleAdmin && (m.AdminRights.InviteUsers || m.AdminRights.ChangeInfo)) {
+		return true
+	}
+	return channel.Megagroup && !channel.DefaultBannedRights.InviteUsers && !m.BannedRights.InviteUsers
+}
+
 // CanManageDirectMessages reports whether this active parent-channel member may
 // see and address every subscriber topic in the linked direct-messages
 // monoforum.  Telegram deliberately does not grant this capability to an
@@ -787,8 +802,11 @@ type ChannelMessagePeerReaction struct {
 // ChannelMessageReactions is the read model carried by channel messages and reaction updates.
 type ChannelMessageReactions struct {
 	CanSeeList bool
-	Results    []ChannelMessageReactionCount
-	Recent     []ChannelMessagePeerReaction
+	// AsTags marks reactions on Saved Messages as private message tags.
+	// It is never set for ordinary private/channel reactions.
+	AsTags  bool
+	Results []ChannelMessageReactionCount
+	Recent  []ChannelMessagePeerReaction
 	// Paid 是付费 reaction（Stars）聚合（nil = 无）；读路径从 channel_message_paid_reactions
 	// 填充、tg 转换注入 ReactionPaid 计数 + top reactors。与普通 reaction 分表存储。
 	Paid *ChannelMessagePaidReactions
@@ -869,6 +887,22 @@ type ChannelMessageReactionsList struct {
 	NextOffset string
 }
 
+// ChannelMessageReactionLookupRequest is the bounded exact lookup used by
+// moderation evidence capture. It avoids paging an arbitrarily large reactor
+// list merely to prove that one named participant reacted.
+type ChannelMessageReactionLookupRequest struct {
+	ViewerUserID  int64
+	ChannelID     int64
+	MessageID     int
+	ReactorUserID int64
+}
+
+type ChannelMessageReactionLookup struct {
+	Channel   Channel
+	Message   ChannelMessage
+	Reactions []ChannelMessagePeerReaction
+}
+
 // RecentMessageReaction is one account-level recently used message reaction.
 type RecentMessageReaction struct {
 	UserID   int64
@@ -890,6 +924,14 @@ type SavedReactionTag struct {
 	Reaction MessageReaction
 	Title    string
 	Count    int
+}
+
+// SavedReactionTagsRequest lists account-level Saved Messages tags. SavedPeer
+// is zero for the global list and non-zero for one Saved Messages sub-dialog.
+type SavedReactionTagsRequest struct {
+	UserID    int64
+	SavedPeer Peer
+	Limit     int
 }
 
 // ChannelDiscussionRef links a broadcast post to its discussion megagroup root message.

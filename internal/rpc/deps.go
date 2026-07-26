@@ -47,6 +47,14 @@ type AuthService interface {
 	ResetAuthorizations(ctx context.Context, userID int64, keepAuthKeyID [8]byte) ([]domain.Authorization, error)
 }
 
+type AuthDeliveryReportService interface {
+	ReportMissingCode(ctx context.Context, req domain.AuthMissingCodeReportRequest) (domain.AuthDeliveryReport, bool, error)
+}
+
+type ClientTelemetryService interface {
+	Record(ctx context.Context, userID int64, kind domain.ClientTelemetryKind, peer domain.Peer, subjectIDs []int64, payload any, createdAt time.Time) (domain.ClientTelemetryEvent, bool, error)
+}
+
 // SessionBinder 抽象登录后 session 与 user 的在线绑定。
 //
 // MTProto session 的完整身份是 raw auth_key_id + session_id。所有定位单个 session
@@ -204,6 +212,16 @@ type OnlineUserProvider interface {
 	AddUserChannelMembership(userID, channelID int64)
 	RemoveUserChannelMembership(userID, channelID int64)
 	OnlineChannelMemberUserIDs(channelID int64, limit int) []int64
+}
+
+// ChannelSubscriptionProvider is the bounded process-local implementation of
+// Telegram's public-channel short-poll subscription. A successful
+// updates.getChannelDifference refresh from one session enables passive channel
+// updates for the whole user account until the subscription expires.
+type ChannelSubscriptionProvider interface {
+	RefreshChannelSubscription(rawAuthKeyID [8]byte, sessionID, userID, channelID int64, ttl time.Duration)
+	OnlineChannelSubscriberUserIDs(channelID int64, limit int) []int64
+	OnlineChannelSubscriberUserIDsExcluding(channelID int64, exclude map[int64]struct{}, limit int) []int64
 }
 
 // ChannelNudgeProvider 暴露「频道在线成员中排除已投递集合后的剩余 user id」，用于 >cap
@@ -546,6 +564,8 @@ type MessagesService interface {
 	GetOutboxReadDate(ctx context.Context, userID int64, req domain.OutboxReadDateRequest) (int, error)
 	SetMessageReactions(ctx context.Context, userID int64, req domain.SetPrivateMessageReactionsRequest) (domain.PrivateMessageReactionsResult, error)
 	GetMessageReactions(ctx context.Context, userID int64, req domain.PrivateMessageReactionsRequest) (domain.PrivateMessageReactionsResult, error)
+	SavedReactionTags(ctx context.Context, userID int64, savedPeer domain.Peer, limit int) ([]domain.SavedReactionTag, error)
+	UpdateSavedReactionTag(ctx context.Context, userID int64, tag domain.SavedReactionTag) error
 	VoteMessagePoll(ctx context.Context, userID int64, req domain.VotePrivateMessagePollRequest) (domain.PrivateMessagePollResult, error)
 	CloseMessagePoll(ctx context.Context, userID int64, req domain.ClosePrivateMessagePollRequest) (domain.PrivateMessagePollResult, error)
 	ListUnreadReactionMessages(ctx context.Context, userID int64, peer domain.Peer, limit int) ([]domain.Message, error)
@@ -669,11 +689,10 @@ type ChannelsService interface {
 	VoteMessagePoll(ctx context.Context, userID int64, req domain.VoteChannelMessagePollRequest) (domain.ChannelMessagePollResult, error)
 	CloseMessagePoll(ctx context.Context, userID int64, req domain.CloseChannelMessagePollRequest) (domain.ChannelMessagePollResult, error)
 	ListMessageReactions(ctx context.Context, userID int64, req domain.ChannelMessageReactionsListRequest) (domain.ChannelMessageReactionsList, error)
+	FindMessageReaction(ctx context.Context, userID int64, req domain.ChannelMessageReactionLookupRequest) (domain.ChannelMessageReactionLookup, bool, error)
 	TopReactions(ctx context.Context, userID int64, limit int) ([]domain.MessageReaction, error)
 	RecentReactions(ctx context.Context, userID int64, limit int) ([]domain.MessageReaction, error)
 	ClearRecentReactions(ctx context.Context, userID int64) error
-	SavedReactionTags(ctx context.Context, userID int64, limit int) ([]domain.SavedReactionTag, error)
-	UpdateSavedReactionTag(ctx context.Context, userID int64, tag domain.SavedReactionTag) error
 	GetPremiumBoostStatus(ctx context.Context, userID, channelID int64, now int) (domain.PremiumBoostStatus, error)
 	ListPremiumBoosts(ctx context.Context, userID, channelID int64, gifts bool, offset string, limit, now int) (domain.PremiumBoostList, error)
 	GetPremiumMyBoosts(ctx context.Context, userID int64, now, premiumUntil int) (domain.PremiumMyBoosts, error)
@@ -750,6 +769,19 @@ type ChannelsService interface {
 	AppendStarGiftAdminLog(ctx context.Context, channelID, senderUserID int64, savedID int64, date int, action domain.ChannelMessageAction) error
 	InviteAdminMemberIDs(ctx context.Context, channelID int64, limit int) ([]int64, error)
 	FilterActiveMemberIDs(ctx context.Context, channelID int64, userIDs []int64) ([]int64, error)
+}
+
+// ChannelMessageAudienceService is the optional production authorization
+// boundary for public short-poll subscribers. Lightweight test/domain adapters
+// that only model joined members may omit it and retain member-only behavior.
+type ChannelMessageAudienceService interface {
+	FilterMessageAudienceIDs(ctx context.Context, channelID int64, userIDs []int64) ([]int64, error)
+}
+
+// ChannelAuthoritativeProjectionService bypasses long-lived channel read
+// models for a durable channel_state refresh emitted by an admin mutation.
+type ChannelAuthoritativeProjectionService interface {
+	GetChannelsAuthoritative(ctx context.Context, userID int64, channelIDs []int64) ([]domain.ChannelView, error)
 }
 
 // CommunitiesService abstracts the Layer 228 Community aggregation domain.
@@ -875,9 +907,35 @@ type EphemeralService interface {
 	ReportTarget(ctx context.Context, userID int64, device domain.EphemeralDevice, peer domain.Peer, id int) (domain.EphemeralMessage, error)
 }
 
+// ModerationService accepts only final report choices. Implementations must
+// validate and snapshot referenced evidence, then durably commit the immutable
+// submission before returning success.
+type ModerationService interface {
+	ReportPeer(ctx context.Context, reporterUserID int64, source domain.ModerationReportSource, target domain.Peer, reason domain.ModerationReason, option, comment string, createdAt time.Time) (domain.ModerationReport, bool, error)
+	ReportMessages(ctx context.Context, req domain.ModerationMessageReportRequest) (domain.ModerationReport, bool, error)
+	ReportProfilePhoto(ctx context.Context, req domain.ModerationProfilePhotoReportRequest) (domain.ModerationReport, bool, error)
+	ReportChannelSpam(ctx context.Context, req domain.ModerationChannelSpamReportRequest) (domain.ModerationReport, bool, error)
+	ReportReaction(ctx context.Context, req domain.ModerationReactionReportRequest) (domain.ModerationReport, bool, error)
+	ReportEncryptedSpam(ctx context.Context, reporterUserID int64, chat domain.SecretChat, createdAt time.Time) (domain.ModerationReport, bool, error)
+	ReportStories(ctx context.Context, req domain.ModerationStoryReportRequest) (domain.ModerationReport, bool, error)
+	ReportEphemeral(ctx context.Context, reporterUserID int64, target domain.EphemeralMessage, reason domain.ModerationReason, option, comment string, createdAt time.Time) (domain.ModerationReport, bool, error)
+	SponsoredImpression(ctx context.Context, userID int64, randomID []byte, now time.Time) (domain.SponsoredMessageImpression, error)
+	ReportSponsored(ctx context.Context, userID int64, randomID []byte, reason domain.ModerationReason, option string, now time.Time) (domain.ModerationReport, bool, error)
+	ReportAntiSpamFalsePositive(ctx context.Context, reporterUserID, channelID int64, messageID int, now time.Time) (domain.ModerationReport, bool, error)
+}
+
+// PremiumPromoService exposes the immutable promo media catalog through a
+// domain-only boundary. File bytes remain served by upload.getFile through the
+// ordinary Files service.
+type PremiumPromoService interface {
+	PremiumPromo(ctx context.Context) (domain.PremiumPromoCatalog, bool, error)
+}
+
 // Deps 按业务域注入服务接口。各域的 handler 注册见对应文件（auth.go / users.go / updates.go）。
 type Deps struct {
-	Auth AuthService
+	Auth                AuthService
+	AuthDeliveryReports AuthDeliveryReportService
+	ClientTelemetry     ClientTelemetryService
 	// AuthKeySessionLayers is the protocol-only durable ordering boundary for
 	// explicit invokeWithLayer evidence. Production must wire the same auth-key
 	// store used by the MTProto edge; nil is reserved for isolated router tests.
@@ -889,7 +947,7 @@ type Deps struct {
 	AICompose            AIComposeService
 	Ephemeral            EphemeralService
 	EphemeralPush        store.EphemeralPushBroker
-	EphemeralReports     store.EphemeralReportStore
+	Moderation           ModerationService
 	Users                UsersService
 	TelegramLogin        TelegramLoginService
 	Updates              UpdatesService
@@ -905,6 +963,7 @@ type Deps struct {
 	Channels             ChannelsService
 	Communities          CommunitiesService
 	Files                FilesService
+	PremiumPromo         PremiumPromoService
 	Bots                 BotsService
 	Polls                PollsService
 	Phone                PhoneService

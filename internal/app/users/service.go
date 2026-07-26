@@ -33,6 +33,10 @@ type usernameAvailabilityStore interface {
 	CheckUsername(ctx context.Context, userID int64, username string) (bool, error)
 }
 
+type moderationFlagAudienceStore interface {
+	ModerationFlagAudience(ctx context.Context, userID int64, limit int) ([]int64, error)
+}
+
 // Option 调整用户服务可选依赖。
 type Option func(*Service)
 
@@ -136,6 +140,14 @@ func (s *Service) AdminUser(ctx context.Context, userID int64) (domain.User, boo
 		return domain.User{}, false, nil
 	}
 	return s.loadBaseUserByID(ctx, userID)
+}
+
+// PrivacyBaseUsers returns viewer-independent bot/premium facts through the
+// shared base-user read model. Privacy uses this as a batched cold loader behind
+// its bounded process cache; no viewer projection is performed, avoiding a
+// privacy -> users -> privacy recursion.
+func (s *Service) PrivacyBaseUsers(ctx context.Context, userIDs []int64) ([]domain.User, error) {
+	return s.loadBaseUsersByIDs(ctx, userIDs)
 }
 
 // ByIDs 批量返回指定用户。调用方必须已登录；缺失用户不会出现在结果中。
@@ -392,6 +404,23 @@ func (s *Service) SetScamFake(ctx context.Context, userID int64, scam, fake bool
 	return updated, nil
 }
 
+// ModerationFlagAudience returns the bounded set of existing viewers that may
+// need an immediate updateUser after SCAM/FAKE changes. This is an online
+// accelerator only: it does not allocate PTS or create durable update events.
+func (s *Service) ModerationFlagAudience(ctx context.Context, userID int64, limit int) ([]int64, error) {
+	if userID == 0 {
+		return nil, ErrNotAuthorized
+	}
+	if limit <= 0 || limit > 4096 {
+		limit = 4096
+	}
+	audience, ok := s.users.(moderationFlagAudienceStore)
+	if !ok {
+		return []int64{userID}, nil
+	}
+	return audience.ModerationFlagAudience(ctx, userID, limit)
+}
+
 // SetSupport 设置/取消用户的 support 标记（官方客服账号）。写后刷新基础缓存。
 func (s *Service) SetSupport(ctx context.Context, userID int64, support bool) (domain.User, error) {
 	if userID == 0 {
@@ -563,7 +592,9 @@ func (s *Service) ResolveUsername(ctx context.Context, currentUserID int64, user
 	return u, true, nil
 }
 
-// ResolvePhone 解析手机号到用户；当前阶段默认允许手机号深链解析，隐私规则后续接 account privacy。
+// ResolvePhone resolves a phone number only when the target's AddedByPhone
+// privacy allows the current viewer. The evaluator is backed by owner-level
+// privacy/contact snapshots in production, so this adds no per-rule SQL query.
 func (s *Service) ResolvePhone(ctx context.Context, currentUserID int64, phone string) (domain.User, bool, error) {
 	if _, err := s.loadSelf(ctx, currentUserID); err != nil {
 		return domain.User{}, false, err
@@ -577,6 +608,28 @@ func (s *Service) ResolvePhone(ctx context.Context, currentUserID int64, phone s
 		return u, found, err
 	}
 	s.putCachedUsers(ctx, u)
+	if s.privacy != nil && u.ID != currentUserID {
+		allowed := false
+		var err error
+		if batch, ok := s.privacy.(userprojection.BatchPrivacyEvaluator); ok {
+			visibility, batchErr := batch.CanSeeBatch(
+				ctx,
+				[]int64{u.ID},
+				currentUserID,
+				[]domain.PrivacyKey{domain.PrivacyKeyAddedByPhone},
+			)
+			err = batchErr
+			allowed = visibility[u.ID][domain.PrivacyKeyAddedByPhone]
+		} else {
+			allowed, err = s.privacy.CanSee(ctx, u.ID, currentUserID, domain.PrivacyKeyAddedByPhone)
+		}
+		if err != nil {
+			return domain.User{}, false, err
+		}
+		if !allowed {
+			return domain.User{}, false, domain.ErrPhoneNotOccupied
+		}
+	}
 	u, err = s.projectOne(ctx, currentUserID, u)
 	if err != nil {
 		return domain.User{}, false, err

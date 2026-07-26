@@ -16,6 +16,12 @@ import (
 
 // registerAccount 注册 account.* RPC handler。
 func (r *Router) registerAccount(d *tlprofile.Dispatcher) {
+	registerRPC[*tg.AccountReportPeerRequest](d, tlprofile.SemanticMethodAccountReportPeer, func(ctx context.Context, req *tg.AccountReportPeerRequest) (any, error) {
+		return r.onAccountReportPeer(ctx, req)
+	})
+	registerRPC[*tg.AccountReportProfilePhotoRequest](d, tlprofile.SemanticMethodAccountReportProfilePhoto, func(ctx context.Context, req *tg.AccountReportProfilePhotoRequest) (any, error) {
+		return r.onAccountReportProfilePhoto(ctx, req)
+	})
 	registerRPC[*tg.AccountDeleteAccountRequest](d, tlprofile.SemanticMethodAccountDeleteAccount, func(ctx context.Context, req *tg.AccountDeleteAccountRequest) (any, error) {
 		return r.onAccountDeleteAccount(ctx, req)
 	})
@@ -587,7 +593,8 @@ func (r *Router) onAccountResetAuthorization(ctx context.Context, hash int64) (b
 	}
 	r.revokeAuthKeySessions(deleted.AuthKeyID)
 	_ = r.clearAuthKeyState(ctx, deleted.AuthKeyID)
-	// P1 修复：撤销该会话销毁其 auth_key，级联 discard 该设备绑定的活跃密聊并通知对端。
+	// 撤销该设备的业务授权后，级联 discard 其绑定的活跃密聊并通知对端。
+	// 协议 auth key 必须保留，供客户端重连后取得 AUTH_KEY_UNREGISTERED。
 	r.discardSecretChatsForAuthKey(ctx, businessAuthKeyInt64(deleted.AuthKeyID), userID)
 	return true, nil
 }
@@ -876,6 +883,10 @@ func (r *Router) onAccountSetPrivacy(ctx context.Context, req *tg.AccountSetPriv
 		return nil, err
 	}
 	r.invalidateRPCProjectionForUser(userID)
+	// updatePrivacy is an absolute, non-PTS account-state notification. The
+	// originating session applies account.setPrivacy's response; other online
+	// sessions receive this best-effort update, while offline sessions reload
+	// the authoritative rules through account.getPrivacy.
 	r.pushUserUpdates(ctx, userID, &tg.Updates{
 		Updates: []tg.UpdateClass{&tg.UpdatePrivacy{
 			Key:   tgPrivacyKey(saved.Key),
@@ -883,7 +894,12 @@ func (r *Router) onAccountSetPrivacy(ctx context.Context, req *tg.AccountSetPriv
 		}},
 		Users: []tg.UserClass{},
 		Chats: []tg.ChatClass{},
+		Date:  int(r.clock.Now().Unix()),
+		Seq:   0,
 	})
+	if domainKey == domain.PrivacyKeyStatusTimestamp {
+		r.pushStatusPrivacyRefresh(ctx, userID)
+	}
 	return out, nil
 }
 
@@ -908,10 +924,11 @@ func (r *Router) onAccountSetAccountTTL(ctx context.Context, ttl tg.AccountDaysT
 		return false, tgerr400("TTL_DAYS_INVALID")
 	}
 	if svc, ok := r.accountSettingsSvc(); ok {
-		if _, err := svc.SetAccountTTL(ctx, userID, ttl.Days); err != nil {
+		saved, err := svc.SetAccountTTL(ctx, userID, ttl.Days)
+		if err != nil {
 			return false, internalErr()
 		}
-		r.accountSettings.Delete(userID)
+		r.accountSettings.Store(userID, saved)
 	}
 	return true, nil
 }
@@ -938,7 +955,7 @@ func (r *Router) onAccountSetGlobalPrivacySettings(ctx context.Context, settings
 		if err != nil {
 			return nil, internalErr()
 		}
-		r.accountSettings.Delete(userID)
+		r.accountSettings.Store(userID, saved)
 		return tgGlobalPrivacySettings(saved.GlobalPrivacy), nil
 	}
 	return &settings, nil
@@ -965,10 +982,11 @@ func (r *Router) onAccountSetContentSettings(ctx context.Context, req *tg.Accoun
 		return false, inputRequestInvalidErr()
 	}
 	if svc, ok := r.accountSettingsSvc(); ok {
-		if _, err := svc.SetSensitiveContent(ctx, userID, req.SensitiveEnabled); err != nil {
+		saved, err := svc.SetSensitiveContent(ctx, userID, req.SensitiveEnabled)
+		if err != nil {
 			return false, internalErr()
 		}
-		r.accountSettings.Delete(userID)
+		r.accountSettings.Store(userID, saved)
 	}
 	return true, nil
 }
@@ -991,10 +1009,11 @@ func (r *Router) onAccountSetContactSignUpNotification(ctx context.Context, sile
 		return false, internalErr()
 	}
 	if svc, ok := r.accountSettingsSvc(); ok {
-		if _, err := svc.SetContactSignUpSilent(ctx, userID, silent); err != nil {
+		saved, err := svc.SetContactSignUpSilent(ctx, userID, silent)
+		if err != nil {
 			return false, internalErr()
 		}
-		r.accountSettings.Delete(userID)
+		r.accountSettings.Store(userID, saved)
 	}
 	return true, nil
 }
