@@ -125,7 +125,7 @@ func (r *Router) onUsersGetUsers(ctx context.Context, ids []tg.InputUserClass) (
 		}
 		out = append(out, r.tgUser(u))
 	}
-	r.applyStoryMaxIDsToPeerObjects(ctx, currentUserID, out, nil)
+	r.applyPeerReadModels(ctx, currentUserID, out, nil)
 	return out, nil
 }
 
@@ -159,7 +159,7 @@ func (r *Router) onUsersGetFullUser(ctx context.Context, id tg.InputUserClass) (
 		return nil, err
 	}
 	applyPrivateContactRestrictionToUser(user, contactRestriction)
-	r.applyStoryMaxIDsToPeerObjects(ctx, currentUserID, []tg.UserClass{user}, nil)
+	r.applyPeerReadModels(ctx, currentUserID, []tg.UserClass{user}, nil)
 	loadEpoch := r.userFullProjectionCache.LoadEpoch()
 	if full, ok := r.userFullProjectionCache.Lookup(currentUserID, u.ID); ok {
 		if !applyContactNoteToUserFull(u, &full) {
@@ -170,6 +170,7 @@ func (r *Router) onUsersGetFullUser(ctx context.Context, id tg.InputUserClass) (
 		}
 		r.applyStoriesPinnedAvailableToUserFull(ctx, currentUserID, u.ID, &full)
 		r.applyNotifySettingsToUserFull(ctx, currentUserID, u.ID, &full)
+		r.applyBotVerificationToUserFull(ctx, u.ID, &full)
 		applyPrivateContactRestrictionToUserFull(&full, contactRestriction)
 		chats := r.applyPersonalChannelToUserFull(ctx, currentUserID, u.PersonalChannelID, &full)
 		return &tg.UsersUserFull{
@@ -191,6 +192,10 @@ func (r *Router) onUsersGetFullUser(ctx context.Context, id tg.InputUserClass) (
 	}
 	r.applyStoriesPinnedAvailableToUserFull(ctx, currentUserID, u.ID, &full)
 	r.applyNotifySettingsToUserFull(ctx, currentUserID, u.ID, &full)
+	// Deliberately after StoreIfEpoch, like applyPersonalChannelToUserFull: the mark
+	// is not baked into the per-(viewer,target) cache, so a revoked badge is gone on
+	// the next response instead of lingering for the cache TTL.
+	r.applyBotVerificationToUserFull(ctx, u.ID, &full)
 	applyPrivateContactRestrictionToUserFull(&full, contactRestriction)
 	chats := r.applyPersonalChannelToUserFull(ctx, currentUserID, u.PersonalChannelID, &full)
 	return &tg.UsersUserFull{
@@ -259,6 +264,17 @@ func (r *Router) buildUserFullProjection(ctx context.Context, currentUserID int6
 		About:          about,
 		Settings:       tg.PeerSettings{},
 		NotifySettings: *tdesktop.NotifySettings(),
+	}
+	if u.ID != currentUserID {
+		if svc, ok := r.deps.Messages.(PrivateNoForwardsService); ok {
+			state, err := svc.GetPrivateNoForwards(ctx, currentUserID, u.ID)
+			if err != nil {
+				return tg.UserFull{}, internalErr()
+			}
+			myEnabled, peerEnabled := state.ForViewer(currentUserID)
+			full.SetNoforwardsMyEnabled(myEnabled)
+			full.SetNoforwardsPeerEnabled(peerEnabled)
+		}
 	}
 	// 通话入口：客户端不见 phone_calls_available=true 不显示通话按钮（P1 前置项）。
 	// phone_calls_private 标记对端禁 P2P（p2p_allowed 真值在通话确认时另行计算）。
@@ -402,10 +418,56 @@ func (r *Router) buildUserFullProjection(ctx context.Context, currentUserID int6
 			full.SetBirthday(tgBirthday(u.Birthday))
 		}
 	}
+	r.applyAccountRatingToUserFull(ctx, currentUserID, u, &full)
 	// 个人频道（account.updatePersonalChannel）不在此落地：它按 viewer 实时解析，作为缓存后的
 	// overlay 处理（applyPersonalChannelToUserFull），避免烤进 per-(viewer,target) 投影缓存以及
 	// build/chats 两次解析同一频道。
 	return full, nil
+}
+
+// applyAccountRatingToUserFull projects gramsrv's stored composite rating through
+// the rating fields official clients already render. This is a gramsrv policy
+// score, not a promise that its inputs or thresholds match Telegram's service.
+//
+// The projection is built inside the existing per-(viewer,target) UserFull
+// cache. Therefore a cache miss adds at most one primary-key read and a cache hit
+// adds none. Recompute and writes remain exclusively in the bounded background
+// worker/admin paths.
+func (r *Router) applyAccountRatingToUserFull(ctx context.Context, viewerUserID int64, target domain.User, full *tg.UserFull) {
+	targetUserID := target.ID
+	if r.deps.AccountRatings == nil || full == nil || !domain.RatableAccount(targetUserID, target.Bot) {
+		return
+	}
+	rating, err := r.deps.AccountRatings.Rating(ctx, targetUserID)
+	if err != nil {
+		// Missing, disabled and temporarily unavailable projections all preserve
+		// the legacy wire shape instead of failing the surrounding profile read.
+		return
+	}
+	full.SetStarsRating(tgAccountRatingLevel(rating.LevelSnapshot()))
+	if viewerUserID == 0 || viewerUserID != targetUserID {
+		return
+	}
+	pending, ok := rating.PendingLevel()
+	if !ok {
+		return
+	}
+	full.SetStarsMyPendingRating(tgAccountRatingLevel(pending))
+	full.SetStarsMyPendingRatingDate(int(rating.PendingDate.Unix()))
+}
+
+// tgAccountRatingLevel maps the local level snapshot onto starsRating#1b0e4f07.
+// next_level_stars remains absent at the configured maximum local level.
+func tgAccountRatingLevel(in domain.AccountRatingLevel) tg.StarsRating {
+	out := tg.StarsRating{
+		Level:             in.Level,
+		CurrentLevelStars: in.CurrentLevelStars,
+		Stars:             in.Stars,
+	}
+	if in.HasNextLevelStars {
+		out.SetNextLevelStars(in.NextLevelStars)
+	}
+	return out
 }
 
 // tgBirthday 把 domain 生日转 tg.Birthday（Year 可选，0 表示不含年份）。
@@ -722,14 +784,16 @@ func (r *Router) fillUserFullPhotos(ctx context.Context, viewerUserID, ownerUser
 // TDesktop 的 botInfo.inited 永不置位，每次开聊/输 "/" 都会重拉 getFullUser；
 // user_id 必填且必须等于该 bot 的 id，不匹配会被客户端整体静默忽略。
 func (r *Router) tgBotInfo(ctx context.Context, u domain.User) tg.BotInfo {
-	if r.deps.Bots == nil {
-		return tgBotInfoFromProfile(u.ID, domain.BotProfile{}, false)
+	info := tgBotInfoFromProfile(u.ID, domain.BotProfile{}, false)
+	if r.deps.Bots != nil {
+		if profile, found, err := r.deps.Bots.BotInfo(ctx, u.ID); err == nil && found {
+			info = tgBotInfoFromProfile(u.ID, profile, true)
+		}
 	}
-	profile, found, err := r.deps.Bots.BotInfo(ctx, u.ID)
-	if err != nil || !found {
-		return tgBotInfoFromProfile(u.ID, domain.BotProfile{}, false)
-	}
-	return tgBotInfoFromProfile(u.ID, profile, true)
+	// botInfo#4d8a0299 verifier_settings:flags.9 -- present only for a bot that is
+	// itself an enabled verifier, and independent of the bot profile above.
+	r.applyVerifierSettingsToOneBotInfo(ctx, &info, u.ID)
+	return info
 }
 
 type botProfileBatchResolver interface {
@@ -755,10 +819,18 @@ func (r *Router) tgBotInfos(ctx context.Context, userIDs []int64) []tg.BotInfo {
 			}
 		}
 	}
+	// One verifier-settings query for the whole bot list, next to the profile batch
+	// above: channelFull.bot_info must not turn into an N+1 just to carry
+	// verifier_settings:flags.9.
+	verifiers := r.verifierSettingsBatch(ctx, ids)
 	out := make([]tg.BotInfo, 0, len(userIDs))
 	for _, id := range userIDs {
 		profile, found := profiles[id]
-		out = append(out, tgBotInfoFromProfile(id, profile, found))
+		info := tgBotInfoFromProfile(id, profile, found)
+		if settings, ok := verifiers[id]; ok {
+			applyVerifierSettingsToBotInfo(&info, id, settings)
+		}
+		out = append(out, info)
 	}
 	return out
 }

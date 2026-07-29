@@ -165,6 +165,37 @@ type Message struct {
 	SavedPeer Peer
 }
 
+// NewHistoryClearMessage 把一个 owner 视角的现有 box 原位投影为
+// messageActionHistoryClear 服务消息。调用方只传递仍需保留的身份字段；
+// 其余正文、媒体、reply、reaction、TTL、pin 等载荷全部按不变量清空。
+func NewHistoryClearMessage(ownerUserID int64, peer Peer, boxID int, uid int64, date, pts int) Message {
+	self := Peer{Type: PeerTypeUser, ID: ownerUserID}
+	return Message{
+		ID:          boxID,
+		UID:         uid,
+		OwnerUserID: ownerUserID,
+		Peer:        peer,
+		From:        self,
+		Date:        date,
+		Out:         true,
+		Pts:         pts,
+		Media: &MessageMedia{
+			Kind: MessageMediaKindService,
+			ServiceAction: &MessageServiceAction{
+				Kind: MessageServiceActionHistoryClear,
+			},
+		},
+	}
+}
+
+// IsHistoryClearServiceMessage 报告该 box 是否已经是清空历史锚点。
+func IsHistoryClearServiceMessage(msg Message) bool {
+	return msg.Media != nil &&
+		msg.Media.Kind == MessageMediaKindService &&
+		msg.Media.ServiceAction != nil &&
+		msg.Media.ServiceAction.Kind == MessageServiceActionHistoryClear
+}
+
 // MessageRichMessage 是 Layer 228 富文本消息（richMessage）的协议中立快照：一组 IV
 // PageBlock（Blocks）+ 内嵌已解析的 Photos/Documents。
 //
@@ -407,6 +438,47 @@ type ForwardPrivateMessagesResult struct {
 	ReplayDeleteEvents []*UpdateEvent
 }
 
+const PrivateNoForwardsRequestExpirePeriod = 24 * 60 * 60
+
+// PrivateNoForwardsState 是一对普通用户唯一的内容保护权威。
+// EnabledByUserID 为 0 或参与者之一；非零时双方共享的会话均受保护。
+type PrivateNoForwardsState struct {
+	UserLowID       int64
+	UserHighID      int64
+	EnabledByUserID int64
+}
+
+func (s PrivateNoForwardsState) Enabled() bool {
+	return s.EnabledByUserID != 0
+}
+
+func (s PrivateNoForwardsState) ForViewer(viewerUserID int64) (myEnabled, peerEnabled bool) {
+	if s.EnabledByUserID == 0 {
+		return false, false
+	}
+	return s.EnabledByUserID == viewerUserID, s.EnabledByUserID != viewerUserID
+}
+
+// TogglePrivateNoForwardsRequest 是私聊内容保护的原子状态+服务消息命令。
+type TogglePrivateNoForwardsRequest struct {
+	ActorUserID     int64
+	PeerUserID      int64
+	Enabled         bool
+	RequestMsgID    int
+	RandomID        int64
+	Date            int
+	OriginAuthKeyID [8]byte
+	OriginSessionID int64
+}
+
+// TogglePrivateNoForwardsResult 同时返回提交后的权威状态与本次真实服务消息。
+// Changed=false 且 Send 为空表示官方定义的 no-op。
+type TogglePrivateNoForwardsResult struct {
+	State   PrivateNoForwardsState
+	Changed bool
+	Send    SendPrivateTextResult
+}
+
 // ReadHistoryRequest 是账号视角的 messages.readHistory 命令。
 type ReadHistoryRequest struct {
 	OwnerUserID     int64
@@ -552,7 +624,23 @@ type DeleteHistoryRequest struct {
 type DeletedMessagesForUser struct {
 	UserID     int64
 	MessageIDs []int
-	Event      UpdateEvent
+	// Event 保留单一 delete_messages 事件，供普通 deleteMessages 路径与
+	// replay receipt 使用；just_clear 还会在 Events 中携带 read/edit 事件。
+	Event  UpdateEvent
+	Events []UpdateEvent
+	// Pts/PtsCount 是本次 method 对该 owner 的 affected watermark 汇总。
+	// 普通删除等于 Event；just_clear 等于最后一条真实 update 的 pts 与
+	// delete/read/edit 三段 pts_count 之和。
+	Pts      int
+	PtsCount int
+}
+
+// AffectedPts 返回 messages.Affected* 应使用的最终 PTS 与本次总增量。
+func (d DeletedMessagesForUser) AffectedPts() (int, int) {
+	if d.Pts != 0 {
+		return d.Pts, d.PtsCount
+	}
+	return d.Event.Pts, d.Event.PtsCount
 }
 
 // DeleteMessagesResult 描述消息删除后的 owner 维度结果。
@@ -575,7 +663,8 @@ func (r DeleteMessagesResult) Self() DeletedMessagesForUser {
 // Changed 表示本次删除是否实际影响了任何 owner 视角。
 func (r DeleteMessagesResult) Changed() bool {
 	for _, item := range r.Deleted {
-		if len(item.MessageIDs) > 0 {
+		pts, _ := item.AffectedPts()
+		if len(item.MessageIDs) > 0 || pts > 0 {
 			return true
 		}
 	}

@@ -1,7 +1,10 @@
 package rpc
 
 import (
+	"time"
+
 	"github.com/iamxvbaba/td/tg"
+
 	"telesrv/internal/domain"
 )
 
@@ -134,6 +137,8 @@ func tgMessageServiceAction(msg domain.Message) tg.MessageActionClass {
 		return nil
 	}
 	switch m.ServiceAction.Kind {
+	case domain.MessageServiceActionHistoryClear:
+		return &tg.MessageActionHistoryClear{}
 	case domain.MessageServiceActionSuggestProfilePhoto:
 		if m.ServiceAction.Photo == nil || m.ServiceAction.Photo.ID == 0 {
 			return &tg.MessageActionEmpty{}
@@ -144,6 +149,25 @@ func tgMessageServiceAction(msg domain.Message) tg.MessageActionClass {
 	case domain.MessageServiceActionSetChatTheme:
 		return &tg.MessageActionSetChatTheme{
 			Theme: &tg.ChatTheme{Emoticon: m.ServiceAction.ChatThemeEmoticon},
+		}
+	case domain.MessageServiceActionNoForwardsToggle:
+		action := m.ServiceAction.NoForwards
+		if action == nil {
+			return &tg.MessageActionEmpty{}
+		}
+		return &tg.MessageActionNoForwardsToggle{
+			PrevValue: action.PrevValue,
+			NewValue:  action.NewValue,
+		}
+	case domain.MessageServiceActionNoForwardsRequest:
+		action := m.ServiceAction.NoForwards
+		if action == nil {
+			return &tg.MessageActionEmpty{}
+		}
+		return &tg.MessageActionNoForwardsRequest{
+			Expired:   action.Expired || (action.ExpiresAt > 0 && int(time.Now().Unix()) >= action.ExpiresAt),
+			PrevValue: action.PrevValue,
+			NewValue:  action.NewValue,
 		}
 	case domain.MessageServiceActionPhoneCall:
 		if m.ServiceAction.Call == nil {
