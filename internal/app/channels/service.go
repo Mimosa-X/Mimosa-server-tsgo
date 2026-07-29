@@ -2301,7 +2301,8 @@ func (s *Service) GetDifference(ctx context.Context, userID int64, req domain.Ch
 	if err != nil {
 		return domain.ChannelDifference{}, err
 	}
-	return s.filterBotChannelDifference(ctx, userID, diff), nil
+	diff = s.filterBotChannelDifference(ctx, userID, diff)
+	return diff, nil
 }
 
 // ClearDanglingPinnedMessage 清除指向已删除消息的悬挂置顶值（unpinAll 自愈）。

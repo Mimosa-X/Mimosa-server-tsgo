@@ -55,11 +55,23 @@ func tgUpdatesDifference(viewerUserID int64, diff domain.UpdateDifference) tg.Up
 		if nudge.ChannelID == 0 {
 			continue
 		}
-		update := &tg.UpdateChannelTooLong{ChannelID: nudge.ChannelID}
-		if nudge.Pts > 0 {
-			update.SetPts(nudge.Pts)
+		if nudge.AvailableMinID > 0 {
+			out.OtherUpdates = append(out.OtherUpdates, &tg.UpdateChannelAvailableMessages{
+				ChannelID:      nudge.ChannelID,
+				AvailableMinID: nudge.AvailableMinID,
+			})
 		}
-		out.OtherUpdates = append(out.OtherUpdates, update)
+		// Preserve compatibility for older domain callers that only supplied
+		// Pts: a nudge without an owner-local boundary is a shared channel
+		// update nudge. New store results set ChannelUpdatesDirty explicitly so
+		// a channel can carry both absolute clear and too-long updates.
+		if nudge.ChannelUpdatesDirty || nudge.AvailableMinID == 0 {
+			update := &tg.UpdateChannelTooLong{ChannelID: nudge.ChannelID}
+			if nudge.Pts > 0 {
+				update.SetPts(nudge.Pts)
+			}
+			out.OtherUpdates = append(out.OtherUpdates, update)
+		}
 		if nudge.Channel != nil && nudge.Channel.Channel.ID != 0 {
 			addChannelNudgeChat(out, seenChats, tgChannelChatForView(viewerUserID, *nudge.Channel))
 		}
@@ -482,14 +494,6 @@ func tgOtherUpdateFromEvent(event domain.UpdateEvent) tg.UpdateClass {
 			FolderPeers: tgFolderPeers(event.FolderPeers),
 			Pts:         event.Pts,
 			PtsCount:    event.PtsCount,
-		}
-	case domain.UpdateEventChannelAvailable:
-		if event.Peer.Type != domain.PeerTypeChannel || event.Peer.ID == 0 || event.MaxID <= 0 {
-			return nil
-		}
-		return &tg.UpdateChannelAvailableMessages{
-			ChannelID:      event.Peer.ID,
-			AvailableMinID: event.MaxID,
 		}
 	default:
 		return nil
