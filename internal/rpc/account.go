@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/iamxvbaba/td/tg"
+	"go.uber.org/zap"
 
 	"github.com/iamxvbaba/td/tlprofile"
 	"telesrv/internal/branding"
@@ -289,6 +290,7 @@ func (r *Router) registerAccount(d *tlprofile.Dispatcher) {
 			return false, tgerr400("WALLPAPER_INVALID")
 		}
 		if _, ok := tdesktop.LookupWallPaper(req.Wallpaper); !ok {
+			r.log.Info("wallpaper reference rejected", wallpaperReferenceLogFields("account.installWallPaper", req.Wallpaper)...)
 			return false, tgerr400("WALLPAPER_INVALID")
 		}
 		return true, nil
@@ -461,6 +463,20 @@ func (r *Router) registerAccount(d *tlprofile.Dispatcher) {
 			Offline)
 	})
 
+}
+
+func wallpaperReferenceLogFields(method string, input tg.InputWallPaperClass) []zap.Field {
+	fields := []zap.Field{zap.String("method", method)}
+	switch wallpaper := input.(type) {
+	case *tg.InputWallPaperSlug:
+		return append(fields, zap.String("input_type", "inputWallPaperSlug"), zap.String("slug", wallpaper.Slug))
+	case *tg.InputWallPaper:
+		return append(fields, zap.String("input_type", "inputWallPaper"), zap.Int64("wallpaper_id", wallpaper.ID))
+	case *tg.InputWallPaperNoFile:
+		return append(fields, zap.String("input_type", "inputWallPaperNoFile"), zap.Int64("wallpaper_id", wallpaper.ID))
+	default:
+		return append(fields, zap.String("input_type", "unknown"))
+	}
 }
 
 func (r *Router) onAccountGetPassword(ctx context.Context) (*tg.AccountPassword, error) {
@@ -730,7 +746,7 @@ func (r *Router) onAccountVerifyEmail(ctx context.Context, req *tg.AccountVerify
 		if ClientTypeFrom(ctx) == ClientTypeAndroid {
 			return &tg.AccountEmailVerifiedLogin{
 				Email:    email,
-				SentCode: tgEmailSentCode(p.PhoneCodeHash, domain.MaskEmail(email), len(strings.TrimSpace(code))),
+				SentCode: tgEmailSentCode(p.PhoneCodeHash, domain.MaskEmail(email), len(strings.TrimSpace(code)), r.loginEmailResetAvailable()),
 			}, nil
 		}
 		u, _, needSignUp, signInErr := r.deps.Auth.SignInWithEmail(ctx, r.authzFromCtx(ctx), p.PhoneNumber, p.PhoneCodeHash, code)
@@ -1084,13 +1100,15 @@ func (r *Router) tgAccountPrivacyRules(ctx context.Context, viewerUserID int64, 
 			return nil, internalErr()
 		}
 	}
-	return &tg.AccountPrivacyRules{
+	out := &tg.AccountPrivacyRules{
 		Rules: tgPrivacyRules(rules.Rules),
 		// viewer 可能把自己（inputUserSelf）写进隐私名单，须带 self 标志，否则下发的
 		// self=false user 会被 DrKLO putUsers 覆盖账号缓存。
 		Users: tgUsersForViewer(viewerUserID, users),
 		Chats: []tg.ChatClass{},
-	}, nil
+	}
+	r.applyPeerReadModels(ctx, viewerUserID, out.Users, out.Chats)
+	return out, nil
 }
 
 func (r *Router) domainPrivacyRulesFromInput(ctx context.Context, userID int64, in []tg.InputPrivacyRuleClass) ([]domain.PrivacyRule, error) {
@@ -1518,8 +1536,7 @@ func (r *Router) onAccountUpdateProfile(ctx context.Context, req *tg.AccountUpda
 		return nil, profileErr(err)
 	}
 	r.invalidateRPCProjectionForUser(u.ID)
-	r.pushUsernameUpdate(ctx, u)
-	return r.tgSelfUser(u), nil
+	return r.pushUsernameUpdate(ctx, u), nil
 }
 
 func (r *Router) onAccountCheckUsername(ctx context.Context, username string) (bool, error) {
@@ -1552,8 +1569,7 @@ func (r *Router) onAccountUpdateUsername(ctx context.Context, username string) (
 		return nil, usernameErr(err)
 	}
 	r.invalidateRPCProjectionForUser(u.ID)
-	r.pushUsernameUpdate(ctx, u)
-	return r.tgSelfUser(u), nil
+	return r.pushUsernameUpdate(ctx, u), nil
 }
 
 // onAccountReorderUsernames rewrites the caller's active username order
@@ -1714,12 +1730,13 @@ func (r *Router) onAccountUpdateEmojiStatus(ctx context.Context, status tg.Emoji
 	}
 	r.invalidateRPCProjectionForUser(u.ID)
 	update := &tg.UpdateUserEmojiStatus{UserID: u.ID, EmojiStatus: tgUserEmojiStatusValue(value)}
+	self := r.tgSelfUserWithUsernames(ctx, u)
 	if durableWrite {
 		if sessionID != 0 {
 			r.bookkeepAuxPtsForCurrentSession(ctx, event)
 		}
 		r.pushUserUpdatesIfNoReliableDispatch(ctx, u.ID, &tg.Updates{
-			Updates: []tg.UpdateClass{update}, Users: []tg.UserClass{r.tgSelfUser(u)}, Date: event.Date,
+			Updates: []tg.UpdateClass{update}, Users: []tg.UserClass{self}, Date: event.Date,
 		})
 	} else if updates, ok := r.deps.Updates.(UserEmojiStatusUpdatesService); ok {
 		event, _, recordErr := updates.RecordUserEmojiStatus(ctx, authKeyID, userID, value, rawAuthKeyIDForOrigin(ctx), sessionID)
@@ -1730,13 +1747,13 @@ func (r *Router) onAccountUpdateEmojiStatus(ctx context.Context, status tg.Emoji
 			r.bookkeepAuxPtsForCurrentSession(ctx, event)
 		}
 		r.pushUserUpdatesIfNoReliableDispatch(ctx, u.ID, &tg.Updates{
-			Updates: []tg.UpdateClass{update}, Users: []tg.UserClass{r.tgSelfUser(u)}, Date: event.Date,
+			Updates: []tg.UpdateClass{update}, Users: []tg.UserClass{self}, Date: event.Date,
 		})
 	} else {
 		// Lightweight test deployments without the durable extension retain the
 		// previous online-only behavior; production wiring implements it.
 		r.pushUserUpdates(ctx, u.ID, &tg.Updates{
-			Updates: []tg.UpdateClass{update}, Users: []tg.UserClass{r.tgSelfUser(u)}, Date: int(r.clock.Now().Unix()),
+			Updates: []tg.UpdateClass{update}, Users: []tg.UserClass{self}, Date: int(r.clock.Now().Unix()),
 		})
 	}
 	return true, nil
@@ -1810,7 +1827,7 @@ func (r *Router) onAccountUpdateColor(ctx context.Context, req *tg.AccountUpdate
 	r.invalidateRPCProjectionForUser(u.ID)
 	r.pushUserUpdates(ctx, u.ID, &tg.Updates{
 		Updates: []tg.UpdateClass{&tg.UpdateUser{UserID: u.ID}},
-		Users:   []tg.UserClass{r.tgSelfUser(u)},
+		Users:   []tg.UserClass{r.tgSelfUserWithUsernames(ctx, u)},
 		Date:    int(r.clock.Now().Unix()),
 	})
 	return true, nil
@@ -1914,18 +1931,22 @@ func (r *Router) onAccountGetCollectibleEmojiStatuses(ctx context.Context, hash 
 	return &tg.AccountEmojiStatuses{Hash: catalogHash, Statuses: statuses}, nil
 }
 
-func (r *Router) pushUsernameUpdate(ctx context.Context, u domain.User) {
-	if u.ID == 0 {
-		return
-	}
+func (r *Router) pushUsernameUpdate(ctx context.Context, u domain.User) *tg.User {
 	// updateUserName carries the vector clients persist, so it has to be the full
 	// registry list when one exists. One peer, one registry read; the overlay
 	// degrades to tgUsernames(u.Username) whenever the registry is unavailable.
+	// Keep the RPC result and pushed update as distinct tg.User objects: TL Encode
+	// recomputes flags, so sharing one pointer across response and push delivery
+	// would make otherwise independent encoders mutate the same object.
 	self := r.tgSelfUser(u)
-	users := []tg.UserClass{self}
+	pushedSelf := r.tgSelfUser(u)
+	users := []tg.UserClass{self, pushedSelf}
 	r.applyUsernamesToPeerObjects(ctx, users, nil)
+	if u.ID == 0 {
+		return self
+	}
 	usernames := tgUsernames(u.Username)
-	if vector, ok := self.GetUsernames(); ok && len(vector) > 0 {
+	if vector, ok := pushedSelf.GetUsernames(); ok && len(vector) > 0 {
 		usernames = vector
 	}
 	r.pushUserUpdates(ctx, u.ID, &tg.Updates{
@@ -1935,9 +1956,10 @@ func (r *Router) pushUsernameUpdate(ctx context.Context, u domain.User) {
 			LastName:  u.LastName,
 			Usernames: usernames,
 		}},
-		Users: users,
+		Users: []tg.UserClass{pushedSelf},
 		Date:  int(r.clock.Now().Unix()),
 	})
+	return self
 }
 
 func (r *Router) pushSelfUserChangedUpdate(ctx context.Context, u domain.User) {
@@ -1946,7 +1968,7 @@ func (r *Router) pushSelfUserChangedUpdate(ctx context.Context, u domain.User) {
 	}
 	r.pushUserUpdates(ctx, u.ID, &tg.Updates{
 		Updates: []tg.UpdateClass{&tg.UpdateUser{UserID: u.ID}},
-		Users:   []tg.UserClass{r.tgSelfUser(u)},
+		Users:   []tg.UserClass{r.tgSelfUserWithUsernames(ctx, u)},
 		Date:    int(r.clock.Now().Unix()),
 	})
 }

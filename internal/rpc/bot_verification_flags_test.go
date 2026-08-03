@@ -65,6 +65,53 @@ func assertFlagBitDelta(t *testing.T, label string, before, after bin.Fields, wa
 	}
 }
 
+func assertMessagesEnvelopeBotVerificationIcon(t *testing.T, out tg.MessagesMessagesClass, peer domain.Peer, want int64) {
+	t.Helper()
+	var users []tg.UserClass
+	var chats []tg.ChatClass
+	switch value := out.(type) {
+	case *tg.MessagesMessages:
+		users, chats = value.Users, value.Chats
+	case *tg.MessagesMessagesSlice:
+		users, chats = value.Users, value.Chats
+	case *tg.MessagesChannelMessages:
+		users, chats = value.Users, value.Chats
+	default:
+		t.Fatalf("messages envelope = %T, want peer-bearing messages.Messages", out)
+	}
+	switch peer.Type {
+	case domain.PeerTypeUser:
+		for _, item := range users {
+			user, ok := item.(*tg.User)
+			if !ok || user.ID != peer.ID {
+				continue
+			}
+			wire := &tg.User{}
+			tlRoundTrip(t, user, wire)
+			if icon, ok := wire.GetBotVerificationIcon(); !ok || icon != want {
+				t.Fatalf("user %d bot_verification_icon = %d, ok=%v, want %d", peer.ID, icon, ok, want)
+			}
+			return
+		}
+	case domain.PeerTypeChannel:
+		for _, item := range chats {
+			channel, ok := item.(*tg.Channel)
+			if !ok || channel.ID != peer.ID {
+				continue
+			}
+			wire := &tg.Channel{}
+			tlRoundTrip(t, channel, wire)
+			if icon, ok := wire.GetBotVerificationIcon(); !ok || icon != want {
+				t.Fatalf("channel %d bot_verification_icon = %d, ok=%v, want %d", peer.ID, icon, ok, want)
+			}
+			return
+		}
+	default:
+		t.Fatalf("unsupported verification peer %+v", peer)
+	}
+	t.Fatalf("messages envelope %T does not carry peer %+v", out, peer)
+}
+
 // TestBotVerificationConstructorIDs pins the two constructor ids the feature
 // serialises. A drift here silently reshapes every payload below.
 func TestBotVerificationConstructorIDs(t *testing.T) {
@@ -678,4 +725,107 @@ func TestUsersGetUsersResolvesBotVerificationInOneBatch(t *testing.T) {
 		t.Fatalf("verification reads = batch %d / peer %d, want batch 1 / peer 0",
 			verify.batchCalls, verify.peerCalls)
 	}
+}
+
+// TestOpeningChatMessageLookupsKeepBotVerificationIcons covers the supplemental
+// message lookups official clients issue while opening a chat. These responses
+// update the same peer cache as messages.getDialogs, so returning an unstamped
+// user/channel here makes a visible badge disappear until the dialogs response is
+// loaded again.
+func TestOpeningChatMessageLookupsKeepBotVerificationIcons(t *testing.T) {
+	t.Run("private messages.getMessages", func(t *testing.T) {
+		const (
+			viewerID = int64(1000000001)
+			targetID = int64(1000000002)
+			iconID   = int64(8800010)
+		)
+		verify := newFakeBotVerifications()
+		peer := domain.Peer{Type: domain.PeerTypeUser, ID: targetID}
+		verify.marks[peer] = domain.CustomVerification{
+			VerifierBotID:  777000123,
+			Peer:           peer,
+			IconDocumentID: iconID,
+			Description:    "Verified by Acme Trust",
+		}
+		r := New(Config{}, Deps{
+			Messages: &captureMessages{list: domain.MessageList{
+				Messages: []domain.Message{{
+					ID:          7,
+					OwnerUserID: viewerID,
+					Peer:        peer,
+					From:        peer,
+					Date:        1700000000,
+					Body:        "reply source",
+				}},
+				Count: 1,
+			}},
+			Users: mapUsersService{users: map[int64]domain.User{
+				viewerID: {ID: viewerID, FirstName: "Viewer"},
+				targetID: {ID: targetID, FirstName: "Target"},
+			}},
+			BotVerifications: verify,
+		}, zaptest.NewLogger(t), clock.System)
+
+		result, err := r.onMessagesGetMessages(
+			WithUserID(context.Background(), viewerID),
+			[]tg.InputMessageClass{&tg.InputMessageID{ID: 7}},
+		)
+		if err != nil {
+			t.Fatalf("messages.getMessages: %v", err)
+		}
+		box := result.(*tg.MessagesMessages)
+		if len(box.Users) != 1 {
+			t.Fatalf("users = %d, want target user", len(box.Users))
+		}
+		user := &tg.User{}
+		tlRoundTrip(t, box.Users[0].(*tg.User), user)
+		if icon, ok := user.GetBotVerificationIcon(); !ok || icon != iconID {
+			t.Fatalf("opening-chat user bot_verification_icon = %d, ok=%v, want %d", icon, ok, iconID)
+		}
+	})
+
+	t.Run("channel channels.getMessages", func(t *testing.T) {
+		const iconID = int64(8800011)
+		f := newBotVerificationFixture(t, newFakeBotVerifications())
+		group := f.botVerificationGroup(t, "Verified Group")
+		sent, err := f.router.onMessagesSendMessage(
+			WithUserID(context.Background(), f.owner.ID),
+			&tg.MessagesSendMessageRequest{
+				Peer:     &tg.InputPeerChannel{ChannelID: group.ID, AccessHash: group.AccessHash},
+				Message:  "pinned source",
+				RandomID: 8800011,
+			},
+		)
+		if err != nil {
+			t.Fatalf("send channel message: %v", err)
+		}
+		messageID := sent.(*tg.Updates).Updates[1].(*tg.UpdateNewChannelMessage).Message.(*tg.Message).ID
+		peer := domain.Peer{Type: domain.PeerTypeChannel, ID: group.ID}
+		f.verify.marks[peer] = domain.CustomVerification{
+			VerifierBotID:  f.bot.ID,
+			Peer:           peer,
+			IconDocumentID: iconID,
+			Description:    "Verified by Acme Trust",
+		}
+
+		result, err := f.router.onChannelsGetMessages(
+			WithUserID(context.Background(), f.owner.ID),
+			&tg.ChannelsGetMessagesRequest{
+				Channel: &tg.InputChannel{ChannelID: group.ID, AccessHash: group.AccessHash},
+				ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: messageID}},
+			},
+		)
+		if err != nil {
+			t.Fatalf("channels.getMessages: %v", err)
+		}
+		box := result.(*tg.MessagesMessages)
+		if len(box.Chats) != 1 {
+			t.Fatalf("chats = %d, want target channel", len(box.Chats))
+		}
+		channel := &tg.Channel{}
+		tlRoundTrip(t, box.Chats[0].(*tg.Channel), channel)
+		if icon, ok := channel.GetBotVerificationIcon(); !ok || icon != iconID {
+			t.Fatalf("opening-chat channel bot_verification_icon = %d, ok=%v, want %d", icon, ok, iconID)
+		}
+	})
 }

@@ -10,14 +10,35 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	accountapp "telesrv/internal/app/account"
+	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
 	"telesrv/internal/store/memory"
 )
 
 func TestQuickReplyRPCSaveListAndDeleteMessage(t *testing.T) {
-	const userID int64 = 1000000001
+	const userID int64 = domain.UserIDSequenceBase
 	ctx := WithSessionID(WithAuthKeyID(WithUserID(context.Background(), userID), [8]byte{1}), 77)
 	r, updates := newChatAutomationTestRouter(t)
+	verify := newFakeBotVerifications()
+	r.deps.BotVerifications = verify
+	userStore := memory.NewUserStore()
+	self, err := userStore.Create(context.Background(), domain.User{
+		AccessHash: 7000001,
+		Phone:      "15550007001",
+		FirstName:  "Quick",
+	})
+	if err != nil || self.ID != userID {
+		t.Fatalf("create quick-reply user = %+v err %v, want id %d", self, err, userID)
+	}
+	r.deps.Users = appusers.NewService(userStore)
+	const quickReplyIcon = int64(8800023)
+	quickReplyPeer := domain.Peer{Type: domain.PeerTypeUser, ID: userID}
+	verify.marks[quickReplyPeer] = domain.CustomVerification{
+		VerifierBotID:  777000123,
+		Peer:           quickReplyPeer,
+		IconDocumentID: quickReplyIcon,
+		Description:    "Verified quick-reply peer",
+	}
 
 	got, err := r.onMessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
 		Peer:               &tg.InputPeerSelf{},
@@ -68,6 +89,17 @@ func TestQuickReplyRPCSaveListAndDeleteMessage(t *testing.T) {
 		t.Fatalf("quick replies = %#v", list)
 	}
 
+	quickReplyMessages, err := r.onMessagesGetQuickReplyMessages(ctx, &tg.MessagesGetQuickReplyMessagesRequest{
+		ShortcutID: shortcutID,
+	})
+	if err != nil {
+		t.Fatalf("onMessagesGetQuickReplyMessages: %v", err)
+	}
+	assertMessagesEnvelopeBotVerificationIcon(t, quickReplyMessages, quickReplyPeer, quickReplyIcon)
+	if verify.batchCalls != 0 || verify.peerCalls != 1 {
+		t.Fatalf("quick-reply verification reads = batch %d peer %d, want 0/1 for one peer", verify.batchCalls, verify.peerCalls)
+	}
+
 	deleted, err := r.onMessagesDeleteQuickReplyMessages(ctx, &tg.MessagesDeleteQuickReplyMessagesRequest{
 		ShortcutID: shortcutID,
 		ID:         []int{messageID},
@@ -97,6 +129,15 @@ func TestBusinessChatLinkRPCs(t *testing.T) {
 	const userID int64 = 1000000002
 	ctx := WithUserID(context.Background(), userID)
 	r, _ := newChatAutomationTestRouter(t)
+	r.deps.Users = mapUsersService{users: map[int64]domain.User{
+		userID: {ID: userID, AccessHash: 2002, FirstName: "Business", Username: "business_slot"},
+	}}
+	registry := newFakeUsernameRegistry()
+	registry.byPeer[domain.Peer{Type: domain.PeerTypeUser, ID: userID}] = []domain.Username{
+		{Username: "business_slot", Editable: true, Active: true, SortOrder: 0},
+		{Username: "business_collectible", Active: true, SortOrder: 1, CollectibleID: 22},
+	}
+	r.deps.Usernames = registry
 
 	created, err := r.onAccountCreateBusinessChatLink(ctx, tg.InputBusinessChatLink{
 		Message: "Prefilled message",
@@ -123,6 +164,13 @@ func TestBusinessChatLinkRPCs(t *testing.T) {
 	peer, ok := resolved.Peer.(*tg.PeerUser)
 	if !ok || peer.UserID != userID || resolved.Message != "Prefilled message" {
 		t.Fatalf("resolved = %+v", resolved)
+	}
+	if len(resolved.Users) != 1 {
+		t.Fatalf("resolved users = %+v, want one", resolved.Users)
+	}
+	assertVectorOnlyUsernames(t, "resolved business chat owner", resolved.Users[0].(*tg.User), []string{"business_slot", "business_collectible"})
+	if registry.peerCalls != 1 || registry.batchCalls != 0 {
+		t.Fatalf("resolved business username reads = peer:%d batch:%d, want 1/0", registry.peerCalls, registry.batchCalls)
 	}
 	list, err = r.onAccountGetBusinessChatLinks(ctx)
 	if err != nil || len(list.Links) != 1 || list.Links[0].Views != 1 {

@@ -66,8 +66,12 @@ func TestDispatchUnwrapsWrappers(t *testing.T) {
 	if cfg.ThisDC != dc {
 		t.Fatalf("ThisDC = %d, want %d", cfg.ThisDC, dc)
 	}
-	if len(cfg.DCOptions) != 0 {
-		t.Fatalf("DCOptions = %+v, want empty (client uses pinned static address)", cfg.DCOptions)
+	if len(cfg.DCOptions) != 1 {
+		t.Fatalf("DCOptions = %+v, want one reconnect route", cfg.DCOptions)
+	}
+	option := cfg.DCOptions[0]
+	if option.ID != dc || option.IPAddress != ip || option.Port != port || option.Ipv6 || option.MediaOnly || option.CDN {
+		t.Fatalf("DCOptions[0] = %+v, want primary dc=%d at %s:%d", option, dc, ip, port)
 	}
 }
 
@@ -1283,8 +1287,12 @@ func TestTDesktopStartupRPCsEncode(t *testing.T) {
 		{name: "account.resetPassword", req: &tg.AccountResetPasswordRequest{}},
 		{name: "account.updateStatus", req: &tg.AccountUpdateStatusRequest{Offline: true}},
 		{name: "account.updateDeviceLocked", req: &tg.AccountUpdateDeviceLockedRequest{Period: 60}},
+		{name: "payments.canPurchaseStore", req: &tg.PaymentsCanPurchaseStoreRequest{Purpose: &tg.InputStorePaymentStarsTopup{Stars: 1000, Currency: "USD", Amount: 99}}},
 		{name: "payments.getStarsTopupOptions", req: &tg.PaymentsGetStarsTopupOptionsRequest{}},
+		{name: "payments.getStarsGiftOptions", req: &tg.PaymentsGetStarsGiftOptionsRequest{}},
+		{name: "payments.getStarsGiveawayOptions", req: &tg.PaymentsGetStarsGiveawayOptionsRequest{}},
 		{name: "payments.getStarsStatus", req: &tg.PaymentsGetStarsStatusRequest{Peer: &tg.InputPeerSelf{}}},
+		{name: "payments.getStarsSubscriptions", req: &tg.PaymentsGetStarsSubscriptionsRequest{Peer: &tg.InputPeerSelf{}}},
 		{name: "updates.getDifference", req: &tg.UpdatesGetDifferenceRequest{}},
 		{name: "users.getFullUser", req: &tg.UsersGetFullUserRequest{ID: &tg.InputUserSelf{}}},
 		{name: "users.getRequirementsToContact", req: &tg.UsersGetRequirementsToContactRequest{ID: []tg.InputUserClass{&tg.InputUserSelf{}}}},

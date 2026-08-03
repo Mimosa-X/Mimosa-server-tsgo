@@ -1264,9 +1264,15 @@ func TestBuildOutboxStoryUpdatesHydratesCompanionPeersWithStoriesMaxID(t *testin
 	if _, err := storyStore.UpsertStory(ctx, domain.UpsertStoryRequest{Story: story}); err != nil {
 		t.Fatalf("upsert story: %v", err)
 	}
+	registry := newFakeUsernameRegistry()
+	registry.byPeer[ownerPeer] = []domain.Username{
+		{Username: "story_owner", Editable: true, Active: true, SortOrder: 0},
+		{Username: "story_collectible", Active: true, SortOrder: 1, CollectibleID: 51},
+	}
 	r := New(Config{}, Deps{
-		Users:   appusers.NewService(userStore),
-		Stories: appstories.NewService(storyStore),
+		Users:     appusers.NewService(userStore),
+		Stories:   appstories.NewService(storyStore),
+		Usernames: registry,
 	}, zaptest.NewLogger(t), fixedClock{now: time.Unix(1700000300, 0)})
 
 	updates := r.BuildOutboxUpdates(ctx, []OutboxUpdateRequest{{
@@ -1290,7 +1296,13 @@ func TestBuildOutboxStoryUpdatesHydratesCompanionPeersWithStoriesMaxID(t *testin
 	if _, ok := updates[0].Updates[0].(*tg.UpdateStory); !ok {
 		t.Fatalf("first update = %T, want updateStory", updates[0].Updates[0])
 	}
-	assertUserStoryMaxID(t, findUserClass(updates[0].Users, owner.ID), 13)
+	ownerUser := findUserClass(updates[0].Users, owner.ID)
+	assertUserStoryMaxID(t, ownerUser, 13)
+	projectedOwner := ownerUser.(*tg.User)
+	assertVectorOnlyUsernames(t, "story owner", projectedOwner, []string{"story_owner", "story_collectible"})
+	if registry.peerCalls != 1 || registry.batchCalls != 0 {
+		t.Fatalf("username registry reads = peer %d / batch %d, want one claim-wide read", registry.peerCalls, registry.batchCalls)
+	}
 }
 
 func TestBuildOutboxNewStoryReactionHydratesReactorUser(t *testing.T) {

@@ -25,6 +25,8 @@ var inboundLayerDecodeLimits = tlprofile.Limits{
 }
 
 var errDefaultLayerAdmission = errors.New("selected layer profile rejected naked RPC")
+var errLayerRPCGZIPCapacity = errors.New("exact layer gzip admission capacity exhausted")
+var errLayerRPCAdmissionCapability = errors.New("exact layer RPC admission capability unavailable")
 
 const (
 	maxLayerRPCDependencyIDs = 128
@@ -40,6 +42,7 @@ const (
 	// 32-MiB per-connection budget and therefore remains admissible by default.
 	layerRPCAdmissionStaticObjectBytes = 512
 	layerRPCAdmissionWireFactor        = 60
+	layerRPCAdmissionFlatBytesFactor   = 2
 	layerRPCAdmissionGraphSlack        = layerRPCAdmissionStaticObjectBytes * 32
 )
 
@@ -59,7 +62,7 @@ type layerRPCProfileEvidence struct {
 
 // layerRPCAdmissionCursor is the wire-ordered, side-effect-free view used while
 // decoding one MTProto container. evidenceMsgID is the last explicit
-// invokeWithLayer proof, not merely the profile used by an arbitrary cached
+// invokeWithLayer proof, not merely the profile used by an arbitrary retained
 // request. It therefore advances only after generated admission reports
 // ProfileEvidence.
 type layerRPCAdmissionCursor struct {
@@ -162,14 +165,136 @@ func (s *Server) initialLayerRPCAdmissionCursor(ctx context.Context, c *Conn) (l
 // Saturation deliberately turns hostile integer-sized inputs into ordinary
 // capacity rejection; it must never wrap into a small accepted reservation.
 func layerRPCAdmissionReservationSize(wireBytes int) int {
+	return saturatingLayerRPCAdmissionCharge(
+		layerRPCAdmissionGraphSlack,
+		layerRPCAdmissionWireCharge(wireBytes),
+	)
+}
+
+func layerRPCAdmissionWireCharge(wireBytes int) int {
 	if wireBytes < 0 {
 		wireBytes = 0
 	}
 	maxInt := int(^uint(0) >> 1)
-	if wireBytes > (maxInt-layerRPCAdmissionGraphSlack)/layerRPCAdmissionWireFactor {
+	if wireBytes > maxInt/layerRPCAdmissionWireFactor {
 		return maxInt
 	}
-	return wireBytes*layerRPCAdmissionWireFactor + layerRPCAdmissionGraphSlack
+	return wireBytes * layerRPCAdmissionWireFactor
+}
+
+// layerRPCFlatBytesWireCharge keeps the generic factor on fixed TL wire and
+// applies a tight copy factor only to a payload which the production Router has
+// already proven to be one bounded flat bytes field. The temporary expanded
+// buffer remains independently owned by inboundFrameBudget while generated
+// admission materializes the request; 2x covers the retained bytes copy plus
+// allocator rounding without treating every payload byte as a possible nested
+// object/vector node. The per-request graph slack is owned by the base
+// reservation and must not be repeated for each nested gzip expansion.
+func layerRPCFlatBytesWireCharge(wireBytes, payloadBytes int) int {
+	if wireBytes < 0 || payloadBytes < 0 || payloadBytes > wireBytes {
+		return layerRPCAdmissionWireCharge(wireBytes)
+	}
+	fixedBytes := wireBytes - payloadBytes
+	maxInt := int(^uint(0) >> 1)
+	if fixedBytes > maxInt/layerRPCAdmissionWireFactor {
+		return maxInt
+	}
+	charge := fixedBytes * layerRPCAdmissionWireFactor
+	if payloadBytes > (maxInt-charge)/layerRPCAdmissionFlatBytesFactor {
+		return maxInt
+	}
+	return charge + payloadBytes*layerRPCAdmissionFlatBytesFactor
+}
+
+func saturatingLayerRPCAdmissionCharge(left, right int) int {
+	if left < 0 {
+		left = 0
+	}
+	if right < 0 {
+		right = 0
+	}
+	maxInt := int(^uint(0) >> 1)
+	if right > maxInt-left {
+		return maxInt
+	}
+	return left + right
+}
+
+func (s *Server) layerRPCExpandedWireCharge(wire []byte) int {
+	if s != nil {
+		if sizer, ok := s.layerRPC.(LayerRPCFlatBytesPayloadSizer); ok {
+			if payloadBytes, flat := sizer.LayerRPCFlatBytesPayloadSize(wire); flat && payloadBytes >= 0 && payloadBytes <= len(wire) {
+				return layerRPCFlatBytesWireCharge(len(wire), payloadBytes)
+			}
+		}
+	}
+	return layerRPCAdmissionWireCharge(len(wire))
+}
+
+// layerRPCGZIPExpansionBudget bridges transient process-wide expansion memory
+// to the durable scheduler charge of one exact typed request. The original
+// compressed wire retains the generic graph charge. Every successful expansion
+// adds its own charge; only a handler-proven flat bytes terminal can use the
+// tighter payload factor. An authoritative-profile re-decode reuses the largest
+// already-held charge instead of double-counting sequential attempts.
+type layerRPCGZIPExpansionBudget struct {
+	server                *Server
+	plan                  *inboundPlan
+	reservation           *inboundRPCBatchReservation
+	entry                 int
+	baseCharge            int
+	attemptExpandedCharge int
+	chargedSize           int
+}
+
+func (b *layerRPCGZIPExpansionBudget) beginAttempt() {
+	if b != nil {
+		b.attemptExpandedCharge = 0
+	}
+}
+
+func (b *layerRPCGZIPExpansionBudget) expand(wire []byte, admissionLimit int) ([]byte, func(), error) {
+	noop := func() {}
+	if b == nil || b.server == nil || b.plan == nil || b.reservation == nil {
+		return nil, noop, errors.New("invalid exact layer gzip expansion budget")
+	}
+	frameRemaining := maxDispatchExpandedBytes - b.plan.gzipExpandedBytes
+	limit := min(admissionLimit, frameRemaining)
+	if limit <= 0 {
+		return nil, noop, errors.Join(
+			errLayerRPCGZIPCapacity,
+			fmt.Errorf("cumulative gzip expansion reached %d bytes", maxDispatchExpandedBytes),
+		)
+	}
+	data, release, err := b.server.decodeGZIPWithGlobalBudgetLimit(&bin.Buffer{Buf: wire}, limit)
+	if err != nil {
+		if work := gzipExpansionWork(err); work > 0 {
+			b.plan.gzipExpandedBytes += work
+		}
+		if errors.Is(err, ErrInboundFrameBudgetExceeded) {
+			return nil, release, errors.Join(errLayerRPCGZIPCapacity, err)
+		}
+		if limit < admissionLimit && errors.Is(err, errGZIPExpansionLimit) {
+			return nil, release, errors.Join(errLayerRPCGZIPCapacity, err)
+		}
+		return nil, release, err
+	}
+	b.plan.gzipExpandedBytes += len(data)
+	b.attemptExpandedCharge = saturatingLayerRPCAdmissionCharge(
+		b.attemptExpandedCharge,
+		b.server.layerRPCExpandedWireCharge(data),
+	)
+	targetCharge := saturatingLayerRPCAdmissionCharge(b.baseCharge, b.attemptExpandedCharge)
+	if targetCharge > b.chargedSize {
+		if err := b.reservation.growEntry(b.entry, targetCharge); err != nil {
+			if errors.Is(err, ErrInboundRPCQueueFull) {
+				return nil, release, errors.Join(errLayerRPCGZIPCapacity, err)
+			}
+			return nil, release, err
+		}
+		b.chargedSize = targetCharge
+	}
+	return data, release, nil
 }
 
 // prepareInboundLayerRPCBatch is the production API path. The whole container
@@ -217,15 +342,40 @@ func (s *Server) prepareInboundLayerRPCBatch(ctx context.Context, c *Conn, plan 
 		return err
 	}
 	evidence := make([]layerRPCProfileEvidence, len(plan.items))
-	for _, index := range candidateItems {
+	decodeOptions := make([]tlprofile.AdmissionOptions, len(candidateItems))
+	expansionBudgets := make([]*layerRPCGZIPExpansionBudget, len(candidateItems))
+	materializationCapacity := false
+	for reservationIndex, index := range candidateItems {
 		item := &plan.items[index]
 		itemState := admissionCursor.state
 		existingProfile, existing := s.rpcResults.ExactAdmissionProfile(c.authKeyID, c.sessionID, item.msgID)
 		if existing {
 			itemState = LayerProfileSnapshot{Profile: existingProfile, Origin: LayerProfileExplicit}
 		}
-		admitted, method, err := s.decodeInboundLayerRPC(itemState, item.body)
+		expansionBudget := &layerRPCGZIPExpansionBudget{
+			server: s, plan: plan, reservation: reservation,
+			entry:       reservationIndex,
+			baseCharge:  provisionalSpecs[reservationIndex].size,
+			chargedSize: provisionalSpecs[reservationIndex].size,
+		}
+		expansionBudgets[reservationIndex] = expansionBudget
+		options := tlprofile.AdmissionOptions{
+			Limits:     inboundLayerDecodeLimits,
+			ExpandGZIP: expansionBudget.expand,
+		}
+		decodeOptions[reservationIndex] = options
+		admitted, method, err := s.decodeInboundLayerRPCWithOptions(itemState, item.body, options)
 		if err != nil {
+			if errors.Is(err, errLayerRPCGZIPCapacity) {
+				materializationCapacity = true
+				break
+			}
+			if errors.Is(err, ErrConnClosed) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			if errors.Is(err, errLayerRPCAdmissionCapability) {
+				return err
+			}
 			if terminal, recognized := wrappedDestroyAuthKeyTerminal(err); recognized {
 				if terminal.WireSize != bin.Word || !validWrappedDestroyAuthKeyChain(terminal) {
 					s.log.Debug("Wrapped destroy_auth_key terminal rejected",
@@ -251,16 +401,11 @@ func (s *Server) prepareInboundLayerRPCBatch(ctx context.Context, c *Conn, plan 
 			if errors.Is(err, ErrLayerProfileConflict) {
 				return err
 			}
-			s.log.Debug("RPC exact admission rejected",
-				zap.String("method", method),
-				zap.String("auth_key_id", c.authKeyHex),
-				zap.Int64("session_id", c.sessionID),
-				zap.Int64("msg_id", item.msgID),
-				zap.Error(err),
-			)
+			rpcError := layerRPCAdmissionError(err)
+			s.logLayerRPCAdmissionRejection(c, item, itemState, admissionCursor, method, rpcError, err)
 			item.kind = inboundItemRPCAdmissionError
 			item.method = method
-			item.payload = layerRPCAdmissionError(err)
+			item.payload = rpcError
 			c.metrics.InboundRPCDropped(method, "layer_admission")
 			continue
 		}
@@ -268,7 +413,7 @@ func (s *Server) prepareInboundLayerRPCBatch(ctx context.Context, c *Conn, plan 
 		item.method = method
 		if profile, hasEvidence := admitted.ProfileEvidence(); hasEvidence {
 			if existing && profile != existingProfile {
-				return fmt.Errorf("%w: cached msg_id %d used Layer %d but replay selected Layer %d", ErrLayerProfileConflict, item.msgID, existingProfile, profile)
+				return fmt.Errorf("%w: retained msg_id %d used Layer %d but replay selected Layer %d", ErrLayerProfileConflict, item.msgID, existingProfile, profile)
 			}
 			evidence[index] = layerRPCProfileEvidence{profile: profile, present: true, fresh: item.profileEvidenceFresh()}
 			if evidence[index].fresh {
@@ -277,6 +422,19 @@ func (s *Server) prepareInboundLayerRPCBatch(ctx context.Context, c *Conn, plan 
 				}
 			}
 		}
+	}
+	if materializationCapacity {
+		for _, index := range candidateItems {
+			item := &plan.items[index]
+			item.kind = inboundItemCapacityError
+			item.admitted = tlprofile.Admission{}
+			c.metrics.InboundRPCDropped(s.typeName(item.typeID), "materialization_capacity")
+		}
+		if err := reservation.retain(nil, nil); err != nil {
+			return err
+		}
+		plan.rpcReservation = nil
+		return nil
 	}
 
 	var indices []int
@@ -304,7 +462,16 @@ func (s *Server) prepareInboundLayerRPCBatch(ctx context.Context, c *Conn, plan 
 				item.admitted.Prepared().SemanticIdentity(),
 				item.admitted.Call().Identity(),
 			); candidate != nil {
-				claim, err := s.acquireAdmittedLayerRPC(c, item, &evidence[index])
+				claim, err := s.acquireAdmittedLayerRPC(
+					c, item, &evidence[index], decodeOptions[reservationIndex], expansionBudgets[reservationIndex],
+				)
+				if errors.Is(err, errLayerRPCGZIPCapacity) {
+					s.rpcRewrap.release(candidate)
+					c.metrics.InboundRPCDropped(candidate.method, "materialization_capacity")
+					flightCapacity = true
+					item.kind = inboundItemCapacityError
+					continue
+				}
 				if errors.Is(err, ErrRPCResultFlightCapacity) {
 					s.rpcRewrap.release(candidate)
 					c.metrics.InboundRPCDropped(candidate.method, "flight_capacity")
@@ -325,6 +492,10 @@ func (s *Server) prepareInboundLayerRPCBatch(ctx context.Context, c *Conn, plan 
 				}
 				switch claim.state {
 				case rpcResultAcquireCompleted:
+					// Transfer the materialization ticket to the plan before any
+					// profile-restore step can fail; plan.close is the universal abort
+					// path and sendReplayed releases it after outbound-budget handoff.
+					item.payload = claim.encoded
 					after, prepareErr := s.prepareAdmittedLayerRPCReplay(ctx, c, item.msgID, claim.admissionSeq, item.profileEvidenceFresh(), item.admitted)
 					if prepareErr != nil {
 						s.rpcRewrap.release(candidate)
@@ -332,10 +503,16 @@ func (s *Server) prepareInboundLayerRPCBatch(ctx context.Context, c *Conn, plan 
 					}
 					s.rpcRewrap.commit(candidate)
 					item.kind = inboundItemReplayRPC
-					item.payload = claim.encoded
 					if claim.executionKnown && claim.executionOK {
 						item.replayAfterSuccessfulDelivery = after
 					}
+				case rpcResultAcquireAcknowledged:
+					// Explicit ACK is terminal proof for this request msg_id. Keep
+					// exact admission metadata, retire the old rewrap candidate and
+					// make the duplicate ACK-only without replay side effects.
+					s.rpcRewrap.commit(candidate)
+					item.kind = inboundItemDuplicate
+					item.payload = nil
 				case rpcResultAcquirePending:
 					after, prepareErr := s.prepareAdmittedLayerRPCReplay(ctx, c, item.msgID, claim.admissionSeq, item.profileEvidenceFresh(), item.admitted)
 					if prepareErr != nil {
@@ -387,7 +564,15 @@ func (s *Server) prepareInboundLayerRPCBatch(ctx context.Context, c *Conn, plan 
 			clearedPostInitCandidates = true
 		}
 
-		claim, err := s.acquireAdmittedLayerRPC(c, item, &evidence[index])
+		claim, err := s.acquireAdmittedLayerRPC(
+			c, item, &evidence[index], decodeOptions[reservationIndex], expansionBudgets[reservationIndex],
+		)
+		if errors.Is(err, errLayerRPCGZIPCapacity) {
+			c.metrics.InboundRPCDropped(method, "materialization_capacity")
+			flightCapacity = true
+			item.kind = inboundItemCapacityError
+			continue
+		}
 		if errors.Is(err, ErrRPCResultFlightCapacity) {
 			c.metrics.InboundRPCDropped(method, "flight_capacity")
 			flightCapacity = true
@@ -406,15 +591,18 @@ func (s *Server) prepareInboundLayerRPCBatch(ctx context.Context, c *Conn, plan 
 		}
 		switch claim.state {
 		case rpcResultAcquireCompleted:
+			item.payload = claim.encoded
 			after, prepareErr := s.prepareAdmittedLayerRPCReplay(ctx, c, item.msgID, claim.admissionSeq, item.profileEvidenceFresh(), item.admitted)
 			if prepareErr != nil {
 				return prepareErr
 			}
 			item.kind = inboundItemReplayRPC
-			item.payload = claim.encoded
 			if claim.executionKnown && claim.executionOK {
 				item.replayAfterSuccessfulDelivery = after
 			}
+		case rpcResultAcquireAcknowledged:
+			item.kind = inboundItemDuplicate
+			item.payload = nil
 		case rpcResultAcquirePending:
 			if ownersInPlan[item.msgID] != nil {
 				item.kind = inboundItemDuplicate
@@ -624,6 +812,8 @@ func (s *Server) acquireAdmittedLayerRPC(
 	c *Conn,
 	item *inboundItem,
 	evidence *layerRPCProfileEvidence,
+	options tlprofile.AdmissionOptions,
+	expansionBudget *layerRPCGZIPExpansionBudget,
 ) (rpcResultAcquire, error) {
 	if s == nil || c == nil || item == nil {
 		return rpcResultAcquire{}, ErrRPCResultFlightInvalid
@@ -652,9 +842,17 @@ func (s *Server) acquireAdmittedLayerRPC(
 		// mutation, not an inherited-default race.
 		return rpcResultAcquire{}, err
 	}
-	redecoded, method, decodeErr := s.decodeInboundLayerRPC(
+	// Drop the losing typed graph before materializing its authoritative-profile
+	// replacement. The grown reservation therefore needs to cover the larger
+	// graph, not two simultaneous copies.
+	item.admitted = tlprofile.Admission{}
+	if expansionBudget != nil {
+		expansionBudget.beginAttempt()
+	}
+	redecoded, method, decodeErr := s.decodeInboundLayerRPCWithOptions(
 		LayerProfileSnapshot{Profile: winnerProfile, Origin: LayerProfileExplicit},
 		item.body,
+		options,
 	)
 	if decodeErr != nil {
 		return rpcResultAcquire{}, decodeErr
@@ -786,6 +984,14 @@ func layerRPCAdmissionHasExplicitSelector(body []byte, admissionErr error) bool 
 // evidence only after the full request identity has acquired an owner (or a
 // genuine new-msg_id rewrap alias).
 func (s *Server) decodeInboundLayerRPC(state LayerProfileSnapshot, body []byte) (tlprofile.Admission, string, error) {
+	return s.decodeInboundLayerRPCWithLimits(state, body, inboundLayerDecodeLimits)
+}
+
+func (s *Server) decodeInboundLayerRPCWithLimits(state LayerProfileSnapshot, body []byte, limits tlprofile.Limits) (tlprofile.Admission, string, error) {
+	return s.decodeInboundLayerRPCWithOptions(state, body, tlprofile.AdmissionOptions{Limits: limits})
+}
+
+func (s *Server) decodeInboundLayerRPCWithOptions(state LayerProfileSnapshot, body []byte, options tlprofile.AdmissionOptions) (tlprofile.Admission, string, error) {
 	if s == nil || s.layerRPC == nil || len(body) < bin.Word {
 		return tlprofile.Admission{}, "unknown", fmt.Errorf("invalid exact RPC admission input")
 	}
@@ -795,15 +1001,30 @@ func (s *Server) decodeInboundLayerRPC(state LayerProfileSnapshot, body []byte) 
 		err     error
 	)
 	if state.Origin != LayerProfileUnknown {
-		if admitter, ok := s.layerRPC.(LayerRPCDefaultProfileAdmitter); ok {
-			request, err = admitter.AdmitDefaultLayer(state.Profile, b, inboundLayerDecodeLimits)
+		if admitter, ok := s.layerRPC.(LayerRPCDefaultProfileOptionsAdmitter); ok {
+			request, err = admitter.AdmitDefaultLayerWithOptions(state.Profile, b, options)
+		} else if admitter, ok := s.layerRPC.(LayerRPCDefaultProfileAdmitter); ok {
+			// Preserve the stable pre-options capability first: unlike strict
+			// exact admission, default admission lets an explicit invokeWithLayer
+			// correct inherited or restored profile evidence.
+			request, err = admitter.AdmitDefaultLayer(state.Profile, b, options.Limits)
+		} else if admitter, ok := s.layerRPC.(LayerRPCOptionsAdmitter); ok {
+			request, err = admitter.AdmitLayerWithOptions(state.Profile, b, options)
 		} else {
-			// Compatibility fallback for old package tests/mocks. Production Router
-			// implements default admission so explicit invokeWithLayer can correct.
-			request, err = s.layerRPC.AdmitLayer(state.Profile, b, inboundLayerDecodeLimits)
+			request, err = s.layerRPC.AdmitLayer(state.Profile, b, options.Limits)
 		}
+	} else if admitter, ok := s.layerRPC.(LayerRPCOptionsAdmitter); ok {
+		request, err = admitter.AdmitUnprofiledWithOptions(b, options)
 	} else {
-		request, err = s.layerRPC.AdmitUnprofiled(b, inboundLayerDecodeLimits)
+		request, err = s.layerRPC.AdmitUnprofiled(b, options.Limits)
+	}
+	if err != nil && options.ExpandGZIP != nil && errors.Is(err, tlprofile.ErrGZIPExpanderMissing) {
+		// A handler compiled against the stable Limits-only boundary remains
+		// valid for plain requests. Encountering gzip_packed without the optional
+		// capability is instead a server wiring/programming error: returning the
+		// generated error as INPUT_REQUEST_INVALID would silently blame a valid
+		// client envelope and make recovery impossible.
+		err = fmt.Errorf("%w: handler cannot use caller-owned bounded gzip expansion: %w", errLayerRPCAdmissionCapability, err)
 	}
 	method := "unknown"
 	if err == nil {
@@ -847,6 +1068,10 @@ func (s *Server) decodeInboundLayerRPC(state LayerProfileSnapshot, body []byte) 
 			method = s.typeName(codecErr.WireID)
 		}
 	}
+	var unknownTerminal *tlprofile.UnknownTerminalError
+	if errors.As(err, &unknownTerminal) && unknownTerminal.WireID != 0 {
+		method = s.typeName(unknownTerminal.WireID)
+	}
 	if errors.Is(err, tlprofile.ErrUnknownRPCMethod) && s.log != nil {
 		if terminal, recognized := wrappedDestroyAuthKeyTerminal(err); recognized {
 			method = "destroy_auth_key"
@@ -867,7 +1092,7 @@ func (s *Server) decodeInboundLayerRPC(state LayerProfileSnapshot, body []byte) 
 // commitLayerProfileEvidence publishes one generated invokeWithLayer proof.
 // The exact-session registry is the cross-physical-connection linearization
 // point; the Conn cursor then prevents a concurrent older admission from
-// overwriting its local wire epoch. Older cached duplicates remain decodable
+// overwriting its local wire epoch. Older retained duplicates remain decodable
 // and request-bound, but cannot mutate session/profile state.
 func (s *Server) commitLayerProfileEvidence(ctx context.Context, c *Conn, profile tlprofile.Profile, msgID int64) (bool, error) {
 	if s == nil || c == nil {
@@ -992,6 +1217,63 @@ func layerRPCAdmissionError(err error) *mt.RPCError {
 		return &mt.RPCError{ErrorCode: 501, ErrorMessage: "NOT_IMPLEMENTED"}
 	}
 	return &mt.RPCError{ErrorCode: 400, ErrorMessage: "INPUT_REQUEST_INVALID"}
+}
+
+// logLayerRPCAdmissionRejection preserves one production-visible diagnostic for
+// an otherwise generic RPC 400 without exposing the request body. The INFO path
+// is one-shot per physical Conn; compatibility-traced unknown RPCs already have
+// their own warning and therefore do not consume this diagnostic slot.
+func (s *Server) logLayerRPCAdmissionRejection(
+	c *Conn,
+	item *inboundItem,
+	state LayerProfileSnapshot,
+	cursor layerRPCAdmissionCursor,
+	method string,
+	rpcError *mt.RPCError,
+	admissionErr error,
+) {
+	if s == nil || s.log == nil || c == nil || item == nil || rpcError == nil {
+		return
+	}
+	wireID := item.typeID
+	if wireID == 0 {
+		if id, err := (&bin.Buffer{Buf: item.body}).PeekID(); err == nil {
+			wireID = id
+		}
+	}
+	fields := []zap.Field{
+		zap.String("method", method),
+		zap.String("auth_key_id", c.authKeyHex),
+		zap.Int64("session_id", c.sessionID),
+		zap.Int64("msg_id", item.msgID),
+		zap.Uint32("top_level_wire_id", wireID),
+		zap.Int("wire_bytes", len(item.body)),
+		zap.Int("selected_profile", int(state.Profile)),
+		zap.String("profile_origin", layerProfileOriginLogName(state.Origin)),
+		zap.Uint32("profile_epoch", state.Epoch),
+		zap.Int("raw_layer_evidence", cursor.rawLayer),
+		zap.Int64("layer_evidence_msg_id", cursor.evidenceMsgID),
+		zap.Bool("explicit_layer_selector", layerRPCAdmissionHasExplicitSelector(item.body, admissionErr)),
+		zap.Int("rpc_error_code", rpcError.ErrorCode),
+		zap.String("rpc_error_message", rpcError.ErrorMessage),
+		zap.Error(admissionErr),
+	}
+	if !errors.Is(admissionErr, tlprofile.ErrUnknownRPCMethod) && c.layerRPCAdmissionTraceLogged.CompareAndSwap(false, true) {
+		s.log.Info("RPC exact admission rejected", fields...)
+		return
+	}
+	s.log.Debug("RPC exact admission rejected", fields...)
+}
+
+func layerProfileOriginLogName(origin LayerProfileOrigin) string {
+	switch origin {
+	case LayerProfileInherited:
+		return "inherited"
+	case LayerProfileExplicit:
+		return "explicit"
+	default:
+		return "unknown"
+	}
 }
 
 func (s *Server) layerRPCDependencies(c *Conn, msgID int64, request tlprofile.Admission) layerRPCDependencySet {

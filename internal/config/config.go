@@ -60,15 +60,13 @@ type Config struct {
 	MTProtoRPCGlobalWorkers  int
 	MTProtoRPCGlobalMaxTasks int
 	MTProtoRPCGlobalMaxBytes int64
-	// Pending ownership and completed rpc_result replay state share a three-level
-	// global/raw-auth/session budget over the full MTProto duplicate horizon.
-	MTProtoRPCResultCacheMaxEntries        int
-	MTProtoRPCResultCacheMaxBytes          int64
-	MTProtoRPCResultCacheAuthMaxEntries    int
-	MTProtoRPCResultCacheAuthMaxBytes      int64
-	MTProtoRPCResultCacheSessionMaxEntries int
-	MTProtoRPCResultCacheSessionMaxBytes   int64
-	MTProtoRPCResultPendingPerAuth         int
+	// Pending ownership and compact completed receipts share three-level
+	// global/raw-auth/session entry accounting. Result bodies are never cached
+	// here; the logical-session outbox owns unacknowledged wire bytes.
+	MTProtoRPCExecutionMaxEntries        int
+	MTProtoRPCExecutionAuthMaxEntries    int
+	MTProtoRPCExecutionSessionMaxEntries int
+	MTProtoRPCExecutionPendingPerAuth    int
 	// MTProtoInboundFrameGlobalMaxBytes 是 transport wire + 最大解密 plaintext 的
 	// 进程级在途预算；frame 长度读出后、payload 分配前预留。
 	MTProtoInboundFrameGlobalMaxBytes int64
@@ -571,6 +569,9 @@ func Load() (Config, error) {
 	envInt64Or := fileEnv.envInt64Or
 	envDurationOr := fileEnv.envDurationOr
 	envAllowEmptyOr := fileEnv.envAllowEmptyOr
+	if err := validateStrictMTProtoCapacityEnv(fileEnv); err != nil {
+		return Config{}, err
+	}
 
 	publicBaseURL, err := links.ValidateBaseURL(envOr("TELESRV_PUBLIC_BASE_URL", links.DefaultPublicBaseURL))
 	if err != nil {
@@ -596,6 +597,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("TELESRV_DEFAULT_COUNTRY_CODE: %w", err)
 	}
+	advertiseIP, err := normalizeAdvertiseIP(envOr("TELESRV_ADVERTISE_IP", "127.0.0.1"))
+	if err != nil {
+		return Config{}, fmt.Errorf("TELESRV_ADVERTISE_IP: %w", err)
+	}
 	// The composite rating weight defaults are the domain formula's own defaults;
 	// see RatingWeight* below.
 	defaultRatingWeights := domain.DefaultAccountRatingWeights()
@@ -611,34 +616,28 @@ func Load() (Config, error) {
 			"http://localhost:1234",
 			"http://127.0.0.1:1234",
 		}),
-		// AdvertiseIP 当前不影响 help.getConfig——getConfig 返回空 DCOptions，
-		// 客户端使用其写死的 static DC 地址（见 compat/tdesktop/config.go）。
-		// 字段与默认值保留，供未来需要显式下发 DC 地址时使用。
-		AdvertiseIP:                         envOr("TELESRV_ADVERTISE_IP", "127.0.0.1"),
-		RSAKeyPath:                          envOr("TELESRV_RSA_KEY", "data/server_rsa.pem"),
-		DC:                                  envIntOr("TELESRV_DC", 2),
-		DefaultCountryCode:                  countryCode,
-		StrictDCCheck:                       envBoolOr("TELESRV_STRICT_DC_CHECK", false),
-		MTProtoMaxConnections:               envIntOr("TELESRV_MTPROTO_MAX_CONNECTIONS", 200000),
-		MTProtoMaxConnectionsPerIP:          envIntOr("TELESRV_MTPROTO_MAX_CONNECTIONS_PER_IP", 4096),
-		MTProtoMaxConcurrentHandshakes:      envIntOr("TELESRV_MTPROTO_MAX_CONCURRENT_HANDSHAKES", 256),
-		MTProtoRPCMaxInflight:               envIntOr("TELESRV_MTPROTO_RPC_MAX_INFLIGHT", 32),
-		MTProtoRPCQueueSize:                 envIntOr("TELESRV_MTPROTO_RPC_QUEUE_SIZE", 64),
-		MTProtoRPCTimeout:                   envDurationOr("TELESRV_MTPROTO_RPC_TIMEOUT", 30*time.Second),
-		MTProtoRPCGlobalWorkers:             envIntOr("TELESRV_MTPROTO_RPC_GLOBAL_WORKERS", 256),
-		MTProtoRPCGlobalMaxTasks:            envIntOr("TELESRV_MTPROTO_RPC_GLOBAL_MAX_TASKS", 8192),
-		MTProtoRPCGlobalMaxBytes:            envInt64Or("TELESRV_MTPROTO_RPC_GLOBAL_MAX_BYTES", 512<<20),
-		MTProtoRPCResultCacheMaxEntries:     envIntOr("TELESRV_MTPROTO_RPC_RESULT_CACHE_MAX_ENTRIES", 1<<18),
-		MTProtoRPCResultCacheMaxBytes:       envInt64Or("TELESRV_MTPROTO_RPC_RESULT_CACHE_MAX_BYTES", 64<<20),
-		MTProtoRPCResultCacheAuthMaxEntries: envIntOr("TELESRV_MTPROTO_RPC_RESULT_CACHE_AUTH_MAX_ENTRIES", 1<<15),
-		MTProtoRPCResultCacheAuthMaxBytes:   envInt64Or("TELESRV_MTPROTO_RPC_RESULT_CACHE_AUTH_MAX_BYTES", 32<<20),
-		MTProtoRPCResultCacheSessionMaxEntries: envIntOr(
-			"TELESRV_MTPROTO_RPC_RESULT_CACHE_SESSION_MAX_ENTRIES", 1<<14,
+		// help.getConfig 必须下发至少一个可重连的主 DC 地址；远端部署不能
+		// 沿用 loopback 默认值，需显式设置客户端实际可达的 IP。
+		AdvertiseIP:                       advertiseIP,
+		RSAKeyPath:                        envOr("TELESRV_RSA_KEY", "data/server_rsa.pem"),
+		DC:                                envIntOr("TELESRV_DC", 2),
+		DefaultCountryCode:                countryCode,
+		StrictDCCheck:                     envBoolOr("TELESRV_STRICT_DC_CHECK", false),
+		MTProtoMaxConnections:             envIntOr("TELESRV_MTPROTO_MAX_CONNECTIONS", 200000),
+		MTProtoMaxConnectionsPerIP:        envIntOr("TELESRV_MTPROTO_MAX_CONNECTIONS_PER_IP", 4096),
+		MTProtoMaxConcurrentHandshakes:    envIntOr("TELESRV_MTPROTO_MAX_CONCURRENT_HANDSHAKES", 256),
+		MTProtoRPCMaxInflight:             envIntOr("TELESRV_MTPROTO_RPC_MAX_INFLIGHT", 32),
+		MTProtoRPCQueueSize:               envIntOr("TELESRV_MTPROTO_RPC_QUEUE_SIZE", 64),
+		MTProtoRPCTimeout:                 envDurationOr("TELESRV_MTPROTO_RPC_TIMEOUT", 30*time.Second),
+		MTProtoRPCGlobalWorkers:           envIntOr("TELESRV_MTPROTO_RPC_GLOBAL_WORKERS", 256),
+		MTProtoRPCGlobalMaxTasks:          envIntOr("TELESRV_MTPROTO_RPC_GLOBAL_MAX_TASKS", 8192),
+		MTProtoRPCGlobalMaxBytes:          envInt64Or("TELESRV_MTPROTO_RPC_GLOBAL_MAX_BYTES", 512<<20),
+		MTProtoRPCExecutionMaxEntries:     envIntOr("TELESRV_MTPROTO_RPC_EXECUTION_MAX_ENTRIES", 1<<18),
+		MTProtoRPCExecutionAuthMaxEntries: envIntOr("TELESRV_MTPROTO_RPC_EXECUTION_AUTH_MAX_ENTRIES", 1<<15),
+		MTProtoRPCExecutionSessionMaxEntries: envIntOr(
+			"TELESRV_MTPROTO_RPC_EXECUTION_SESSION_MAX_ENTRIES", 1<<14,
 		),
-		MTProtoRPCResultCacheSessionMaxBytes: envInt64Or(
-			"TELESRV_MTPROTO_RPC_RESULT_CACHE_SESSION_MAX_BYTES", 16<<20,
-		),
-		MTProtoRPCResultPendingPerAuth:       envIntOr("TELESRV_MTPROTO_RPC_RESULT_PENDING_PER_AUTH", 1<<11),
+		MTProtoRPCExecutionPendingPerAuth:    envIntOr("TELESRV_MTPROTO_RPC_EXECUTION_PENDING_PER_AUTH", 1<<11),
 		MTProtoInboundFrameGlobalMaxBytes:    envInt64Or("TELESRV_MTPROTO_INBOUND_FRAME_GLOBAL_MAX_BYTES", 512<<20),
 		MTProtoOutboundQueueSize:             envIntOr("TELESRV_MTPROTO_OUTBOUND_QUEUE_SIZE", 128),
 		MTProtoOutboundControlQueueSize:      envIntOr("TELESRV_MTPROTO_OUTBOUND_CONTROL_QUEUE_SIZE", 32),
@@ -864,7 +863,7 @@ func Load() (Config, error) {
 	if err := validateLoginEmailConfig(cfg); err != nil {
 		return Config{}, err
 	}
-	if err := validateRPCResultCacheConfig(cfg); err != nil {
+	if err := validateRPCExecutionConfig(cfg); err != nil {
 		return Config{}, err
 	}
 	if err := validateStarGiftConfig(cfg); err != nil {
@@ -898,6 +897,18 @@ func normalizeDefaultCountryCode(raw string) (string, error) {
 		return "", fmt.Errorf("must identify a country or autonomous area")
 	}
 	return region.String(), nil
+}
+
+func normalizeAdvertiseIP(raw string) (string, error) {
+	addr, err := netip.ParseAddr(strings.TrimSpace(raw))
+	if err != nil {
+		return "", fmt.Errorf("must be an IPv4 or IPv6 address: %w", err)
+	}
+	addr = addr.Unmap()
+	if addr.IsUnspecified() || addr.IsMulticast() || addr.Zone() != "" {
+		return "", fmt.Errorf("must be a unicast address usable by clients")
+	}
+	return addr.String(), nil
 }
 
 func validateTelegramLoginConfig(cfg Config) error {
@@ -1211,35 +1222,21 @@ func validateCollectibleUsernameConfig(cfg Config) error {
 	return nil
 }
 
-const mtProtoRPCResultMinBytes = int64((1 << 24) - (2 << 10))
-
-func validateRPCResultCacheConfig(cfg Config) error {
-	if cfg.MTProtoRPCResultCacheMaxEntries <= 0 || cfg.MTProtoRPCResultCacheAuthMaxEntries <= 0 ||
-		cfg.MTProtoRPCResultCacheSessionMaxEntries <= 0 {
-		return fmt.Errorf("MTProto rpc_result entry limits must be positive")
+func validateRPCExecutionConfig(cfg Config) error {
+	if cfg.MTProtoRPCExecutionMaxEntries <= 0 || cfg.MTProtoRPCExecutionAuthMaxEntries <= 0 ||
+		cfg.MTProtoRPCExecutionSessionMaxEntries <= 0 {
+		return fmt.Errorf("MTProto rpc execution entry limits must be positive")
 	}
-	if cfg.MTProtoRPCResultCacheMaxEntries < cfg.MTProtoRPCResultCacheAuthMaxEntries ||
-		cfg.MTProtoRPCResultCacheAuthMaxEntries < cfg.MTProtoRPCResultCacheSessionMaxEntries {
-		return fmt.Errorf("MTProto rpc_result entry hierarchy must satisfy global >= auth >= session: %d/%d/%d",
-			cfg.MTProtoRPCResultCacheMaxEntries, cfg.MTProtoRPCResultCacheAuthMaxEntries, cfg.MTProtoRPCResultCacheSessionMaxEntries)
+	if cfg.MTProtoRPCExecutionMaxEntries < cfg.MTProtoRPCExecutionAuthMaxEntries ||
+		cfg.MTProtoRPCExecutionAuthMaxEntries < cfg.MTProtoRPCExecutionSessionMaxEntries {
+		return fmt.Errorf("MTProto rpc execution entry hierarchy must satisfy global >= auth >= session: %d/%d/%d",
+			cfg.MTProtoRPCExecutionMaxEntries, cfg.MTProtoRPCExecutionAuthMaxEntries, cfg.MTProtoRPCExecutionSessionMaxEntries)
 	}
-	if cfg.MTProtoRPCResultCacheMaxBytes < mtProtoRPCResultMinBytes ||
-		cfg.MTProtoRPCResultCacheAuthMaxBytes < mtProtoRPCResultMinBytes ||
-		cfg.MTProtoRPCResultCacheSessionMaxBytes < mtProtoRPCResultMinBytes {
-		return fmt.Errorf("MTProto rpc_result byte limits must each be at least %d: %d/%d/%d",
-			mtProtoRPCResultMinBytes, cfg.MTProtoRPCResultCacheMaxBytes,
-			cfg.MTProtoRPCResultCacheAuthMaxBytes, cfg.MTProtoRPCResultCacheSessionMaxBytes)
-	}
-	if cfg.MTProtoRPCResultCacheMaxBytes < cfg.MTProtoRPCResultCacheAuthMaxBytes ||
-		cfg.MTProtoRPCResultCacheAuthMaxBytes < cfg.MTProtoRPCResultCacheSessionMaxBytes {
-		return fmt.Errorf("MTProto rpc_result byte hierarchy must satisfy global >= auth >= session: %d/%d/%d",
-			cfg.MTProtoRPCResultCacheMaxBytes, cfg.MTProtoRPCResultCacheAuthMaxBytes, cfg.MTProtoRPCResultCacheSessionMaxBytes)
-	}
-	if cfg.MTProtoRPCGlobalMaxTasks <= 0 || cfg.MTProtoRPCResultPendingPerAuth <= 0 ||
-		cfg.MTProtoRPCResultPendingPerAuth > cfg.MTProtoRPCGlobalMaxTasks ||
-		cfg.MTProtoRPCResultPendingPerAuth > cfg.MTProtoRPCResultCacheAuthMaxEntries {
-		return fmt.Errorf("MTProto rpc_result pending-per-auth %d must be positive and <= global pending %d and auth entries %d",
-			cfg.MTProtoRPCResultPendingPerAuth, cfg.MTProtoRPCGlobalMaxTasks, cfg.MTProtoRPCResultCacheAuthMaxEntries)
+	if cfg.MTProtoRPCGlobalMaxTasks <= 0 || cfg.MTProtoRPCExecutionPendingPerAuth <= 0 ||
+		cfg.MTProtoRPCExecutionPendingPerAuth > cfg.MTProtoRPCGlobalMaxTasks ||
+		cfg.MTProtoRPCExecutionPendingPerAuth > cfg.MTProtoRPCExecutionAuthMaxEntries {
+		return fmt.Errorf("MTProto rpc execution pending-per-auth %d must be positive and <= global pending %d and auth entries %d",
+			cfg.MTProtoRPCExecutionPendingPerAuth, cfg.MTProtoRPCGlobalMaxTasks, cfg.MTProtoRPCExecutionAuthMaxEntries)
 	}
 	return nil
 }
@@ -1523,6 +1520,43 @@ func (e envSource) envIntOr(key string, def int) int {
 		}
 	}
 	return def
+}
+
+func validateStrictMTProtoCapacityEnv(e envSource) error {
+	for _, key := range []string{
+		"TELESRV_MTPROTO_MAX_CONNECTIONS",
+		"TELESRV_MTPROTO_MAX_CONNECTIONS_PER_IP",
+		"TELESRV_MTPROTO_MAX_CONCURRENT_HANDSHAKES",
+		"TELESRV_MTPROTO_RPC_MAX_INFLIGHT",
+		"TELESRV_MTPROTO_RPC_QUEUE_SIZE",
+		"TELESRV_MTPROTO_RPC_GLOBAL_WORKERS",
+		"TELESRV_MTPROTO_RPC_GLOBAL_MAX_TASKS",
+		"TELESRV_MTPROTO_RPC_EXECUTION_MAX_ENTRIES",
+		"TELESRV_MTPROTO_RPC_EXECUTION_AUTH_MAX_ENTRIES",
+		"TELESRV_MTPROTO_RPC_EXECUTION_SESSION_MAX_ENTRIES",
+		"TELESRV_MTPROTO_RPC_EXECUTION_PENDING_PER_AUTH",
+		"TELESRV_MTPROTO_OUTBOUND_QUEUE_SIZE",
+		"TELESRV_MTPROTO_OUTBOUND_CONTROL_QUEUE_SIZE",
+	} {
+		if raw := e.envOr(key, ""); raw != "" {
+			if _, err := strconv.Atoi(raw); err != nil {
+				return fmt.Errorf("%s must be a base-10 integer: %w", key, err)
+			}
+		}
+	}
+	for _, key := range []string{
+		"TELESRV_MTPROTO_RPC_GLOBAL_MAX_BYTES",
+		"TELESRV_MTPROTO_INBOUND_FRAME_GLOBAL_MAX_BYTES",
+		"TELESRV_MTPROTO_OUTBOUND_TRACKED_GLOBAL_MAX_BYTES",
+		"TELESRV_MTPROTO_OUTBOUND_WRITE_GLOBAL_MAX_BYTES",
+	} {
+		if raw := e.envOr(key, ""); raw != "" {
+			if _, err := strconv.ParseInt(raw, 10, 64); err != nil {
+				return fmt.Errorf("%s must be a base-10 int64: %w", key, err)
+			}
+		}
+	}
+	return nil
 }
 
 func (e envSource) envInt64Or(key string, def int64) int64 {

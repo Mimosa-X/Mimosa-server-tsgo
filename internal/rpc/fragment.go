@@ -255,6 +255,57 @@ func (r *Router) applyUsernamesToPeerObjects(ctx context.Context, users []tg.Use
 	}
 	peers := make([]domain.Peer, 0, len(users)+len(chats))
 	seen := make(map[domain.Peer]struct{}, len(users)+len(chats))
+	peers = appendUsernameProjectionPeers(peers, seen, users, chats)
+	if len(peers) == 0 {
+		return
+	}
+	byPeer := r.usernameRegistryMap(ctx, peers)
+	if len(byPeer) == 0 {
+		return
+	}
+	applyUsernamesFromRegistry(users, chats, byPeer)
+}
+
+// applyUsernamesToUpdatesBatch projects one username-registry snapshot over a
+// whole outbox claim. A claim may contain repeated peer objects for several
+// events and viewers; collecting the peer union first keeps the hot path at one
+// registry round trip rather than one read per event or online session.
+func (r *Router) applyUsernamesToUpdatesBatch(ctx context.Context, updates []*tg.Updates) {
+	if r.deps.Usernames == nil || len(updates) == 0 {
+		return
+	}
+	peerCapacity := 0
+	for _, update := range updates {
+		if update != nil {
+			peerCapacity += len(update.Users) + len(update.Chats)
+		}
+	}
+	if peerCapacity == 0 {
+		return
+	}
+	peers := make([]domain.Peer, 0, peerCapacity)
+	seen := make(map[domain.Peer]struct{}, peerCapacity)
+	for _, update := range updates {
+		if update == nil {
+			continue
+		}
+		peers = appendUsernameProjectionPeers(peers, seen, update.Users, update.Chats)
+	}
+	if len(peers) == 0 {
+		return
+	}
+	byPeer := r.usernameRegistryMap(ctx, peers)
+	if len(byPeer) == 0 {
+		return
+	}
+	for _, update := range updates {
+		if update != nil {
+			applyUsernamesFromRegistry(update.Users, update.Chats, byPeer)
+		}
+	}
+}
+
+func appendUsernameProjectionPeers(peers []domain.Peer, seen map[domain.Peer]struct{}, users []tg.UserClass, chats []tg.ChatClass) []domain.Peer {
 	addPeer := func(peer domain.Peer) {
 		if peer.ID == 0 {
 			return
@@ -275,14 +326,7 @@ func (r *Router) applyUsernamesToPeerObjects(ctx context.Context, users []tg.Use
 			addPeer(domain.Peer{Type: domain.PeerTypeChannel, ID: ch.ID})
 		}
 	}
-	if len(peers) == 0 {
-		return
-	}
-	byPeer := r.usernameRegistryMap(ctx, peers)
-	if len(byPeer) == 0 {
-		return
-	}
-	applyUsernamesFromRegistry(users, chats, byPeer)
+	return peers
 }
 
 // applyUsernamesFromRegistry applies a previously loaded registry snapshot.
@@ -302,16 +346,12 @@ func applyUsernamesFromRegistry(users []tg.UserClass, chats []tg.ChatClass, byPe
 			continue
 		}
 		if vector := tgUsernamesFromRegistry(list, u.Username); len(vector) > 0 {
-			// Layer 228 defines username as the main active username, not as a
-			// legacy alternative to usernames. TDesktop seeds its local search
-			// index from this scalar before consuming the complete vector, so
-			// both fields must be projected together.
-			if primary := domain.ActiveUsername(list); primary != "" {
-				u.SetUsername(primary)
-			} else {
-				u.Flags.Unset(3)
-				u.Username = ""
-			}
+			// Official clients treat the legacy scalar and the complete vector as
+			// alternative representations. TDLib rejects a User carrying both and
+			// discards the complete username set, while TDesktop and DrKLO derive
+			// the primary username from the first active vector entry.
+			u.Flags.Unset(3)
+			u.Username = ""
 			u.SetUsernames(vector)
 		}
 	}
@@ -328,12 +368,8 @@ func applyUsernamesFromRegistry(users []tg.UserClass, chats []tg.ChatClass, byPe
 		// when unset, which is exactly the fallback tgUsernamesFromRegistry wants.
 		scalar, _ := ch.GetUsername()
 		if vector := tgUsernamesFromRegistry(list, scalar); len(vector) > 0 {
-			if primary := domain.ActiveUsername(list); primary != "" {
-				ch.SetUsername(primary)
-			} else {
-				ch.Flags.Unset(6)
-				ch.Username = ""
-			}
+			ch.Flags.Unset(6)
+			ch.Username = ""
 			ch.SetUsernames(vector)
 		}
 	}

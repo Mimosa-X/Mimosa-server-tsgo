@@ -108,6 +108,9 @@ type Conn struct {
 	outboundControlBudgetOnce    sync.Once
 	outboundScratchPool          *outboundScratchPool
 	outboundScratchOnce          sync.Once
+	// outboundState outlives this physical Conn generation. A replacement
+	// physical connection for the same auth key/session reuses it.
+	outboundState *outboundState
 	// lifecycle is the sole monotonic activation/retirement state machine.
 	// retired never transitions back to claiming/active; one atomic state avoids
 	// contradictory activation and shutdown observations.
@@ -130,7 +133,7 @@ type Conn struct {
 	rpcReady         bool
 	rpcClosed        bool
 	// rpcReplayRestores is a per-physical-connection ordering barrier. An exact
-	// cached/rewrapped init request has already executed its business handler,
+	// replayed/rewrapped init request has already executed its business handler,
 	// but its wrapper/client/readiness state becomes authoritative only after the
 	// replacement rpc_result is physically written. Queued naked RPCs remain
 	// admitted and budgeted, but are not scheduler-runnable until every such
@@ -139,6 +142,11 @@ type Conn struct {
 	// Rewrap aliasing never delays execution. initialized stops collecting
 	// candidates after the first valid init wrapper on this physical generation.
 	rpcRewrapInitialized atomic.Bool
+	// layerRPCAdmissionTraceLogged bounds production INFO diagnostics to the
+	// first non-unknown exact-admission rejection on this physical generation.
+	// Repeated malformed requests remain visible at Debug without turning an
+	// authenticated reconnect/session into an unbounded INFO log source.
+	layerRPCAdmissionTraceLogged atomic.Bool
 	// rpcResultAcked is invoked by the sole outbound actor after it resolves an
 	// acknowledged server frame back to the rpc_result request msg_id.
 	rpcResultAcked func(*Conn, int64)
@@ -150,7 +158,8 @@ type Conn struct {
 	rpcRootCtx     context.Context
 	rpcMaxInflight int
 
-	// sentContentMessages 只由 outbound actor 访问，用于生成 MTProto seq_no。
+	// sentContentMessages is retained only for standalone construction tests.
+	// Server connections allocate seq_no from logical-session outboundState.
 	sentContentMessages int32
 	// outboundRand 只由 outbound actor 访问：对 cipher 随机源的缓冲预读，
 	// 把每帧 padding 的 getrandom syscall 摊薄成 ~1KiB 一次。
