@@ -19,7 +19,7 @@
 | 参数 | 类型 / 代码默认值 | 说明与约束 |
 |---|---|---|
 | `TELESRV_LISTEN` | string / `0.0.0.0:2398` | MTProto TCP 监听地址，必须与 patched 客户端可达地址/端口一致。 |
-| `TELESRV_ADVERTISE_IP` | string / `127.0.0.1` | 媒体、通话等回退路径使用的客户端可达 IP；当前 TDesktop 静态 DC patch 不从这里获取 MTProto 地址。 |
+| `TELESRV_ADVERTISE_IP` | string / `127.0.0.1` | 写入 `help.getConfig.DCOptions`、媒体与通话回退路径的客户端可达 IP。默认 loopback 只适合纯本机 TDesktop；Android、局域网或远端验证必须显式设为宿主机 LAN IP/公网 IP。Windows 本地重启优先用 `scripts\restart-local-server.ps1 -Listen 0.0.0.0:2398 -AdvertiseIP <client-reachable-ip>`，避免手动 `Start-Process` 漏掉环境变量。 |
 | `TELESRV_RSA_KEY` | path / `data/server_rsa.pem` | MTProto RSA 私钥；缺失时自动生成。属于敏感文件，重启和升级间必须稳定保存。 |
 | `TELESRV_DC` | int / `2` | 服务端输出配置及媒体/DC 元数据使用的规范 DC ID；当前单后端不会按它分区密钥交换状态。 |
 | `TELESRV_DEFAULT_COUNTRY_CODE` | ISO alpha-2 / `CN` | `help.getNearestDc` 返回的登录页默认国家。客户端把 `CN` 映射为国际区号 `+86`、`US` 映射为 `+1`。输入会 trim、转大写并校验为国家或自治地区；格式错误或未知值会让启动失败。 |
@@ -64,6 +64,9 @@ live expanded buffer 释放后会归还进程内存，但不会返还该 frame �
 | `TELESRV_ADMIN_UI_TOKEN` | secret string / 空 | Admin UI 替代登录凭证；管理写调用仍使用独立的 `TELESRV_ADMIN_API_TOKEN`。 |
 | `TELESRV_ADMIN_SESSION_KEY` | secret string / 空 | 加密/签名 Admin UI session cookie；生产至少使用 32 字节随机值，修改会使已有会话失效。 |
 | `TELESRV_PUBLIC_BASE_URL` | HTTP(S) URL / `https://telesrv.net` | 客户端可见的公开链接根地址；允许 path，禁止 credentials、query、fragment。本地例：`http://127.0.0.1:2401`。 |
+| `TELESRV_UPDATE_PUBLIC_URL` | nullable HTTP(S) URL / 空 | 客户端可见的 `cmd/telesrv-update` 根地址，通过 `help.getConfig.autoupdate_url_prefix` 下发；空值关闭 desktop 原生更新。详见 `docs/update-service.md`。 |
+| `TELESRV_UPDATE_SERVICE_URL` | nullable HTTP(S) URL / `TELESRV_UPDATE_PUBLIC_URL` | `help.getAppUpdate` 使用的内部 resolver 地址，可指向 loopback/private route；空值回退到公开更新地址。 |
+| `TELESRV_UPDATE_REQUEST_TIMEOUT` | duration / `2s` | application update resolver 调用超时，必须大于零且不超过 `30s`；resolver 故障返回 `help.noAppUpdate`，不会转成 RPC 500。 |
 | `TELESRV_PUBLIC_APP_SCHEME` | URL scheme / `telesrv` | 落地页自动唤起客户端的 scheme，必须与 patched 客户端注册值一致；禁止 `tg`、`http`、`https`。 |
 | `TELESRV_PUBLIC_APP_LINK_BASE` | nullable custom URL base / 空 | 多服务客户端可选的 host-based 根，例如 `owpg://example.com`。配置后生成 `owpg://example.com/oauth`、`owpg://example.com/<username>` 等；只允许精确 `<custom-scheme>://<host>`，禁止端口、path、query、fragment。`TELESRV_PUBLIC_APP_SCHEME` 仍作为旧链接输入兼容。 |
 | `TELESRV_PUBLIC_WEB_BASE_URL` | HTTP(S) URL / `https://weba.telesrv.net` | username 页面 Web 客户端入口，校验规则同 `TELESRV_PUBLIC_BASE_URL`。 |
@@ -502,6 +505,9 @@ active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别�
 
 | 参数 | 类型 / 代码默认值 | 说明与约束 |
 |---|---|---|
+| `TELESRV_PREMIUM_BOT_USERNAME` | username / `premiumbot` | 内置 Premium 商店 bot 的保留 username；开头的 `@` 会被移除，非法值会使启动失败。 |
+| `TELESRV_PREMIUM_BOT_USER_ID` | int64 / `1250000015` | 内置 Premium bot 的稳定用户 ID；必须为正且不能与其他系统账号冲突。 |
+| `TELESRV_PREMIUM_PLANS` | `months:days:stars` CSV / `3:90:750,6:180:1300,12:365:2400` | 初始化并同步由配置管理的 Premium 套餐；月份不得重复，所有值必须为正且在边界内。在管理界面保存后，该行转为管理员管理，后续重启不会覆盖它。目录变更会提升持久化版本，使旧价格 form 失效。 |
 | `TELESRV_PREMIUM_GRANT_MONTHS` | int / `3` | 新注册账号默认 Premium 月数；`0` 关闭新赠送，不影响已有迁移 backfill。 |
 | `TELESRV_STARS_STARTING_GRANT` | int64 / `1000` | 对所有账号幂等惰性授予的 Stars 起始余额；`0` 关闭自动赠送。 |
 | `TELESRV_PREMIUM_SWEEP_INTERVAL` | duration / `1m` | 过期 Premium 清理/推送周期；读取路径独立即时派生到期状态。 |
