@@ -111,15 +111,19 @@ const replyLockStripes = 256
 
 // Service 提供 bot 账号业务。
 type Service struct {
-	users                 store.UserStore
-	bots                  store.BotStore
-	messages              store.MessageStore
-	blocker               blockChecker
-	channels              publicChannelUsernameResolver
-	stickers              stickerSetCreator
-	installer             userStickerSetInstaller
-	aiChat                aiChatGenerator
-	premium               premiumStorefront
+	users      store.UserStore
+	bots       store.BotStore
+	messages   store.MessageStore
+	blocker    blockChecker
+	channels   publicChannelUsernameResolver
+	stickers   stickerSetCreator
+	installer  userStickerSetInstaller
+	aiChat     aiChatGenerator
+	premium    premiumStorefront
+	gifCatalog interface {
+		ListGifCatalog(context.Context, bool) ([]domain.GifCatalogEntry, error)
+		GetDocuments(context.Context, []int64) ([]domain.Document, error)
+	}
 	verification          verificationApplications
 	customVerification    customVerifications
 	verifierTargets       verifierBotTargets
@@ -231,6 +235,15 @@ func WithPremium(p premiumStorefront) Option {
 			s.premium = p
 		}
 	}
+}
+
+// WithGifCatalog injects the curated catalog plus document resolver used by
+// the inline-only @gif responder.
+func WithGifCatalog(c interface {
+	ListGifCatalog(context.Context, bool) ([]domain.GifCatalogEntry, error)
+	GetDocuments(context.Context, []int64) ([]domain.Document, error)
+}) Option {
+	return func(s *Service) { s.gifCatalog = c }
 }
 
 // WithVerification injects the official verification service used by the
@@ -638,6 +651,23 @@ func (s *Service) ExportBotToken(ctx context.Context, ownerUserID, botUserID int
 		return "", err
 	}
 	if !found || profile.OwnerUserID != ownerUserID || botUserID == domain.BotFatherUserID || profile.TokenSecret == "" {
+		return "", domain.ErrBotNotFound
+	}
+	return domain.FormatBotToken(botUserID, profile.TokenSecret), nil
+}
+
+// AdminExportBotToken returns a non-system bot's current token without
+// rotating it or applying the owner check used by the Telegram RPC. The admin
+// layer is responsible for RBAC and for keeping the secret out of audit data.
+func (s *Service) AdminExportBotToken(ctx context.Context, botUserID int64) (string, error) {
+	if s == nil || s.bots == nil || botUserID <= 0 || domain.IsSystemUserID(botUserID) || botUserID == domain.BotFatherUserID {
+		return "", domain.ErrBotNotFound
+	}
+	profile, found, err := s.botProfile(ctx, botUserID)
+	if err != nil {
+		return "", err
+	}
+	if !found || profile.TokenSecret == "" {
 		return "", domain.ErrBotNotFound
 	}
 	return domain.FormatBotToken(botUserID, profile.TokenSecret), nil

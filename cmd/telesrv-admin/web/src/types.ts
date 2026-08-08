@@ -74,6 +74,7 @@ export type AccountDetail = {
   Fake: boolean;
   Support: boolean;
   Bot: boolean;
+  LoginEmail: string;
   StarsBalance: number;
   StarsGranted: boolean;
   Restriction: RestrictionRow;
@@ -146,6 +147,7 @@ export type BotRow = {
   ID: number;
   Username: string;
   FirstName: string;
+  LastName: string;
   Verified: boolean;
   Scam: boolean;
   Fake: boolean;
@@ -778,6 +780,71 @@ export type CommandResult = {
   error?: string;
 };
 
+export type StorageBackendRow = {
+  Backend: string;
+  PhysicalBytes: string;
+  LogicalBytes: string;
+  ObjectCount: string;
+  ReferenceCount: string;
+};
+
+export type StorageStatsResponse = {
+  PhysicalBytes: string;
+  LogicalBytes: string;
+  ObjectCount: string;
+  ReferenceCount: string;
+  DocumentCount: string;
+  PhotoCount: string;
+  Backends: StorageBackendRow[] | null;
+};
+
+export type DashboardCounts = {
+  Users: number;
+  OnlineUsers: number;
+  Bots: number;
+  BroadcastChannels: number;
+  Supergroups: number;
+  StickerSets: number;
+  EmojiSets: number;
+  Gifs: number;
+  PendingReports: number;
+  PendingVerifications: number;
+};
+
+export type HostStatsSnapshot = {
+  CPUPercent: number;
+  MemUsedBytes: number;
+  MemTotalBytes: number;
+  DiskFreeBytes: number;
+  DiskTotalBytes: number;
+  Ready: boolean;
+};
+
+export type DashboardResponse = {
+  counts: DashboardCounts;
+  storage: StorageStatsResponse;
+  host?: HostStatsSnapshot;
+};
+
+export type StickerSetRow = {
+  // Telegram snowflake ids exceed JavaScript's safe-integer range, so the BFF
+  // returns them as decimal strings.
+  ID: string;
+  ShortName: string;
+  Title: string;
+  Count: number;
+  Kind: string;
+  SystemKey: string;
+  Official: boolean;
+  Archived: boolean;
+  Installed: boolean;
+  SortOrder: number;
+  CreatedAt: string;
+  CoverDocumentID: string;
+};
+
+export type StickerSetListResponse = { rows: StickerSetRow[] };
+
 export type AccountListResponse = {
   query: string;
   limit: number;
@@ -806,6 +873,39 @@ export type BotListResponse = {
   next_before_id: number;
   listing: boolean;
 };
+
+export type BroadcastRow = {
+  ID: string;
+  Message: string;
+  TargetMode: "all" | "selected";
+  TargetCount: string;
+  MaterializedCount: string;
+  SentCount: string;
+  FailedCount: string;
+  EnumerationDone: boolean;
+  CreatedBy: string;
+  CreatedAt: string;
+};
+
+export type BroadcastListResponse = {
+  limit: number;
+  rows: BroadcastRow[];
+  has_more: boolean;
+  next_before_id: string;
+};
+
+export type GifCatalogRow = {
+  ID: string;
+  Title: string;
+  DocumentID: string;
+  Enabled: boolean;
+  SortOrder: number;
+  CreatedBy: string;
+  SourceFilename: string;
+  CreatedAt: string;
+};
+
+export type GifCatalogListResponse = { rows: GifCatalogRow[]; limit: number };
 
 export type EmojiRow = {
   DocumentID: string;

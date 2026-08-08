@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/text/language"
 
+	"telesrv/internal/branding"
 	"telesrv/internal/domain"
 	"telesrv/internal/links"
 )
@@ -91,6 +92,9 @@ type Config struct {
 	// PublicBaseURL 是所有客户端可见 telesrv 链接的公开根 URL。
 	// 生产默认 https://telesrv.net；本地可设为 http://127.0.0.1:2401。
 	PublicBaseURL string
+	// Branding 是所有客户端可见产品名称的进程级只读快照；协议标识、
+	// 客户端检测 token 与兼容 header 不属于品牌配置。
+	Branding branding.Config
 	// UpdatePublicURL is advertised to native clients through
 	// help.getConfig.autoupdate_url_prefix. Empty disables desktop updates.
 	UpdatePublicURL string
@@ -232,10 +236,34 @@ type Config struct {
 	// StarGiftTONStartingGrant 是 telesrv 内部 TON 账本首次访问时授予的 nanoton。
 	// 该账本只用于自建服务端礼物链路，不连接任何外部区块链。
 	StarGiftTONStartingGrant int64
-	// BlobDir 是本地磁盘 blob backend 根目录（媒体文件字节内容）。
+	// BlobBackendKind 选择唯一永久 blob backend：localfs（默认）或 s3。
+	BlobBackendKind string
+	// BlobDir 是 localfs 永久媒体根目录。s3 模式不从这里回退读取。
 	BlobDir string
+	// BlobStagingDir 是 s3 模式的本地临时上传分片与写入 spool 根目录；
+	// 它不是永久 backend，成功组装后的媒体只存在 S3。
+	BlobStagingDir string
+	// S3* 配置 MinIO/AWS S3 兼容永久 backend。endpoint 不含 URL scheme；
+	// access key/secret 没有默认值，CreateBucket 默认关闭。
+	S3Endpoint        string
+	S3Region          string
+	S3Bucket          string
+	S3AccessKeyID     string
+	S3SecretAccessKey string
+	S3UseSSL          bool
+	S3PathStyle       bool
+	S3CreateBucket    bool
+	// StorageLowSpaceGuardEnable enables both the local filesystem reserve and,
+	// when configured, the S3 tracked-byte budget. A successful initial capacity
+	// snapshot is required before the service starts accepting writes.
+	StorageLowSpaceGuardEnable  bool
+	StorageMinFreeBytes         int64
+	StorageMaxTotalBytes        int64
+	StorageUsageRefreshInterval time.Duration
 	// StickerSeedDir 是 reaction / sticker 资源种子目录（导入到 documents/sticker_sets + blob）。
 	StickerSeedDir string
+	// GifSeedDir is an optional bounded .gif/.mp4 drop directory for @gif.
+	GifSeedDir string
 	// StickerSeedMaxSets 限制导入的常规贴纸集数量（避免启动时导入过多包），<=0 表示不限。
 	StickerSeedMaxSets int
 	// PremiumPromoSeedDir 是 help.getPremiumPromo 视频与缩略图导出目录。
@@ -463,6 +491,13 @@ type Config struct {
 	// message send, so delivery cadence is a worker property.
 	VerificationNotifyInterval time.Duration
 	VerificationNotifyBatch    int
+	// Broadcast worker enumerates all-user campaigns and delivers claimed
+	// recipients in bounded batches. Lease permits another instance to recover a
+	// claim after a crash; it is not a message timeout.
+	BroadcastWorkerInterval   time.Duration
+	BroadcastWorkerLease      time.Duration
+	BroadcastMaterializeBatch int
+	BroadcastDeliveryBatch    int
 	// VerificationMaxActivePerUser bounds how many applications one applicant may
 	// keep open at once; 0 disables the cap.
 	VerificationMaxActivePerUser int
@@ -591,6 +626,22 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("TELESRV_PUBLIC_BASE_URL: %w", err)
 	}
+	brandConfig := branding.DefaultConfig()
+	brandConfig.ProductName = envOr("TELESRV_BRAND_PRODUCT_NAME", brandConfig.ProductName)
+	brandConfig.ProductUsername = envOr("TELESRV_BRAND_PRODUCT_USERNAME", brandConfig.ProductUsername)
+	brandConfig.DesktopAppName = envOr("TELESRV_BRAND_DESKTOP_APP_NAME", brandConfig.DesktopAppName)
+	brandConfig.AndroidAppName = envOr("TELESRV_BRAND_ANDROID_APP_NAME", brandConfig.AndroidAppName)
+	brandConfig.IOSAppName = envOr("TELESRV_BRAND_IOS_APP_NAME", brandConfig.IOSAppName)
+	brandConfig.MacOSAppName = envOr("TELESRV_BRAND_MACOS_APP_NAME", brandConfig.MacOSAppName)
+	brandConfig.WebAAppName = envOr("TELESRV_BRAND_WEB_A_APP_NAME", brandConfig.WebAAppName)
+	brandConfig.WebKAppName = envOr("TELESRV_BRAND_WEB_K_APP_NAME", brandConfig.WebKAppName)
+	brandConfig.PremiumName = envOr("TELESRV_BRAND_PREMIUM_NAME", brandConfig.PremiumName)
+	brandConfig.StarsName = envOr("TELESRV_BRAND_STARS_NAME", brandConfig.StarsName)
+	brandConfig.PublicBaseURL = publicBaseURL
+	brandConfig, err = branding.Validate(brandConfig)
+	if err != nil {
+		return Config{}, fmt.Errorf("brand configuration: %w", err)
+	}
 	updatePublicURL := strings.TrimSpace(envAllowEmptyOr("TELESRV_UPDATE_PUBLIC_URL", ""))
 	if updatePublicURL != "" {
 		updatePublicURL, err = links.ValidateBaseURL(updatePublicURL)
@@ -617,7 +668,7 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("TELESRV_PUBLIC_WEB_BASE_URL: %w", err)
 	}
-	publicAppName, err := links.ValidateAppName(envOr("TELESRV_PUBLIC_APP_NAME", links.DefaultAppName))
+	publicAppName, err := links.ValidateAppName(envOr("TELESRV_PUBLIC_APP_NAME", brandConfig.ProductName))
 	if err != nil {
 		return Config{}, fmt.Errorf("TELESRV_PUBLIC_APP_NAME: %w", err)
 	}
@@ -688,6 +739,7 @@ func Load() (Config, error) {
 		AdminAPIAddr:                         envAllowEmptyOr("TELESRV_ADMIN_API_ADDR", ""),
 		AdminAPIToken:                        envOr("TELESRV_ADMIN_API_TOKEN", ""),
 		PublicBaseURL:                        publicBaseURL,
+		Branding:                             brandConfig,
 		UpdatePublicURL:                      updatePublicURL,
 		UpdateServiceURL:                     updateServiceURL,
 		UpdateRequestTimeout:                 envDurationOr("TELESRV_UPDATE_REQUEST_TIMEOUT", 2*time.Second),
@@ -747,14 +799,29 @@ func Load() (Config, error) {
 		SMTPUsername:                  envOr("TELESRV_SMTP_USERNAME", ""),
 		SMTPPassword:                  envOr("TELESRV_SMTP_PASSWORD", ""),
 		SMTPFrom:                      envOr("TELESRV_SMTP_FROM", ""),
-		SMTPFromName:                  envOr("TELESRV_SMTP_FROM_NAME", "telesrv"),
+		SMTPFromName:                  envOr("TELESRV_SMTP_FROM_NAME", brandConfig.ProductName),
 		SMTPTLSMode:                   strings.ToLower(strings.TrimSpace(envOr("TELESRV_SMTP_TLS", "starttls"))),
 		SMTPTimeout:                   envDurationOr("TELESRV_SMTP_TIMEOUT", 10*time.Second),
 		LangPackSeedDir:               envOr("TELESRV_LANGPACK_SEED_DIR", "data/langpack"),
 		OfficialGiftsDir:              envOr("TELESRV_OFFICIAL_GIFTS_DIR", "data/official-gifts"),
 		StarGiftTONStartingGrant:      envInt64Or("TELESRV_STARGIFT_TON_STARTING_GRANT", 10_000_000_000),
+		BlobBackendKind:               strings.ToLower(strings.TrimSpace(envOr("TELESRV_BLOB_BACKEND", "localfs"))),
 		BlobDir:                       envOr("TELESRV_BLOB_DIR", "data/blobs"),
+		BlobStagingDir:                envOr("TELESRV_BLOB_STAGING_DIR", "data/blob-staging"),
+		S3Endpoint:                    strings.TrimSpace(envOr("TELESRV_S3_ENDPOINT", "")),
+		S3Region:                      strings.TrimSpace(envOr("TELESRV_S3_REGION", "us-east-1")),
+		S3Bucket:                      strings.TrimSpace(envOr("TELESRV_S3_BUCKET", "")),
+		S3AccessKeyID:                 envOr("TELESRV_S3_ACCESS_KEY_ID", ""),
+		S3SecretAccessKey:             envOr("TELESRV_S3_SECRET_ACCESS_KEY", ""),
+		S3UseSSL:                      envBoolOr("TELESRV_S3_USE_SSL", true),
+		S3PathStyle:                   envBoolOr("TELESRV_S3_PATH_STYLE", false),
+		S3CreateBucket:                envBoolOr("TELESRV_S3_CREATE_BUCKET", false),
+		StorageLowSpaceGuardEnable:    envBoolOr("TELESRV_STORAGE_LOW_SPACE_GUARD_ENABLE", true),
+		StorageMinFreeBytes:           envInt64Or("TELESRV_STORAGE_MIN_FREE_BYTES", 1<<30),
+		StorageMaxTotalBytes:          envInt64Or("TELESRV_STORAGE_MAX_TOTAL_BYTES", 0),
+		StorageUsageRefreshInterval:   envDurationOr("TELESRV_STORAGE_USAGE_REFRESH_INTERVAL", time.Minute),
 		StickerSeedDir:                envOr("TELESRV_STICKER_SEED_DIR", "data/sticker-seed"),
+		GifSeedDir:                    envOr("TELESRV_GIF_SEED_DIR", "data/gifs"),
 		StickerSeedMaxSets:            envIntOr("TELESRV_STICKER_SEED_MAX_SETS", 300),
 		PremiumPromoSeedDir:           envOr("TELESRV_PREMIUM_PROMO_SEED_DIR", "data/premium-promo"),
 		MapboxToken:                   envOr("TELESRV_MAPBOX_TOKEN", ""),
@@ -872,6 +939,10 @@ func Load() (Config, error) {
 		VerificationBotRateWindow:    envDurationOr("TELESRV_VERIFICATION_BOT_RATE_WINDOW", time.Minute),
 		VerificationNotifyInterval:   envDurationOr("TELESRV_VERIFICATION_NOTIFY_INTERVAL", 15*time.Second),
 		VerificationNotifyBatch:      envIntOr("TELESRV_VERIFICATION_NOTIFY_BATCH", 50),
+		BroadcastWorkerInterval:      envDurationOr("TELESRV_BROADCAST_WORKER_INTERVAL", 3*time.Second),
+		BroadcastWorkerLease:         envDurationOr("TELESRV_BROADCAST_WORKER_LEASE", 30*time.Second),
+		BroadcastMaterializeBatch:    envIntOr("TELESRV_BROADCAST_MATERIALIZE_BATCH", 200),
+		BroadcastDeliveryBatch:       envIntOr("TELESRV_BROADCAST_DELIVERY_BATCH", 50),
 		VerificationMaxActivePerUser: envIntOr("TELESRV_VERIFICATION_MAX_ACTIVE_PER_USER", 3),
 
 		BotVerificationEnabled:        envBoolOr("TELESRV_BOT_VERIFICATION_ENABLED", true),
@@ -930,10 +1001,47 @@ func Load() (Config, error) {
 	if err := validateTelegramLoginConfig(cfg); err != nil {
 		return Config{}, err
 	}
+	if err := validateBlobStorageConfig(cfg); err != nil {
+		return Config{}, err
+	}
 	if cfg.UpdateRequestTimeout <= 0 || cfg.UpdateRequestTimeout > 30*time.Second {
 		return Config{}, fmt.Errorf("TELESRV_UPDATE_REQUEST_TIMEOUT must be greater than zero and at most 30s")
 	}
 	return cfg, nil
+}
+
+func validateBlobStorageConfig(cfg Config) error {
+	if cfg.StorageMinFreeBytes < 0 {
+		return fmt.Errorf("TELESRV_STORAGE_MIN_FREE_BYTES must be non-negative")
+	}
+	if cfg.StorageMaxTotalBytes < 0 {
+		return fmt.Errorf("TELESRV_STORAGE_MAX_TOTAL_BYTES must be non-negative")
+	}
+	if cfg.StorageLowSpaceGuardEnable && cfg.StorageUsageRefreshInterval <= 0 {
+		return fmt.Errorf("TELESRV_STORAGE_USAGE_REFRESH_INTERVAL must be positive when storage capacity guard is enabled")
+	}
+	switch cfg.BlobBackendKind {
+	case string(domain.MediaBackendLocalFS):
+		if strings.TrimSpace(cfg.BlobDir) == "" {
+			return fmt.Errorf("TELESRV_BLOB_DIR is required when TELESRV_BLOB_BACKEND=localfs")
+		}
+	case string(domain.MediaBackendS3):
+		if strings.TrimSpace(cfg.BlobStagingDir) == "" {
+			return fmt.Errorf("TELESRV_BLOB_STAGING_DIR is required when TELESRV_BLOB_BACKEND=s3")
+		}
+		if cfg.S3Endpoint == "" || strings.Contains(cfg.S3Endpoint, "://") {
+			return fmt.Errorf("TELESRV_S3_ENDPOINT must be host[:port] without a URL scheme when TELESRV_BLOB_BACKEND=s3")
+		}
+		if cfg.S3Bucket == "" {
+			return fmt.Errorf("TELESRV_S3_BUCKET is required when TELESRV_BLOB_BACKEND=s3")
+		}
+		if strings.TrimSpace(cfg.S3AccessKeyID) == "" || strings.TrimSpace(cfg.S3SecretAccessKey) == "" {
+			return fmt.Errorf("TELESRV_S3_ACCESS_KEY_ID and TELESRV_S3_SECRET_ACCESS_KEY are required when TELESRV_BLOB_BACKEND=s3")
+		}
+	default:
+		return fmt.Errorf("TELESRV_BLOB_BACKEND must be localfs or s3, got %q", cfg.BlobBackendKind)
+	}
+	return nil
 }
 
 func parsePremiumPlans(raw string) ([]domain.PremiumPlan, error) {
@@ -1144,6 +1252,18 @@ func validateVerificationConfig(cfg Config) error {
 	}
 	if cfg.VerificationNotifyBatch <= 0 || cfg.VerificationNotifyBatch > 500 {
 		return fmt.Errorf("TELESRV_VERIFICATION_NOTIFY_BATCH must be 1..500")
+	}
+	if cfg.BroadcastWorkerInterval <= 0 {
+		return fmt.Errorf("TELESRV_BROADCAST_WORKER_INTERVAL must be positive")
+	}
+	if cfg.BroadcastWorkerLease <= 0 || cfg.BroadcastWorkerLease > time.Hour {
+		return fmt.Errorf("TELESRV_BROADCAST_WORKER_LEASE must be positive and at most 1h")
+	}
+	if cfg.BroadcastMaterializeBatch <= 0 || cfg.BroadcastMaterializeBatch > 1000 {
+		return fmt.Errorf("TELESRV_BROADCAST_MATERIALIZE_BATCH must be 1..1000")
+	}
+	if cfg.BroadcastDeliveryBatch <= 0 || cfg.BroadcastDeliveryBatch > 500 {
+		return fmt.Errorf("TELESRV_BROADCAST_DELIVERY_BATCH must be 1..500")
 	}
 	if cfg.VerificationMaxActivePerUser < 0 || cfg.VerificationMaxActivePerUser > 50 {
 		return fmt.Errorf("TELESRV_VERIFICATION_MAX_ACTIVE_PER_USER must be 0..50")

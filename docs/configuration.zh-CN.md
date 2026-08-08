@@ -63,14 +63,26 @@ live expanded buffer 释放后会归还进程内存，但不会返还该 frame �
 | `TELESRV_ADMIN_UI_PASSWORD` | secret string / 空 | Admin UI 登录密码；它与 `TELESRV_ADMIN_UI_TOKEN` 至少配置一个。 |
 | `TELESRV_ADMIN_UI_TOKEN` | secret string / 空 | Admin UI 替代登录凭证；管理写调用仍使用独立的 `TELESRV_ADMIN_API_TOKEN`。 |
 | `TELESRV_ADMIN_SESSION_KEY` | secret string / 空 | 加密/签名 Admin UI session cookie；生产至少使用 32 字节随机值，修改会使已有会话失效。 |
+| `TELESRV_ADMIN_UI_PERMISSIONS` | comma-separated list / `*` | 使用 `TELESRV_ADMIN_UI_PASSWORD` / `_TOKEN` 登录的 Admin UI 会话权限集合。`*` 表示全部权限且是默认值。读取托管 bot token 需要显式 `bots.token.read` 权限；token 只在命令响应中返回，不会持久化到审计结果。权限名只允许字母、数字和 `._:-`，最多 64 字符，可用 `namespace.*` 授权整个命名空间。空列表或无法解析的权限名会让启动失败。 |
+| `TELESRV_ADMIN_SCOPED_TOKENS` | 用 `;` 分隔的 `name:token:perm1,perm2` 条目 / 空 | 额外的 Admin API bearer token，每个 token 只携带指定权限，供集成服务按最小权限访问，避免使用无限制的 `TELESRV_ADMIN_API_TOKEN`。token 不能包含 `:` 或空白字符，每个条目必须至少列出一个权限，name/token 必须唯一，且禁止复用 `TELESRV_ADMIN_API_TOKEN`，否则会把受限 token 静默放大成全权限。任何格式错误都会让启动失败。 |
 | `TELESRV_PUBLIC_BASE_URL` | HTTP(S) URL / `https://telesrv.net` | 客户端可见的公开链接根地址；允许 path，禁止 credentials、query、fragment。本地例：`http://127.0.0.1:2401`。 |
+| `TELESRV_BRAND_PRODUCT_NAME` | string / `Telesrv` | 母品牌显示名；系统账号、登录通知、邀请、WebAuthn、内置 bot 与上游可见文案替换共用。trim 后非空、无控制字符、最多 64 个 Unicode 字符。 |
+| `TELESRV_BRAND_PRODUCT_USERNAME` | username / `telesrv` | 777000 系统账号的公开 username；trim、去掉可选 `@` 后规范成小写，必须为 5–32 位 ASCII username 且首字符为字母。 |
+| `TELESRV_BRAND_DESKTOP_APP_NAME` | string / `Telesrv Desktop` | `account.getAuthorizations` 返回的 Desktop/Windows 显示名；校验规则同产品名。 |
+| `TELESRV_BRAND_ANDROID_APP_NAME` | string / `Telesrv Android` | 授权列表中的 Android 显示名；校验规则同产品名。 |
+| `TELESRV_BRAND_IOS_APP_NAME` | string / `Telesrv iOS` | 授权列表中的 iOS 显示名；校验规则同产品名。 |
+| `TELESRV_BRAND_MACOS_APP_NAME` | string / `Telesrv macOS` | 授权列表中的 macOS 显示名；校验规则同产品名。 |
+| `TELESRV_BRAND_WEB_A_APP_NAME` | string / `Telesrv Web A` | `telegram-tt` / `weba` 授权列表显示名；持久化检测 token 不变。 |
+| `TELESRV_BRAND_WEB_K_APP_NAME` | string / `Telesrv Web K` | `tweb` / `webk` 授权列表显示名；持久化检测 token 不变。 |
+| `TELESRV_BRAND_PREMIUM_NAME` | string / `Telesrv Premium` | Premium 状态与相关客户端可见文案中的产品名；校验规则同产品名。 |
+| `TELESRV_BRAND_STARS_NAME` | string / `Telesrv Stars` | Stars 支付 label 与相关客户端可见文案中的产品名；校验规则同产品名。 |
 | `TELESRV_UPDATE_PUBLIC_URL` | nullable HTTP(S) URL / 空 | 客户端可见的 `cmd/telesrv-update` 根地址，通过 `help.getConfig.autoupdate_url_prefix` 下发；空值关闭 desktop 原生更新。详见 `docs/update-service.md`。 |
 | `TELESRV_UPDATE_SERVICE_URL` | nullable HTTP(S) URL / `TELESRV_UPDATE_PUBLIC_URL` | `help.getAppUpdate` 使用的内部 resolver 地址，可指向 loopback/private route；空值回退到公开更新地址。 |
 | `TELESRV_UPDATE_REQUEST_TIMEOUT` | duration / `2s` | application update resolver 调用超时，必须大于零且不超过 `30s`；resolver 故障返回 `help.noAppUpdate`，不会转成 RPC 500。 |
 | `TELESRV_PUBLIC_APP_SCHEME` | URL scheme / `telesrv` | 落地页自动唤起客户端的 scheme，必须与 patched 客户端注册值一致；禁止 `tg`、`http`、`https`。 |
 | `TELESRV_PUBLIC_APP_LINK_BASE` | nullable custom URL base / 空 | 多服务客户端可选的 host-based 根，例如 `owpg://example.com`。配置后生成 `owpg://example.com/oauth`、`owpg://example.com/<username>` 等；只允许精确 `<custom-scheme>://<host>`，禁止端口、path、query、fragment。`TELESRV_PUBLIC_APP_SCHEME` 仍作为旧链接输入兼容。 |
 | `TELESRV_PUBLIC_WEB_BASE_URL` | HTTP(S) URL / `https://weba.telesrv.net` | username 页面 Web 客户端入口，校验规则同 `TELESRV_PUBLIC_BASE_URL`。 |
-| `TELESRV_PUBLIC_APP_NAME` | string / `telesrv` | 公开落地页产品名；trim 后非空、无控制字符、最多 64 个 Unicode 字符。 |
+| `TELESRV_PUBLIC_APP_NAME` | string / `TELESRV_BRAND_PRODUCT_NAME` | 公开落地页产品名；trim 后非空、无控制字符、最多 64 个 Unicode 字符。 |
 | `TELESRV_PUBLIC_LINK_WEB_ADDR` | nullable address / 空 | 只读 username/avatar/sticker/emoji/chatlist/collectible gift 落地页监听；空值关闭。生产应 loopback + nginx 精确反代；`.env.example` 为开发启用 `127.0.0.1:2401`。 |
 | `TELESRV_TELEGRAM_LOGIN_ENABLE` | bool / `false` | 在 `TELESRV_PUBLIC_LINK_WEB_ADDR` 上挂载自建 Telegram Login/OIDC Provider；启用时必须同时配置该 listener 与下列全部密钥文件。 |
 | `TELESRV_TELEGRAM_LOGIN_ISSUER` | 绝对 origin URL / `TELESRV_PUBLIC_BASE_URL` | discovery 与 token 使用的精确公开 issuer；默认必须 HTTPS，禁止 path、credentials、query、fragment。开启下一项后可直接配置任意 HTTP 域名/IP。 |
@@ -377,12 +389,29 @@ active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别�
 | `TELESRV_REDIS_DB` | int / `0` | Redis 逻辑库编号。 |
 | `TELESRV_LANGPACK_SEED_DIR` | path / `data/langpack` | TDesktop `.strings` 语言包 seed 目录。 |
 | `TELESRV_OFFICIAL_GIFTS_DIR` | path / `data/official-gifts` | `cmd/giftfetch` 生成的只读官方礼物快照；供管理后台选择、验哈希并显式导入。 |
-| `TELESRV_BLOB_DIR` | path / `data/blobs` | 本地开发 blob backend 的媒体字节根目录。 |
+| `TELESRV_BLOB_BACKEND` | enum / `localfs` | 唯一永久媒体后端：`localfs` 或 `s3`。不会跨后端回退、双读或双写；库内已有另一 backend 的 `file_blobs` 时启动失败。 |
+| `TELESRV_BLOB_DIR` | path / `data/blobs` | `localfs` 永久媒体与临时上传分片根目录；`s3` 模式不会从此目录回退读取。 |
+| `TELESRV_BLOB_STAGING_DIR` | path / `data/blob-staging` | `s3` 模式的本地临时上传分片与写入 spool；不是永久后端。 |
+| `TELESRV_S3_ENDPOINT` | host[:port] / 空 | `s3` 模式必填，不含 `http://`/`https://`。 |
+| `TELESRV_S3_REGION` | string / `us-east-1` | S3 region。 |
+| `TELESRV_S3_BUCKET` | string / 空 | `s3` 模式必填的永久媒体 bucket。 |
+| `TELESRV_S3_ACCESS_KEY_ID` | secret / 空 | `s3` 模式必填；无弱默认凭据。 |
+| `TELESRV_S3_SECRET_ACCESS_KEY` | secret / 空 | `s3` 模式必填；不得写入日志。 |
+| `TELESRV_S3_USE_SSL` | bool / `true` | S3 endpoint 使用 TLS。 |
+| `TELESRV_S3_PATH_STYLE` | bool / `false` | 强制 path-style bucket 地址；本地 MinIO 常设为 `true`。 |
+| `TELESRV_S3_CREATE_BUCKET` | bool / `false` | 仅显式为 `true` 时允许启动创建缺失 bucket；否则缺桶即失败。 |
+| `TELESRV_STORAGE_LOW_SPACE_GUARD_ENABLE` | bool / `true` | 启用存储容量门禁；启动时必须先取得有效快照，运行期刷新失败保留最后一个有效快照并告警。 |
+| `TELESRV_STORAGE_MIN_FREE_BYTES` | int64 / `1073741824` | 本地文件系统最小剩余字节。`localfs` 保护永久文件与分片；`s3` 保护本地分片和 S3 写入 spool。`0` 关闭该维度。 |
+| `TELESRV_STORAGE_MAX_TOTAL_BYTES` | int64 / `0` | S3 永久后端预算，按 `file_blobs` 中去重后的唯一 `object_key` 字节统计；`0` 不限制。它不是 bucket 实际账单用量。 |
+| `TELESRV_STORAGE_USAGE_REFRESH_INTERVAL` | duration / `1m` | 容量快照刷新周期；容量门禁启用时必须为正数。 |
 | `TELESRV_STICKER_SEED_DIR` | path / `data/sticker-seed` | 导入 documents、sticker sets、blob 的贴纸/reaction seed 目录。 |
 | `TELESRV_STICKER_SEED_MAX_SETS` | int / `300` | 启动时导入的常规贴纸集上限；`<=0` 表示不限。 |
+| `TELESRV_GIF_SEED_DIR` | path / `data/gifs` | 可选的内置 `@gif` 启动导入目录，只接受 `.gif/.mp4`，目录总量最多 50；缺失时跳过，同文件名内容变化或无效媒体会阻止启动。产物只写当前显式 blob backend。 |
 | `TELESRV_PREMIUM_PROMO_SEED_DIR` | path / `data/premium-promo` | `help.getPremiumPromo` 导出的 manifest、MP4 视频与 JPEG 缩略图目录。目录缺失时保留无视频兼容响应；目录存在但内容非法或不完整时启动失败。 |
 
 语言包 seed 以文件 manifest 为事实源。新增语言时放入 `data/langpack/<pack>/<pack>_<lang>_v<version>.strings` 并重启 `telesrv`；`pack` 必须与所在一级目录一致，允许 Telegram 已使用的字母、数字、`-` 与 `_`（例如 `android_x`），`lang` 会统一为小写、连字符形式（例如 `pt_BR` 归一为 `pt-br`）。同一语言存在多个文件时只读取最高版本。修改已有语言的有效内容必须提高版本；同版本有效内容变化或版本倒退会阻止启动。删除语言文件或整个 pack 子目录后，下次重启会原子移除对应数据库目录和字符串。启动先流式计算源文件 SHA-256；未变化文件复用上次原子 manifest，不解析字符串也不写库，只有新增或变化文件才解析并通过 PostgreSQL `COPY` 整包替换。
+
+对象存储保持单后端运行。在显式离线迁移完成对象复制、size/SHA-256 校验并更新 `file_blobs.backend` 之前，不得直接翻转 `TELESRV_BLOB_BACKEND`。
 
 ## 5. 登录、OTP Provider、SMTP 与 passkey
 
@@ -408,7 +437,7 @@ active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别�
 | `TELESRV_SMTP_USERNAME` | sensitive string / 空 | SMTP 用户名；`TELESRV_SMTP_FROM` 为空时也用作发件人。 |
 | `TELESRV_SMTP_PASSWORD` | secret string / 空 | SMTP 密码。 |
 | `TELESRV_SMTP_FROM` | email/string / 空 | envelope/header 发件人；启用登录邮箱时它与 SMTP username 至少一个非空。 |
-| `TELESRV_SMTP_FROM_NAME` | string / `telesrv` | 登录邮件展示的发件人名称。 |
+| `TELESRV_SMTP_FROM_NAME` | string / `TELESRV_BRAND_PRODUCT_NAME` | 登录邮件展示的发件人名称；未显式配置时继承母品牌显示名。 |
 | `TELESRV_SMTP_TLS` | enum / `starttls` | 仅允许 `starttls`、`tls`、`none`，其它值阻止启动。 |
 | `TELESRV_SMTP_TIMEOUT` | duration / `10s` | SMTP 操作超时；使用 SMTP provider 时必须为正数。 |
 | `TELESRV_PASSKEY_RP_ID` | hostname / `telesrv.net` | WebAuthn relying-party ID，用于校验 `rpIdHash`；Android Credential Manager 必须与公网 `assetlinks.json` 对齐。 |
@@ -565,6 +594,10 @@ active key。不要手工编辑 manifest 或 PEM，不要在各实例上分别�
 | `TELESRV_VERIFICATION_BOT_RATE_WINDOW` | duration / `1m` | bot 对话限流窗口；limit>0 时必须为正数。 |
 | `TELESRV_VERIFICATION_NOTIFY_INTERVAL` | duration / `15s` | durable 通知 outbox worker 周期，必须为正数。 |
 | `TELESRV_VERIFICATION_NOTIFY_BATCH` | int / `50` | 每轮投递通知数，必须为 `1..500`。 |
+| `TELESRV_BROADCAST_WORKER_INTERVAL` | duration / `3s` | 系统广播 worker 周期，必须为正数。 |
+| `TELESRV_BROADCAST_WORKER_LEASE` | duration / `30s` | recipient 崩溃恢复租约，必须为正数且不超过 `1h`。 |
+| `TELESRV_BROADCAST_MATERIALIZE_BATCH` | int / `200` | 单次数据库 keyset 物化的全体用户上限，必须为 `1..1000`；ID 不离开 PostgreSQL。 |
+| `TELESRV_BROADCAST_DELIVERY_BATCH` | int / `50` | 每轮领取并投递的 recipient 上限，必须为 `1..500`；每条消息独立提交。 |
 | `TELESRV_VERIFICATION_MAX_ACTIVE_PER_USER` | int / `3` | 每个申请者可保持的 active 申请数；允许 `0..50`。 |
 
 ### 第三方 bot 认证

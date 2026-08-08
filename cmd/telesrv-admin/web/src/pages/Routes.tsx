@@ -10,7 +10,9 @@ import { ChannelDetailPage } from "./ChannelDetailPage";
 import { ChannelsPage } from "./ChannelsPage";
 import { BotDetailPage } from "./BotDetailPage";
 import { BotsPage } from "./BotsPage";
+import { BroadcastsPage } from "./BroadcastsPage";
 import { EmojiPage } from "./EmojiPage";
+import { GifCatalogPage } from "./GifCatalogPage";
 import { Dashboard } from "./Dashboard";
 import { GroupMessageDetailPage } from "./GroupMessageDetailPage";
 import { GroupMessagesPage } from "./GroupMessagesPage";
@@ -25,6 +27,8 @@ import { BotVerificationPage } from "./BotVerificationPage";
 import { BotVerificationRequestPage } from "./BotVerificationRequestPage";
 import { VerificationDetailPage } from "./VerificationDetailPage";
 import { VerificationPage } from "./VerificationPage";
+import { StoragePage } from "./StoragePage";
+import { StickerSetsPage } from "./StickerSetsPage";
 import {
   PermissionGate,
   permissionBotVerificationReview,
@@ -90,6 +94,9 @@ export function Routes({ route, navigate }: { route: RouteState; navigate: Navig
   if (route.path === "/account-ratings") {
     return <AccountRatingsPage navigate={navigate} />;
   }
+  if (route.path === "/storage") {
+    return <StoragePage />;
+  }
   if (route.path === "/monetization" || route.path === "/premium") {
     return (
       <PermissionGate permission={permissionPremiumManage}>
@@ -118,12 +125,21 @@ export function Routes({ route, navigate }: { route: RouteState; navigate: Navig
   if (route.path === "/bots") {
     return <BotsPage navigate={navigate} />;
   }
+  if (route.path === "/broadcasts") {
+    return <BroadcastsPage />;
+  }
   if (route.path === "/moderation") {
     return <ModerationCasesPage navigate={navigate} />;
   }
   if (route.path === "/emoji") {
     return <EmojiPage />;
   }
+  if (route.path === "/stickers") {
+    return <StickerSetsPage kind="stickers" />;
+  }
+	if (route.path === "/gif-catalog") {
+		return <GifCatalogPage />;
+	}
 	if (route.path === "/gifts") {
 		return <GiftsPage />;
 	}

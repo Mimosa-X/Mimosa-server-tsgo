@@ -49,8 +49,16 @@ type Service interface {
 	SetChannelFlags(ctx context.Context, req admin.SetChannelFlagsRequest) (admin.CommandResult, error)
 	CreateBot(ctx context.Context, req admin.CreateBotRequest) (admin.CommandResult, error)
 	DeleteBot(ctx context.Context, req admin.DeleteBotRequest) (admin.CommandResult, error)
+	ExportBotToken(ctx context.Context, req admin.ExportBotTokenRequest) (admin.CommandResult, error)
 	SetSupport(ctx context.Context, req admin.SetSupportRequest) (admin.CommandResult, error)
 	SetUsername(ctx context.Context, req admin.SetUsernameRequest) (admin.CommandResult, error)
+	SetProfile(ctx context.Context, req admin.SetProfileRequest) (admin.CommandResult, error)
+	SetPhone(ctx context.Context, req admin.SetPhoneRequest) (admin.CommandResult, error)
+	SetLoginEmail(ctx context.Context, req admin.SetLoginEmailRequest) (admin.CommandResult, error)
+	AccountAvatar(ctx context.Context, userID int64) ([]byte, string, bool, error)
+	SetAccountAvatar(ctx context.Context, req admin.SetAccountAvatarRequest) (admin.CommandResult, error)
+	ChannelAvatar(ctx context.Context, channelID int64) ([]byte, string, bool, error)
+	SetChannelAvatar(ctx context.Context, req admin.SetChannelAvatarRequest) (admin.CommandResult, error)
 	SetUserColor(ctx context.Context, req admin.SetUserColorRequest) (admin.CommandResult, error)
 	SetUserEmojiStatus(ctx context.Context, req admin.SetUserEmojiStatusRequest) (admin.CommandResult, error)
 	SetChannelSettings(ctx context.Context, req admin.SetChannelSettingsRequest) (admin.CommandResult, error)
@@ -60,6 +68,14 @@ type Service interface {
 	RevokeSessions(ctx context.Context, req admin.RevokeSessionsRequest) (admin.CommandResult, error)
 	DeletePrivateMessages(ctx context.Context, req admin.DeletePrivateMessagesRequest) (admin.CommandResult, error)
 	DeletePrivateHistory(ctx context.Context, req admin.DeletePrivateHistoryRequest) (admin.CommandResult, error)
+	SetStickerSetArchived(ctx context.Context, req admin.SetStickerSetArchivedRequest) (admin.CommandResult, error)
+	SetStickerSetSortOrder(ctx context.Context, req admin.SetStickerSetSortOrderRequest) (admin.CommandResult, error)
+	RenameStickerSet(ctx context.Context, req admin.RenameStickerSetRequest) (admin.CommandResult, error)
+	DeleteStickerSet(ctx context.Context, req admin.DeleteStickerSetRequest) (admin.CommandResult, error)
+	CreateStickerSet(ctx context.Context, req admin.CreateStickerSetRequest) (admin.CommandResult, error)
+	AddStickerToSet(ctx context.Context, req admin.AddStickerToSetRequest) (admin.CommandResult, error)
+	RemoveStickerFromSet(ctx context.Context, req admin.RemoveStickerFromSetRequest) (admin.CommandResult, error)
+	StickerDocumentAnimation(ctx context.Context, documentID int64) ([]byte, string, bool, error)
 	ImportStarGift(ctx context.Context, req admin.ImportStarGiftRequest) (admin.CommandResult, error)
 	ImportOfficialStarGift(ctx context.Context, req admin.ImportOfficialStarGiftRequest) (admin.CommandResult, error)
 	OfficialStarGifts(ctx context.Context) ([]officialgifts.GiftSummary, error)
@@ -70,6 +86,12 @@ type Service interface {
 	GiveGift(ctx context.Context, req admin.GiveGiftRequest) (admin.CommandResult, error)
 	StarGiftAnimation(ctx context.Context, giftID int64) ([]byte, bool, error)
 	EmojiAnimation(ctx context.Context, documentID int64) ([]byte, bool, error)
+	GifCatalog(ctx context.Context) ([]domain.GifCatalogEntry, error)
+	CreateGifCatalogEntry(ctx context.Context, req admin.CreateGifCatalogEntryRequest) (admin.CommandResult, error)
+	SetGifCatalogEnabled(ctx context.Context, req admin.SetGifCatalogEnabledRequest) (admin.CommandResult, error)
+	SetGifCatalogSortOrder(ctx context.Context, req admin.SetGifCatalogSortOrderRequest) (admin.CommandResult, error)
+	DeleteGifCatalogEntry(ctx context.Context, req admin.DeleteGifCatalogEntryRequest) (admin.CommandResult, error)
+	GifCatalogDocumentPreview(ctx context.Context, documentID int64) ([]byte, string, bool, error)
 	StarGiftCollectibles(ctx context.Context, giftID int64) (domain.StarGiftUpgradePreview, bool, error)
 	StarGiftCollectibleAnimation(ctx context.Context, giftID int64, kind domain.StarGiftCollectibleAttributeKind, attributeID int64) ([]byte, bool, error)
 	ModerationCases(ctx context.Context, filter domain.ModerationCaseFilter) ([]domain.ModerationCase, error)
@@ -194,6 +216,11 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /v1/accounts/set-flags", s.authenticated(s.handleSetUserFlags))
 	mux.HandleFunc("POST /v1/accounts/set-support", s.authenticated(s.handleSetSupport))
 	mux.HandleFunc("POST /v1/accounts/set-username", s.authenticated(s.handleSetUsername))
+	mux.HandleFunc("GET /v1/accounts/{id}/avatar", s.authenticated(s.handleAccountAvatar))
+	mux.HandleFunc("POST /v1/accounts/set-profile", s.authenticated(s.handleSetProfile))
+	mux.HandleFunc("POST /v1/accounts/set-phone", s.authenticated(s.handleSetPhone))
+	mux.HandleFunc("POST /v1/accounts/set-login-email", s.authenticated(s.handleSetLoginEmail))
+	mux.HandleFunc("POST /v1/accounts/set-avatar", s.authenticated(s.handleSetAccountAvatar))
 	mux.HandleFunc("POST /v1/accounts/set-color", s.authenticated(s.handleSetUserColor))
 	mux.HandleFunc("POST /v1/accounts/set-emoji-status", s.authenticated(s.handleSetUserEmojiStatus))
 	mux.HandleFunc("POST /v1/accounts/revoke-sessions", s.authenticated(s.handleRevokeSessions))
@@ -203,10 +230,22 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /v1/channels/set-username", s.authenticated(s.handleSetChannelUsername))
 	mux.HandleFunc("POST /v1/channels/set-color", s.authenticated(s.handleSetChannelColor))
 	mux.HandleFunc("POST /v1/channels/set-emoji-status", s.authenticated(s.handleSetChannelEmojiStatus))
+	mux.HandleFunc("GET /v1/channels/{id}/avatar", s.authenticated(s.handleChannelAvatar))
+	mux.HandleFunc("POST /v1/channels/set-avatar", s.authenticated(s.handleSetChannelAvatar))
 	mux.HandleFunc("POST /v1/bots/create", s.authenticated(s.handleCreateBot))
+	mux.HandleFunc("POST /v1/broadcasts/create", s.authenticated(s.handleCreateBroadcast))
 	mux.HandleFunc("POST /v1/bots/delete", s.authenticated(s.handleDeleteBot))
+	mux.HandleFunc("POST /v1/bots/export-token", s.authorized(PermissionBotTokenRead, s.handleExportBotToken))
 	mux.HandleFunc("POST /v1/messages/delete", s.authenticated(s.handleDeleteMessages))
 	mux.HandleFunc("POST /v1/messages/delete-history", s.authenticated(s.handleDeleteHistory))
+	mux.HandleFunc("POST /v1/stickers/set-archived", s.authenticated(s.handleSetStickerSetArchived))
+	mux.HandleFunc("POST /v1/stickers/set-sort-order", s.authenticated(s.handleSetStickerSetSortOrder))
+	mux.HandleFunc("POST /v1/stickers/rename", s.authenticated(s.handleRenameStickerSet))
+	mux.HandleFunc("POST /v1/stickers/delete", s.authenticated(s.handleDeleteStickerSet))
+	mux.HandleFunc("POST /v1/stickers/create", s.authenticated(s.handleCreateStickerSet))
+	mux.HandleFunc("POST /v1/stickers/add", s.authenticated(s.handleAddStickerToSet))
+	mux.HandleFunc("POST /v1/stickers/remove", s.authenticated(s.handleRemoveStickerFromSet))
+	mux.HandleFunc("GET /v1/stickers/documents/{id}/animation", s.authenticated(s.handleStickerDocumentAnimation))
 	mux.HandleFunc("POST /v1/gifts/import", s.authenticated(s.handleImportStarGift))
 	mux.HandleFunc("GET /v1/official-gifts", s.authenticated(s.handleOfficialStarGifts))
 	mux.HandleFunc("GET /v1/official-gifts/{id}/animation", s.authenticated(s.handleOfficialStarGiftAnimation))
@@ -217,6 +256,12 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /v1/gifts/give", s.authenticated(s.handleGiveGift))
 	mux.HandleFunc("GET /v1/gifts/{id}/animation", s.authenticated(s.handleStarGiftAnimation))
 	mux.HandleFunc("GET /v1/emoji/{id}/animation", s.authenticated(s.handleEmojiAnimation))
+	mux.HandleFunc("GET /v1/gif-catalog", s.authenticated(s.handleGifCatalog))
+	mux.HandleFunc("GET /v1/gif-catalog/documents/{id}/preview", s.authenticated(s.handleGifCatalogPreview))
+	mux.HandleFunc("POST /v1/gif-catalog/create", s.authenticated(s.handleCreateGifCatalogEntry))
+	mux.HandleFunc("POST /v1/gif-catalog/set-enabled", s.authenticated(s.handleSetGifCatalogEnabled))
+	mux.HandleFunc("POST /v1/gif-catalog/set-sort-order", s.authenticated(s.handleSetGifCatalogSortOrder))
+	mux.HandleFunc("POST /v1/gif-catalog/delete", s.authenticated(s.handleDeleteGifCatalogEntry))
 	mux.HandleFunc("GET /v1/gifts/{id}/collectibles", s.authenticated(s.handleStarGiftCollectibles))
 	mux.HandleFunc("GET /v1/gifts/{id}/collectibles/{kind}/{attribute_id}/animation", s.authenticated(s.handleStarGiftCollectibleAnimation))
 	mux.HandleFunc("GET /v1/moderation/cases", s.authenticated(s.handleModerationCases))
@@ -466,6 +511,136 @@ func (s *Server) handleSetUsername(w http.ResponseWriter, r *http.Request) {
 	writeCommandResult(w, result, err)
 }
 
+func (s *Server) handleAccountAvatar(w http.ResponseWriter, r *http.Request) {
+	userID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || userID <= 0 {
+		http.NotFound(w, r)
+		return
+	}
+	data, mimeType, found, err := s.svc.AccountAvatar(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !found {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", mimeType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+func (s *Server) handleSetProfile(w http.ResponseWriter, r *http.Request) {
+	var req admin.SetProfileRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.SetProfile(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleSetPhone(w http.ResponseWriter, r *http.Request) {
+	var req admin.SetPhoneRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.SetPhone(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleSetLoginEmail(w http.ResponseWriter, r *http.Request) {
+	var req admin.SetLoginEmailRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.SetLoginEmail(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleSetAccountAvatar(w http.ResponseWriter, r *http.Request) {
+	var req admin.SetAccountAvatarRequest
+	if !s.decodeAvatarUpload(w, r, &req.FileName, &req.Data) {
+		return
+	}
+	if !decodeMultipartMetadata(w, r, &req) {
+		return
+	}
+	result, err := s.svc.SetAccountAvatar(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleChannelAvatar(w http.ResponseWriter, r *http.Request) {
+	channelID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || channelID <= 0 {
+		http.NotFound(w, r)
+		return
+	}
+	data, mimeType, found, err := s.svc.ChannelAvatar(r.Context(), channelID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !found {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", mimeType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+func (s *Server) handleSetChannelAvatar(w http.ResponseWriter, r *http.Request) {
+	var req admin.SetChannelAvatarRequest
+	if !s.decodeAvatarUpload(w, r, &req.FileName, &req.Data) {
+		return
+	}
+	if !decodeMultipartMetadata(w, r, &req) {
+		return
+	}
+	result, err := s.svc.SetChannelAvatar(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) decodeAvatarUpload(w http.ResponseWriter, r *http.Request, fileName *string, data *[]byte) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, admin.MaxAccountAvatarBytes+(1<<20))
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid multipart form: "+err.Error())
+		return false
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "avatar file is required")
+		return false
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, admin.MaxAccountAvatarBytes+1))
+	if err != nil || len(raw) == 0 || int64(len(raw)) > admin.MaxAccountAvatarBytes {
+		writeError(w, http.StatusBadRequest, "avatar file is empty or too large")
+		return false
+	}
+	*fileName = header.Filename
+	*data = raw
+	return true
+}
+
+func decodeMultipartMetadata(w http.ResponseWriter, r *http.Request, dst any) bool {
+	dec := json.NewDecoder(strings.NewReader(r.FormValue("metadata")))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid metadata: "+err.Error())
+		return false
+	}
+	return true
+}
+
 func (s *Server) handleSetUserColor(w http.ResponseWriter, r *http.Request) {
 	var req admin.SetUserColorRequest
 	if !decodeJSON(w, r, &req) {
@@ -529,12 +704,37 @@ func (s *Server) handleCreateBot(w http.ResponseWriter, r *http.Request) {
 	writeCommandResult(w, result, err)
 }
 
+func (s *Server) handleCreateBroadcast(w http.ResponseWriter, r *http.Request) {
+	var req admin.CreateBroadcastRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	service, ok := s.svc.(interface {
+		CreateBroadcast(context.Context, admin.CreateBroadcastRequest) (admin.CommandResult, error)
+	})
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "broadcasts are not configured")
+		return
+	}
+	result, err := service.CreateBroadcast(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
 func (s *Server) handleDeleteBot(w http.ResponseWriter, r *http.Request) {
 	var req admin.DeleteBotRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
 	result, err := s.svc.DeleteBot(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleExportBotToken(w http.ResponseWriter, r *http.Request) {
+	var req admin.ExportBotTokenRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.ExportBotToken(r.Context(), req)
 	writeCommandResult(w, result, err)
 }
 
@@ -563,6 +763,138 @@ func (s *Server) handleDeleteHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.svc.DeletePrivateHistory(r.Context(), req)
 	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleSetStickerSetArchived(w http.ResponseWriter, r *http.Request) {
+	var req admin.SetStickerSetArchivedRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.SetStickerSetArchived(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleSetStickerSetSortOrder(w http.ResponseWriter, r *http.Request) {
+	var req admin.SetStickerSetSortOrderRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.SetStickerSetSortOrder(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleRenameStickerSet(w http.ResponseWriter, r *http.Request) {
+	var req admin.RenameStickerSetRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.RenameStickerSet(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleDeleteStickerSet(w http.ResponseWriter, r *http.Request) {
+	var req admin.DeleteStickerSetRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.DeleteStickerSet(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleCreateStickerSet(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, domain.MaxStickerMaterialDocumentSize+(2<<20))
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid multipart form: "+err.Error())
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	var req admin.CreateStickerSetRequest
+	dec := json.NewDecoder(strings.NewReader(r.FormValue("metadata")))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid metadata: "+err.Error())
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "sticker file is required")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, domain.MaxStickerMaterialDocumentSize+1))
+	if err != nil || len(data) == 0 || int64(len(data)) > domain.MaxStickerMaterialDocumentSize {
+		writeError(w, http.StatusBadRequest, "sticker file is empty or too large")
+		return
+	}
+	req.FileName, req.Data = header.Filename, data
+	result, err := s.svc.CreateStickerSet(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleAddStickerToSet(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, domain.MaxStickerMaterialDocumentSize+(2<<20))
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid multipart form: "+err.Error())
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	var req admin.AddStickerToSetRequest
+	dec := json.NewDecoder(strings.NewReader(r.FormValue("metadata")))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid metadata: "+err.Error())
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "sticker file is required")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, domain.MaxStickerMaterialDocumentSize+1))
+	if err != nil || len(data) == 0 || int64(len(data)) > domain.MaxStickerMaterialDocumentSize {
+		writeError(w, http.StatusBadRequest, "sticker file is empty or too large")
+		return
+	}
+	req.FileName, req.Data = header.Filename, data
+	result, err := s.svc.AddStickerToSet(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleRemoveStickerFromSet(w http.ResponseWriter, r *http.Request) {
+	var req admin.RemoveStickerFromSetRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.RemoveStickerFromSet(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleStickerDocumentAnimation(w http.ResponseWriter, r *http.Request) {
+	documentID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || documentID <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid document id")
+		return
+	}
+	raw, contentType, found, err := s.svc.StickerDocumentAnimation(r.Context(), documentID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "document animation not found")
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(raw)
 }
 
 func (s *Server) handleImportStarGift(w http.ResponseWriter, r *http.Request) {
@@ -787,6 +1119,96 @@ func (s *Server) handleEmojiAnimation(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "private, max-age=60")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(raw)
+}
+
+func (s *Server) handleGifCatalog(w http.ResponseWriter, r *http.Request) {
+	items, err := s.svc.GifCatalog(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"rows": items, "limit": domain.MaxGifCatalogEntries})
+}
+
+func (s *Server) handleGifCatalogPreview(w http.ResponseWriter, r *http.Request) {
+	documentID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || documentID <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid document id")
+		return
+	}
+	raw, contentType, found, err := s.svc.GifCatalogDocumentPreview(r.Context(), documentID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "gif preview not found")
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "private, max-age=60")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(raw)
+}
+
+func (s *Server) handleCreateGifCatalogEntry(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, domain.MaxGifCatalogUploadSize+(2<<20))
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid multipart form: "+err.Error())
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	var req admin.CreateGifCatalogEntryRequest
+	dec := json.NewDecoder(strings.NewReader(r.FormValue("metadata")))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid metadata: "+err.Error())
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "gif file is required")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, domain.MaxGifCatalogUploadSize+1))
+	if err != nil || len(data) == 0 || len(data) > domain.MaxGifCatalogUploadSize {
+		writeError(w, http.StatusBadRequest, "gif file is empty or too large")
+		return
+	}
+	req.FileName, req.Data = header.Filename, data
+	result, err := s.svc.CreateGifCatalogEntry(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleSetGifCatalogEnabled(w http.ResponseWriter, r *http.Request) {
+	var req admin.SetGifCatalogEnabledRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.SetGifCatalogEnabled(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleSetGifCatalogSortOrder(w http.ResponseWriter, r *http.Request) {
+	var req admin.SetGifCatalogSortOrderRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.SetGifCatalogSortOrder(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleDeleteGifCatalogEntry(w http.ResponseWriter, r *http.Request) {
+	var req admin.DeleteGifCatalogEntryRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.DeleteGifCatalogEntry(r.Context(), req)
+	writeCommandResult(w, result, err)
 }
 
 func (s *Server) handleStarGiftCollectibles(w http.ResponseWriter, r *http.Request) {
