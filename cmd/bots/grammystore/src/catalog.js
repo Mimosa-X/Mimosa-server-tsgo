@@ -1,21 +1,21 @@
 export const KINDS = Object.freeze({ premium: "premium", stars: "stars", number: "number", username: "username" });
 
 const fixed = Object.freeze([
-  { kind: KINDS.premium, code: "premium_1m", title: "Premium — 1 month", description: "Premium subscription for one month", starsPrice: 20, months: 1 },
-  { kind: KINDS.premium, code: "premium_3m", title: "Premium — 3 months", description: "Premium subscription for three months", starsPrice: 40, months: 3 },
-  { kind: KINDS.number, code: "num_short", title: "Anonymous +888 8 XXX", description: "Short collectible anonymous number", starsPrice: 50, numberFormat: "short" },
-  { kind: KINDS.number, code: "num_long", title: "Anonymous +888 0XXX XXXX", description: "Anonymous +888 number", starsPrice: 25, numberFormat: "long" },
-  { kind: KINDS.username, code: "uname_10", title: "Collectible username — 10 TON", description: "Mint a collectible username", starsPrice: 10, bid: 10 },
-  { kind: KINDS.username, code: "uname_100", title: "Collectible username — 100 TON", description: "Mint a collectible username", starsPrice: 20, bid: 100 },
-  { kind: KINDS.username, code: "uname_1000", title: "Collectible username — 1000 TON", description: "Mint a collectible username", starsPrice: 40, bid: 1000 },
+  { kind: KINDS.premium, code: "premium_1m", title: "NexGram Premium — 1 месяц", description: "Премиум-подписка на 1 месяц", starsPrice: 20, months: 1 },
+  { kind: KINDS.premium, code: "premium_3m", title: "NexGram Premium — 3 месяца", description: "Премиум-подписка на 3 месяца", starsPrice: 40, months: 3 },
+  { kind: KINDS.number, code: "num_short", title: "Анонимный номер +888 8 XXX", description: "Формат +888 8 XXX (3 случайные цифры)", starsPrice: 50, numberFormat: "short" },
+  { kind: KINDS.number, code: "num_long", title: "Анонимный номер +888 0XXX XXXX", description: "Формат +888 0XXX XXXX (7 случайных цифр)", starsPrice: 25, numberFormat: "long" },
+  { kind: KINDS.username, code: "uname_10", title: "Коллекционный @username — ставка 10 TON", description: "Выпуск NFT-юзернейма в NexGram со ставкой 10 TON.", starsPrice: 10, bid: 10 },
+  { kind: KINDS.username, code: "uname_100", title: "Коллекционный @username — ставка 100 TON", description: "Выпуск NFT-юзернейма в NexGram со ставкой 100 TON.", starsPrice: 20, bid: 100 },
+  { kind: KINDS.username, code: "uname_1000", title: "Коллекционный @username — ставка 1000 TON", description: "Выпуск NFT-юзернейма в NexGram со ставкой 1000 TON.", starsPrice: 40, bid: 1000 },
 ]);
 
 export function catalog(starsRate = 20) {
   const starPackages = [1, 5, 10, 25, 50, 100].map((price) => ({
     kind: KINDS.stars,
     code: `stars_${price}`,
-    title: `${price * starsRate} Stars`,
-    description: `${price * starsRate} server Stars for ${price} Telegram Stars`,
+    title: `${price * starsRate} NexGram Stars`,
+    description: `${price * starsRate} NexGram Stars за ${price} Telegram Stars`,
     starsPrice: price,
     starsAmount: price * starsRate,
   }));
@@ -25,14 +25,15 @@ export function catalog(starsRate = 20) {
 export function findProduct(code, starsRate = 20) {
   const fixedProduct = catalog(starsRate).find((product) => product.code === code);
   if (fixedProduct) return fixedProduct;
-  const match = String(code).match(/^stars_([1-9]\d{0,4})$/);
+  const match = String(code).match(/^stars_([1-9]\d{0,5})$/);
   if (!match) return null;
   const starsPrice = Number(match[1]);
+  if (starsPrice > 100000) return null;
   return {
     kind: KINDS.stars,
     code: `stars_${starsPrice}`,
-    title: `${starsPrice * starsRate} Stars`,
-    description: `${starsPrice * starsRate} server Stars for ${starsPrice} Telegram Stars`,
+    title: `${starsPrice * starsRate} NexGram Stars`,
+    description: `${starsPrice * starsRate} NexGram Stars за ${starsPrice} Telegram Stars`,
     starsPrice,
     starsAmount: starsPrice * starsRate,
   };

@@ -435,6 +435,17 @@ type PremiumRefundRequest struct {
 	CommandKey      string
 }
 
+// PremiumSubscriptionActiveError prevents the single-recipient Premium gift
+// flow from silently stacking another entitlement on an already active one.
+// Until is the recipient's current expiry as a Unix timestamp.
+type PremiumSubscriptionActiveError struct {
+	Until int
+}
+
+func (e PremiumSubscriptionActiveError) Error() string {
+	return fmt.Sprintf("premium: subscription active until %d", e.Until)
+}
+
 var (
 	ErrPremiumPlanInvalid         = errors.New("premium: invalid plan")
 	ErrPremiumPlanUnavailable     = errors.New("premium: plan unavailable")

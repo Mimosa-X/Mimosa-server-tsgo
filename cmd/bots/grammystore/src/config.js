@@ -29,7 +29,7 @@ export function loadConfig() {
   if (webhookSecret.length < 24) throw new Error("CODE_WEBHOOK_SECRET must contain at least 24 characters");
   return Object.freeze({
     botToken: required("BOT_TOKEN"),
-    productName: (process.env.PRODUCT_NAME ?? "Telesrv").trim() || "Telesrv",
+    productName: (process.env.PRODUCT_NAME ?? "NexGram").trim() || "NexGram",
     ownerIDs: ownerIDs(),
     publicUsername: (process.env.BOT_PUBLIC_USERNAME ?? "").replace(/^@/, "").trim(),
     gramsrvAPI: (process.env.GRAMSRV_API ?? "http://127.0.0.1:2399").replace(/\/+$/, ""),
@@ -42,11 +42,6 @@ export function loadConfig() {
     codeWebhookSecret: webhookSecret,
     requiredChannel: (process.env.REQUIRED_CHANNEL ?? "").trim(),
     requiredChannelURL: (process.env.REQUIRED_CHANNEL_URL ?? "").trim(),
-    supportUsername: (process.env.SUPPORT_USERNAME ?? "").replace(/^@/, "").trim(),
-    defaultLanguage: (process.env.DEFAULT_LANGUAGE ?? "ru").toLowerCase() === "en" ? "en" : "ru",
     defaultNumberCountry: (process.env.DEFAULT_NUMBER_COUNTRY ?? "RU").toUpperCase() === "US" ? "US" : "RU",
-    referralBonus: integer("REFERRAL_BONUS", 100, { min: 0 }),
-    dailyBonus: integer("DAILY_BONUS", 15, { min: 0 }),
-    notificationTTLDays: integer("NOTIFICATION_TTL_DAYS", 30, { min: 1 }),
   });
 }

@@ -815,6 +815,50 @@ func TestChannelUniqueActionSuppressesCraftReadinessAcrossProfiles(t *testing.T)
 	}
 }
 
+func TestUniqueGiftSenderMirrorHidesOwnerLifecycleControls(t *testing.T) {
+	const (
+		ownerID  = int64(7102)
+		senderID = int64(7101)
+	)
+	action := &domain.MessageStarGiftUniqueAction{
+		Gift: domain.UniqueStarGift{
+			ID: 9903, GiftID: 8003, Title: "Owned gift", Slug: "owned-gift-1", Num: 1,
+			Owner: domain.Peer{Type: domain.PeerTypeUser, ID: ownerID},
+		},
+		TransferStars: 25, ResaleAmount: &domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 100},
+		CanExportAt: 100, CanTransferAt: 101, CanResellAt: 102,
+		DropOriginalDetailsStars: 25, CanCraftAt: 103,
+	}
+
+	owner := tgMessageActionStarGiftUniqueForViewer(action, ownerID).(*tg.MessageActionStarGiftUnique)
+	if value, ok := owner.GetDropOriginalDetailsStars(); !ok || value != 25 {
+		t.Fatalf("owner drop_original_details_stars = %d set=%v", value, ok)
+	}
+
+	sender := tgMessageActionStarGiftUniqueForViewer(action, senderID).(*tg.MessageActionStarGiftUnique)
+	if _, ok := sender.GetDropOriginalDetailsStars(); ok {
+		t.Fatal("sender mirror exposed drop_original_details_stars")
+	}
+	if _, ok := sender.GetTransferStars(); ok {
+		t.Fatal("sender mirror exposed transfer_stars")
+	}
+	if _, ok := sender.GetResaleAmount(); ok {
+		t.Fatal("sender mirror exposed resale_amount")
+	}
+	if _, ok := sender.GetCanExportAt(); ok {
+		t.Fatal("sender mirror exposed can_export_at")
+	}
+	if _, ok := sender.GetCanTransferAt(); ok {
+		t.Fatal("sender mirror exposed can_transfer_at")
+	}
+	if _, ok := sender.GetCanResellAt(); ok {
+		t.Fatal("sender mirror exposed can_resell_at")
+	}
+	if _, ok := sender.GetCanCraftAt(); ok {
+		t.Fatal("sender mirror exposed can_craft_at")
+	}
+}
+
 func TestStarGiftLifecycleCraftUnavailableError(t *testing.T) {
 	if err := starGiftLifecycleErr(domain.ErrStarGiftCraftUnavailable); !tgerr.Is(err, "STARGIFT_CRAFT_UNAVAILABLE") {
 		t.Fatalf("craft unavailable mapping = %v", err)

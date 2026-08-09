@@ -2,90 +2,149 @@ import { Bot, GrammyError, HttpError, InlineKeyboard } from "grammy";
 import { randomInt } from "node:crypto";
 import { buildPayload, findProduct, KINDS, normalizeUsername, parsePayload, productsOfKind } from "./catalog.js";
 
-const spinPrizes = [{ amount: 50, weight: 250 }, { amount: 100, weight: 130 }, { amount: 500, weight: 50 }, { amount: 1000, weight: 30 }, { amount: 10000, weight: 10 }, { amount: 15, weight: 530 }];
-const text = {
-  ru: {
-    hello: "👋 <b>Добро пожаловать!</b>\n\nЗдесь можно получать номера и коды, покупать Stars, Premium и коллекционные активы.",
-    menu: "🏠 <b>Главное меню</b>", numbers: "📱 <b>Ваши номера</b>", noCode: "Код ещё не поступал.",
-    shop: "🛒 <b>Магазин</b>\nВыберите раздел:", bonuses: "🎁 <b>Бонусы</b>", settings: "⚙️ <b>Настройки</b>",
-    support: "💬 Отправьте одним сообщением вопрос для поддержки.", target: "Введите числовой ID пользователя в {product}.",
-    account: "Введите ваш числовой ID аккаунта {product}. Он будет использоваться для бонусов и покупок себе.",
-  },
-  en: {
-    hello: "👋 <b>Welcome!</b>\n\nGet numbers and login codes, or buy Stars, Premium and collectibles.",
-    menu: "🏠 <b>Main menu</b>", numbers: "📱 <b>Your numbers</b>", noCode: "No login code has arrived yet.",
-    shop: "🛒 <b>Store</b>\nChoose a section:", bonuses: "🎁 <b>Bonuses</b>", settings: "⚙️ <b>Settings</b>",
-    support: "💬 Send your support question in one message.", target: "Enter the numeric {product} user ID.",
-    account: "Enter your numeric {product} account ID. It is used for bonuses and purchases for yourself.",
-  },
-};
+const SPIN_PRIZES = Object.freeze([
+  { amount: 50, weight: 250 },
+  { amount: 100, weight: 130 },
+  { amount: 500, weight: 50 },
+  { amount: 1000, weight: 30 },
+  { amount: 10000, weight: 10 },
+  { amount: 15, weight: 530 },
+]);
 
-function escapeHTML(value) { return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;"); }
-function language(db, id, fallback) { return db.user(id)?.language ?? fallback; }
-function t(db, id, fallback, key, productName = "Telesrv") { return text[language(db, id, fallback)][key].replaceAll("{product}", productName); }
-function isOwner(config, id) { return config.ownerIDs.has(id); }
-function userName(from) { return from.username ? `@${from.username}` : [from.first_name, from.last_name].filter(Boolean).join(" "); }
-function initialLanguage(from, fallback) { const code = String(from?.language_code ?? "").toLowerCase(); return code.startsWith("ru") ? "ru" : code ? "en" : fallback; }
+const FREE_COUNTRY_TEXT = "🎁 <b>Бесплатный номер</b>\n\nВыберите код страны для получения бесплатного номера.\nНа этот номер вы сможете получать коды входа <b>бесплатно</b>.";
+const ID_HELP_TEXT = "ℹ️ <b>Как получить свой NexGram ID</b>\n\n1. Перейдите в бот <b>@getmyid</b> (именно в <b>NexGram</b>, не в Telegram!)\n2. Нажмите «Старт»\n3. Скопируйте свой ID\n4. Пришлите его сюда сообщением";
 
-function mainKeyboard(admin = false) {
-  const kb = new InlineKeyboard().text("📱 Номера", "menu:numbers").text("🛒 Магазин", "menu:shop").row()
-    .text("🎁 Бонусы", "menu:bonuses").text("👥 Рефералы", "menu:referrals").row()
-    .text("💬 Поддержка", "menu:support").text("⚙️ Настройки", "menu:settings");
-  if (admin) kb.row().text("🛡 Админ-панель", "admin:menu");
-  return kb;
+function escapeHTML(value) {
+  return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 }
-function backKeyboard(target = "menu:home") { return new InlineKeyboard().text("‹ Назад", target); }
-function shopKeyboard() { return new InlineKeyboard().text("👑 Premium", "shop:premium").text("⭐ Stars", "shop:stars").row().text("📱 +888", "shop:number").text("💎 NFT username", "shop:username").row().text("‹ Назад", "menu:home"); }
-function settingsKeyboard(user) { return new InlineKeyboard().text("🆔 ID аккаунта", "settings:account").row().text("🌐 Русский", "settings:lang:ru").text("🌐 English", "settings:lang:en").row().text(user.notifications ? "🔔 Уведомления: да" : "🔕 Уведомления: нет", "settings:notifications").row().text("‹ Назад", "menu:home"); }
-function adminKeyboard() { return new InlineKeyboard().text("📊 Статистика", "admin:stats").text("📣 Рассылка", "admin:broadcast").row().text("⭐ Выдать Stars", "admin:stars").text("💎 Выдать Premium", "admin:premium").row().text("🎟 Промокод", "admin:promo").text("🎁 Розыгрыш", "admin:giveaway").row().text("🎁 Выдать бонус", "admin:bonus").text("🧾 Счёт", "admin:invoice").row().text("📨 Доступ к кодам", "admin:access").text("↩️ Возврат", "admin:refund").row().text("💬 Ответить", "admin:reply").text("📈 Продажи", "admin:sales").row().text("⚙️ Курс Stars", "admin:rate").row().text("‹ Назад", "menu:home"); }
 
-async function editOrReply(ctx, message, keyboard = undefined) {
+function isOwner(config, userID) { return config.ownerIDs.has(userID); }
+function displayName(from) { return from?.username ? `@${from.username}` : [from?.first_name, from?.last_name].filter(Boolean).join(" "); }
+function positiveInteger(value, max = Number.MAX_SAFE_INTEGER) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 && number <= max ? number : 0;
+}
+function normalizePhone(value) {
+  const phone = String(value ?? "").replace(/[\s()\-]/g, "");
+  return phone && !phone.startsWith("+") ? `+${phone}` : phone;
+}
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+function menuText(config, userID) {
+  let value = `👋 Привет! Это бот <b>${escapeHTML(config.productName)}</b>.\n\nВыбери действие кнопками ниже 👇`;
+  if (isOwner(config, userID)) value += "\n\n👑 <i>Режим владельца: покупки проходят без счёта, автоматически.</i>";
+  return value;
+}
+
+function mainKeyboard(admin) {
+  const keyboard = new InlineKeyboard()
+    .text("🛍 Магазин", "shop").row()
+    .text("📞 Мои номера", "mynumbers").row()
+    .text("🎁 Бесплатный номер", "free").row()
+    .text("🎰 Бесплатная рулетка", "spin").row()
+    .text("🆔 Как узнать свой NexGram ID", "idhelp");
+  if (admin) keyboard.row().text("👑 Админка", "admin");
+  return keyboard;
+}
+
+function backMenuKeyboard() { return new InlineKeyboard().text("⬅️ В меню", "menu"); }
+function shopKeyboard() {
+  return new InlineKeyboard()
+    .text("💎 Premium", "cat:premium").row()
+    .text("⭐ NexGram Stars", "cat:stars").row()
+    .text("📞 Номера +888", "cat:number").row()
+    .text("🎭 Коллекционные @username", "cat:username").row()
+    .text("⬅️ Назад", "menu");
+}
+function freeCountryKeyboard() {
+  return new InlineKeyboard().text("🇷🇺 +7 (Россия)", "free:RU").text("🇺🇸 +1 (США)", "free:US").row().text("⬅️ В меню", "menu");
+}
+function adminKeyboard() {
+  return new InlineKeyboard()
+    .text("⭐ Выдать Stars", "adm:stars").row()
+    .text("💎 Выдать Premium", "adm:premium").row()
+    .text("🎭 Выдать @username", "adm:username").row()
+    .text("🧾 Выставить счёт", "adm:invoice").row()
+    .text("📨 Дать доступ к кодам", "adm:access").row()
+    .text("📢 Рассылка", "adm:bcast").row()
+    .text("🎉 Акция", "adm:gw").row()
+    .text("🏷 Промокод", "adm:promo").row()
+    .text("💱 Курс NexGram Stars", "adm:rate").row()
+    .text("↩️ Возврат по transaction ID", "adm:refund").row()
+    .text("📒 Логи магазина", "adm:sales").row()
+    .text("⬅️ В меню", "menu");
+}
+function categoryKeyboard(kind, db) {
+  const keyboard = new InlineKeyboard();
+  for (const product of productsOfKind(kind, db.starsRate())) {
+    let label = `${product.title} — ${product.starsPrice}⭐`;
+    if (product.kind === KINDS.premium) label = `${product.months} мес — ${product.starsPrice}⭐`;
+    if (product.kind === KINDS.username) label = `Ставка ${product.bid} TON — ${product.starsPrice}⭐`;
+    keyboard.text(label, `p:${product.code}`).row();
+  }
+  return keyboard.text("⬅️ Назад", "shop");
+}
+function productKeyboard(product) {
+  const keyboard = new InlineKeyboard().text("🛒 Купить", `buy:${product.code}:self`);
+  if (product.kind !== KINDS.number && product.kind !== KINDS.username) keyboard.row().text("🎁 Купить другому", `buy:${product.code}:other`);
+  return keyboard.row().text("⬅️ Назад", `cat:${product.kind}`);
+}
+function targetKeyboard(productCode, buyerID, db) {
+  const keyboard = new InlineKeyboard();
+  for (const recipientID of db.recentRecipients(buyerID)) keyboard.text(`♻️ ${recipientID}`, `rid:${productCode}:${recipientID}`).row();
+  return keyboard.text("⬅️ В меню", "menu");
+}
+function productText(product, db) {
+  let extra = "";
+  if (product.kind === KINDS.stars) extra = `\n\nКурс: 1⭐ Telegram = ${db.starsRate()} NexGram Stars`;
+  if (product.kind === KINDS.number) extra = "\n\nПосле оплаты номер резервируется за тобой, коды авторизации приходят в этот чат.";
+  if (product.kind === KINDS.username) extra = `\n\nСтавка: <b>${product.bid} TON</b>. После оплаты юзернейм будет выпущен как коллекционный NFT в NexGram и закреплён за указанным NexGram ID.`;
+  return `<b>${escapeHTML(product.title)}</b>\n\n${escapeHTML(product.description)}\n\n💰 Цена: <b>${product.starsPrice} ⭐</b>${extra}`;
+}
+
+async function editOrReply(ctx, text, keyboard = backMenuKeyboard()) {
   const options = { parse_mode: "HTML", link_preview_options: { is_disabled: true }, reply_markup: keyboard };
   if (ctx.callbackQuery?.message) {
-    try { return await ctx.editMessageText(message, options); } catch (error) { if (!String(error.description ?? error).includes("message is not modified")) throw error; }
+    try { return await ctx.editMessageText(text, options); }
+    catch (error) {
+      if (String(error?.description ?? error).includes("message is not modified")) return;
+    }
   }
-  return ctx.reply(message, options);
+  return ctx.reply(text, options);
 }
 
-async function subscribed(ctx, config) {
+async function isSubscribed(ctx, config) {
   if (!config.requiredChannel || isOwner(config, ctx.from.id)) return true;
-  try { const member = await ctx.api.getChatMember(config.requiredChannel, ctx.from.id); return ["creator", "administrator", "member", "restricted"].includes(member.status); }
-  catch { return false; }
+  try {
+    const member = await ctx.api.getChatMember(config.requiredChannel, ctx.from.id);
+    return ["creator", "administrator", "member", "restricted"].includes(member.status);
+  } catch (error) {
+    console.error("subscription check failed", ctx.from.id, error?.description ?? error);
+    return false;
+  }
 }
 
-async function subscriptionGate(ctx, config) {
-  const kb = new InlineKeyboard();
-  if (config.requiredChannelURL) kb.url("📣 Открыть канал", config.requiredChannelURL).row();
-  kb.text("✅ Я подписался", "subscription:check");
-  await editOrReply(ctx, "🔒 Для использования бота подпишитесь на обязательный канал, затем нажмите кнопку проверки.", kb);
+function subscriptionKeyboard(config) {
+  const keyboard = new InlineKeyboard();
+  const url = config.requiredChannelURL || `https://t.me/${config.requiredChannel.replace(/^@/, "")}`;
+  if (url) keyboard.url("📣 Открыть канал", url).row();
+  return keyboard.text("✅ Я подписался", "checksub");
 }
-
-function parseStartRef(ctx) {
-  const match = String(ctx.match ?? "").match(/^ref_(\d+)$/); return match ? Number(match[1]) : 0;
+function subscriptionText(config) {
+  return `🔒 <b>Подпишись на канал</b> ${escapeHTML(config.requiredChannel)}\n\nДля работы с ботом нужна подписка на наш канал.\n1. Подпишись на ${escapeHTML(config.requiredChannel)}\n2. Нажми «✅ Я подписался»`;
 }
-
-function productText(product) {
-  const extra = product.kind === KINDS.username ? `\nСтавка: <b>${product.bid} TON</b>` : product.kind === KINDS.stars ? `\nБудет начислено: <b>${product.starsAmount}</b>` : "";
-  return `<b>${escapeHTML(product.title)}</b>\n\n${escapeHTML(product.description)}\n\nЦена: <b>${product.starsPrice} ⭐</b>${extra}`;
-}
-
-function productKeyboard(product, db, buyerID) {
-  const kb = new InlineKeyboard();
-  if (product.kind === KINDS.number) return kb.text(`Купить за ${product.starsPrice} ⭐`, `buy:${product.code}:0`).row().text("‹ Назад", `shop:${product.kind}`);
-  const selfID = db.user(buyerID)?.server_user_id ?? 0;
-  if (selfID > 0) kb.text("Купить себе", `buy:${product.code}:${selfID}`).row();
-  kb.text("Подарить / другой ID", `target:${product.code}`).row();
-  for (const id of db.recentRecipients(buyerID)) kb.text(`ID ${id}`, `buy:${product.code}:${id}`);
-  return kb.row().text("‹ Назад", `shop:${product.kind}`);
-}
-
-async function sendInvoice(ctx, product, targetUserID, extra = "") {
-  await ctx.api.sendInvoice(ctx.chat.id, product.title, product.description, buildPayload(product.code, targetUserID, extra), "XTR", [{ label: product.title, amount: product.starsPrice }]);
+async function requireSubscription(ctx, config) {
+  if (await isSubscribed(ctx, config)) return true;
+  await editOrReply(ctx, subscriptionText(config), subscriptionKeyboard(config));
+  return false;
 }
 
 function rollPrize() {
-  const total = spinPrizes.reduce((sum, value) => sum + value.weight, 0); let value = randomInt(total);
-  for (const prize of spinPrizes) { value -= prize.weight; if (value < 0) return prize.amount; }
+  let value = randomInt(SPIN_PRIZES.reduce((sum, prize) => sum + prize.weight, 0));
+  for (const prize of SPIN_PRIZES) {
+    value -= prize.weight;
+    if (value < 0) return prize.amount;
+  }
   return 15;
 }
 
@@ -93,175 +152,393 @@ export function createBot({ config, db, gramsrv }) {
   const bot = new Bot(config.botToken);
 
   bot.use(async (ctx, next) => {
-    if (ctx.from && ctx.chat) db.upsertUser(ctx.from, ctx.chat.id, initialLanguage(ctx.from, config.defaultLanguage));
+    if (ctx.from && ctx.chat) db.upsertUser(ctx.from, ctx.chat.id, "ru");
     await next();
   });
 
-  bot.command("start", async (ctx) => {
-    const referrer = parseStartRef(ctx);
-    const existed = db.user(ctx.from.id);
-    db.upsertUser(ctx.from, ctx.chat.id, initialLanguage(ctx.from, config.defaultLanguage), referrer, config.referralBonus);
-    if (!(await subscribed(ctx, config))) return subscriptionGate(ctx, config);
-    const number = db.createNumber(ctx.from.id, ctx.chat.id, "free", config.defaultNumberCountry, false);
-    const referralNotice = !existed && referrer > 0 ? "\n\n✅ Реферальное приглашение учтено." : "";
-    await ctx.reply(`${t(db, ctx.from.id, config.defaultLanguage, "hello")}\n\n📞 Ваш номер: <code>${escapeHTML(number.display)}</code>\n🔑 Начальный код: <code>${number.login_code}</code>${referralNotice}`, { parse_mode: "HTML", reply_markup: mainKeyboard(isOwner(config, ctx.from.id)) });
+  async function showMenu(ctx) {
+    db.clearPending(ctx.from.id);
+    return editOrReply(ctx, menuText(config, ctx.from.id), mainKeyboard(isOwner(config, ctx.from.id)));
+  }
+
+  async function broadcast(text, keyboard) {
+    let sent = 0, failed = 0;
+    for (const user of db.users()) {
+      try {
+        await bot.api.sendMessage(user.chat_id, text, { parse_mode: "HTML", link_preview_options: { is_disabled: true }, reply_markup: keyboard });
+        sent++;
+      } catch { failed++; }
+      await sleep(40);
+    }
+    return { sent, failed };
+  }
+
+  async function fulfill(product, recipientID, buyer, chatID, chargeID, extra = "") {
+    if (db.saleByCharge(chargeID)) return;
+    const commandKey = `payment:${chargeID}:${product.code}`;
+    let number;
+    if (product.kind === KINDS.premium) {
+      if (!positiveInteger(recipientID)) throw new Error("Некорректный NexGram ID получателя");
+      await gramsrv.grantPremium(recipientID, product.months, "Telegram bot purchase", commandKey);
+    } else if (product.kind === KINDS.stars) {
+      if (!positiveInteger(recipientID)) throw new Error("Некорректный NexGram ID получателя");
+      await gramsrv.grantStars(recipientID, product.starsAmount, "Telegram bot purchase", commandKey);
+    } else if (product.kind === KINDS.username) {
+      const username = normalizeUsername(extra);
+      if (!positiveInteger(recipientID) || !username) throw new Error("Некорректный NexGram ID или @username");
+      await gramsrv.mintUsername(recipientID, username, product.bid, commandKey);
+    } else if (product.kind === KINDS.number) {
+      number = db.createNumber(buyer.id, chatID, product.numberFormat, "ANON", true);
+      recipientID = buyer.id;
+    } else throw new Error("Неизвестный товар");
+
+    db.addSale({ product: product.code, title: product.title, starsPrice: product.starsPrice, recipientID, buyerID: buyer.id, buyerName: displayName(buyer), chargeID });
+    if (number) {
+      await bot.api.sendMessage(chatID, `✅ <b>Номер зарезервирован</b>\n\n📞 <code>${escapeHTML(number.display)}</code>\n\nКоды авторизации будут приходить сюда.`, { parse_mode: "HTML", reply_markup: backMenuKeyboard() });
+    } else if (product.kind === KINDS.username) {
+      const username = normalizeUsername(extra);
+      await bot.api.sendMessage(chatID, `✅ <b>Коллекционный @${escapeHTML(username)} выдан</b>\n\nВладелец: <code>${recipientID}</code>\nСтавка: <b>${product.bid} TON</b>\n\n🔗 ${escapeHTML(config.publicBaseURL)}/nft/username/${escapeHTML(username)}`, { parse_mode: "HTML", link_preview_options: { is_disabled: true }, reply_markup: backMenuKeyboard() });
+    } else {
+      const result = product.kind === KINDS.premium ? `Premium на ${product.months} мес.` : `${product.starsAmount} NexGram Stars`;
+      await bot.api.sendMessage(chatID, `✅ ${result} выдано пользователю <code>${recipientID}</code>`, { parse_mode: "HTML", reply_markup: backMenuKeyboard() });
+    }
+  }
+
+  async function startPurchase(ctx, product, targetID = 0, extra = "") {
+    if (targetID > 0 && targetID !== ctx.from.id) db.rememberRecipient(ctx.from.id, targetID);
+    if (isOwner(config, ctx.from.id)) {
+      await ctx.reply(`👑 <b>Тестовая покупка без оплаты</b>\n\n${escapeHTML(product.title)}\n(${product.starsPrice} ⭐ списано не будет)`, { parse_mode: "HTML" });
+      return fulfill(product, targetID || ctx.from.id, ctx.from, ctx.chat.id, `owner-${ctx.from.id}-${Date.now()}-${randomInt(1_000_000)}`, extra);
+    }
+    await ctx.api.sendInvoice(ctx.chat.id, product.title, product.description, buildPayload(product.code, targetID, extra), "XTR", [{ label: product.title, amount: product.starsPrice }]);
+  }
+
+  bot.command(["start", "menu", "shop"], async (ctx) => {
+    db.clearPending(ctx.from.id);
+    if (!(await requireSubscription(ctx, config))) return;
+    const free = db.freeNumber(ctx.from.id);
+    if (!free) return editOrReply(ctx, `${menuText(config, ctx.from.id)}\n\n${FREE_COUNTRY_TEXT}`, freeCountryKeyboard());
+    return showMenu(ctx);
   });
 
-  bot.command("menu", async (ctx) => editOrReply(ctx, t(db, ctx.from.id, config.defaultLanguage, "menu"), mainKeyboard(isOwner(config, ctx.from.id))));
-  bot.command("admin", async (ctx) => { if (isOwner(config, ctx.from.id)) await editOrReply(ctx, "🛡 <b>Админ-панель</b>", adminKeyboard()); });
   bot.command("promo_code", async (ctx) => {
-    const [code, rawID] = String(ctx.match ?? "").trim().split(/\s+/); const serverID = Number(rawID || db.user(ctx.from.id)?.server_user_id);
-    if (!code || !Number.isSafeInteger(serverID) || serverID <= 0) return ctx.reply(`Формат: /promo_code CODE ${config.productName.toUpperCase()}_ID`);
-    try {
-      const promo = db.claimPromo(code, ctx.from.id);
-      try { await gramsrv.grantStars(serverID, promo.stars_amount, `Promo ${code}`, `promo:${code.toLowerCase()}:${ctx.from.id}`); }
-      catch (error) { db.releaseCampaignClaim("promo", code.toLowerCase(), ctx.from.id); throw error; }
-      await ctx.reply(`✅ Начислено ${promo.stars_amount} Stars.`);
-    } catch (error) { await ctx.reply(`⚠️ ${escapeHTML(error.message)}`, { parse_mode: "HTML" }); }
+    if (!(await requireSubscription(ctx, config))) return;
+    const code = String(ctx.match ?? "").trim().split(/\s+/)[0];
+    if (!code) return ctx.reply("Формат: <code>/promo_code КОД</code>", { parse_mode: "HTML" });
+    db.setPending(ctx.from.id, "promo_claim", { code: code.toLowerCase() });
+    return ctx.reply(`🏷 Пришли свой <b>NexGram ID</b> сообщением.\n\n${ID_HELP_TEXT}`, { parse_mode: "HTML", reply_markup: backMenuKeyboard() });
   });
 
   bot.on("pre_checkout_query", async (ctx) => {
     try {
-      if (ctx.preCheckoutQuery.currency !== "XTR") throw new Error("unsupported currency");
-      if (!ctx.preCheckoutQuery.invoice_payload.startsWith("custom|")) {
-        const parsed = parsePayload(ctx.preCheckoutQuery.invoice_payload); const product = findProduct(parsed.code, db.starsRate());
-        if (!product || product.starsPrice !== ctx.preCheckoutQuery.total_amount) throw new Error("product price changed");
+      const query = ctx.preCheckoutQuery;
+      if (query.currency !== "XTR") throw new Error("unsupported currency");
+      if (!query.invoice_payload.startsWith("custom|")) {
+        const parsed = parsePayload(query.invoice_payload);
+        const product = findProduct(parsed.code, db.starsRate());
+        if (!product || product.starsPrice !== query.total_amount) throw new Error("stale invoice");
       }
       await ctx.answerPreCheckoutQuery(true);
+    } catch {
+      await ctx.answerPreCheckoutQuery(false, { error_message: "Некорректный или устаревший заказ." });
     }
-    catch { await ctx.answerPreCheckoutQuery(false, { error_message: "Некорректный или устаревший заказ." }); }
   });
-
-  async function fulfill(product, recipientID, buyer, chatID, chargeID, extra = "") {
-    if (product.kind !== KINDS.number && (!Number.isSafeInteger(recipientID) || recipientID <= 0)) throw new Error(`recipient ${config.productName} ID is invalid`);
-    if (db.saleByCharge(chargeID)) return;
-    const key = `payment:${chargeID}:${product.code}`;
-    let number = null;
-    if (product.kind === KINDS.premium) await gramsrv.grantPremium(recipientID, product.months, "Telegram bot purchase", key);
-    else if (product.kind === KINDS.stars) await gramsrv.grantStars(recipientID, product.starsAmount, "Telegram bot purchase", key);
-    else if (product.kind === KINDS.username) {
-      const username = normalizeUsername(extra); if (!username) throw new Error("collectible username is invalid");
-      await gramsrv.mintUsername(recipientID, username, product.bid, key);
-    } else if (product.kind === KINDS.number) {
-      number = db.createNumber(buyer.id, chatID, product.numberFormat, "ANON", true);
-    }
-    db.addSale({ product: product.code, title: product.title, starsPrice: product.starsPrice, recipientID, buyerID: buyer.id, buyerName: userName(buyer), chargeID });
-    if (number) await bot.api.sendMessage(chatID, `✅ Номер зарезервирован: <code>${escapeHTML(number.display)}</code>`, { parse_mode: "HTML" }).catch(() => {});
-    else await bot.api.sendMessage(chatID, `✅ <b>${escapeHTML(product.title)}</b> выдано пользователю <code>${recipientID}</code>.`, { parse_mode: "HTML" }).catch(() => {});
-  }
 
   bot.on("message:successful_payment", async (ctx) => {
     const payment = ctx.message.successful_payment;
-    if (!db.beginPayment(payment.telegram_payment_charge_id, ctx.from.id, payment.invoice_payload, payment.total_amount)) return;
+    const chargeID = payment.telegram_payment_charge_id;
+    if (!db.beginPayment(chargeID, ctx.from.id, payment.invoice_payload, payment.total_amount)) return;
     try {
       if (payment.invoice_payload.startsWith("custom|")) {
         const title = Buffer.from(payment.invoice_payload.slice(7), "base64url").toString("utf8");
-        db.addSale({ product: "custom", title, starsPrice: payment.total_amount, recipientID: ctx.from.id, buyerID: ctx.from.id, buyerName: userName(ctx.from), chargeID: payment.telegram_payment_charge_id });
-        await ctx.reply(`✅ Оплата «${escapeHTML(title)}» получена.`, { parse_mode: "HTML" });
+        db.addSale({ product: "custom", title, starsPrice: payment.total_amount, recipientID: ctx.from.id, buyerID: ctx.from.id, buyerName: displayName(ctx.from), chargeID });
+        await ctx.reply(`✅ <b>Оплата получена</b>\n\n${escapeHTML(title)} — ${payment.total_amount} ⭐\n\nЧек: <code>${escapeHTML(chargeID)}</code>`, { parse_mode: "HTML" });
+        for (const ownerID of config.ownerIDs) await bot.api.sendMessage(ownerID, `💰 Счёт оплачен: <code>${ctx.from.id}</code> → ${escapeHTML(title)} (${payment.total_amount} ⭐)`, { parse_mode: "HTML" }).catch(() => {});
       } else {
         const parsed = parsePayload(payment.invoice_payload);
-        const product = findProduct(parsed.code, db.starsRate()); if (!product) throw new Error("product no longer exists");
-        if (payment.currency !== "XTR" || payment.total_amount !== product.starsPrice) throw new Error("paid amount does not match the product");
-        const recipient = parsed.targetUserID || db.user(ctx.from.id)?.server_user_id || 0;
-        await fulfill(product, recipient, ctx.from, ctx.chat.id, payment.telegram_payment_charge_id, parsed.extra);
+        const product = findProduct(parsed.code, db.starsRate());
+        if (!product || payment.currency !== "XTR" || payment.total_amount !== product.starsPrice) throw new Error("Параметры оплаченного товара изменились");
+        await fulfill(product, parsed.targetUserID || ctx.from.id, ctx.from, ctx.chat.id, chargeID, parsed.extra);
       }
-      db.finishPayment(payment.telegram_payment_charge_id);
+      db.finishPayment(chargeID);
     } catch (error) {
-      db.failPayment(payment.telegram_payment_charge_id, error);
-      await ctx.reply(`⚠️ Оплата получена, но автоматическая выдача не завершена. Передайте поддержке чек <code>${escapeHTML(payment.telegram_payment_charge_id)}</code>.`, { parse_mode: "HTML" });
-      for (const owner of config.ownerIDs) await bot.api.sendMessage(owner, `⚠️ Ошибка выдачи ${escapeHTML(payment.telegram_payment_charge_id)}: ${escapeHTML(error.message)}`, { parse_mode: "HTML" }).catch(() => {});
+      db.failPayment(chargeID, error.message);
+      await ctx.reply(`⚠️ Оплата прошла, но автоматическая выдача не завершена. Передайте поддержке чек <code>${escapeHTML(chargeID)}</code>.`, { parse_mode: "HTML" });
+      for (const ownerID of config.ownerIDs) await bot.api.sendMessage(ownerID, `⚠️ Ошибка выдачи <code>${escapeHTML(chargeID)}</code>: ${escapeHTML(error.message)}`, { parse_mode: "HTML" }).catch(() => {});
     }
   });
 
-  bot.callbackQuery(/^subscription:check$/, async (ctx) => { await ctx.answerCallbackQuery(); if (await subscribed(ctx, config)) await editOrReply(ctx, t(db, ctx.from.id, config.defaultLanguage, "menu"), mainKeyboard(isOwner(config, ctx.from.id))); else await subscriptionGate(ctx, config); });
-  bot.callbackQuery(/^menu:(.+)$/, async (ctx) => {
-    await ctx.answerCallbackQuery(); const page = ctx.match[1]; const user = db.user(ctx.from.id);
-    if (page === "home") return editOrReply(ctx, t(db, ctx.from.id, config.defaultLanguage, "menu"), mainKeyboard(isOwner(config, ctx.from.id)));
-    if (page === "numbers") {
-      const numbers = db.numbers(ctx.from.id); const current = db.currentNumber(ctx.from.id);
-      const list = numbers.slice(0, 10).map((number) => `${number.is_current ? "▶️" : "▫️"} <code>${escapeHTML(number.display)}</code>`).join("\n");
-      const code = current?.login_code && current.code_expires_at >= Math.floor(Date.now() / 1000) ? `<code>${current.login_code}</code>` : t(db, ctx.from.id, config.defaultLanguage, "noCode");
-      return editOrReply(ctx, `${t(db, ctx.from.id, config.defaultLanguage, "numbers")}\n\n${list || "—"}\n\n🔑 ${code}`, new InlineKeyboard().text("🔄 Новый бесплатный номер", "numbers:new").row().text("‹ Назад", "menu:home"));
+  bot.on("callback_query:data", async (ctx) => {
+    const data = ctx.callbackQuery.data;
+    await ctx.answerCallbackQuery().catch(() => {});
+    if (data === "checksub") {
+      if (await isSubscribed(ctx, config)) return showMenu(ctx);
+      return editOrReply(ctx, subscriptionText(config), subscriptionKeyboard(config));
     }
-    if (page === "shop") return editOrReply(ctx, t(db, ctx.from.id, config.defaultLanguage, "shop"), shopKeyboard());
-    if (page === "bonuses") return editOrReply(ctx, `${t(db, ctx.from.id, config.defaultLanguage, "bonuses")}\n\nБаланс: <b>${user.bonus}</b>\nРефералов: <b>${user.referral_count}</b>`, new InlineKeyboard().text("🎁 Ежедневный бонус", "bonus:daily").text("🎡 Рулетка", "bonus:spin").row().text("‹ Назад", "menu:home"));
-    if (page === "referrals") {
-      const username = config.publicUsername || bot.botInfo?.username || "bot"; const link = `https://t.me/${username}?start=ref_${ctx.from.id}`;
-      return editOrReply(ctx, `👥 <b>Реферальная система</b>\n\nПриглашено: <b>${user.referral_count}</b>\nБонус за приглашение: <b>${config.referralBonus}</b>\n\n<code>${link}</code>`, backKeyboard());
+    if (!(await requireSubscription(ctx, config))) return;
+
+    if (data === "menu") return showMenu(ctx);
+    if (data === "shop") { db.clearPending(ctx.from.id); return editOrReply(ctx, "🛍 <b>NexGram Shop</b>\n\nВыбери категорию:", shopKeyboard()); }
+    if (data === "idhelp") return editOrReply(ctx, ID_HELP_TEXT, backMenuKeyboard());
+    if (data === "free") {
+      const number = db.freeNumber(ctx.from.id);
+      return number
+        ? editOrReply(ctx, `🎁 У вас уже есть бесплатный номер:\n\n📞 <code>${escapeHTML(number.display)}</code>\n\nКоды приходят в этот чат.`, backMenuKeyboard())
+        : editOrReply(ctx, FREE_COUNTRY_TEXT, freeCountryKeyboard());
     }
-    if (page === "support") { db.setPending(ctx.from.id, "support"); return editOrReply(ctx, t(db, ctx.from.id, config.defaultLanguage, "support"), backKeyboard()); }
-    if (page === "settings") return editOrReply(ctx, t(db, ctx.from.id, config.defaultLanguage, "settings"), settingsKeyboard(user));
-  });
+    if (/^free:(RU|US)$/.test(data)) {
+      const country = data.slice(5);
+      const existing = db.freeNumber(ctx.from.id);
+      const number = existing ?? db.createNumber(ctx.from.id, ctx.chat.id, "free", country, false);
+      return editOrReply(ctx, `✅ <b>Ваш бесплатный номер</b>\n\n📞 <code>${escapeHTML(number.display)}</code>\n\nКоды авторизации на этот номер приходят сюда <b>бесплатно</b>.`, backMenuKeyboard());
+    }
+    if (data === "mynumbers") {
+      const numbers = db.numbers(ctx.from.id);
+      if (!numbers.length) return editOrReply(ctx, "У тебя пока нет номеров.", shopKeyboard());
+      const lines = numbers.map((number, index) => `${index + 1}. <code>${escapeHTML(number.display)}</code>${number.format === "free" ? " 🎁 <i>бесплатный</i>" : ""}`);
+      return editOrReply(ctx, `<b>📞 Твои номера:</b>\n\n${lines.join("\n")}`, backMenuKeyboard());
+    }
+    if (data === "spin") {
+      db.setPending(ctx.from.id, "spin_id");
+      return editOrReply(ctx, `🎰 <b>Бесплатная рулетка</b>\n\nУсловия:\n• 1 спин в день, максимум 5 в неделю\n\nПризы (NexGram Stars): 15 / 50 / 100 / 500 / 1000 / 10000\n\n🆔 Пришли свой <b>NexGram ID</b> сообщением, чтобы крутить.\n\n${ID_HELP_TEXT}`, backMenuKeyboard());
+    }
 
-  bot.callbackQuery(/^numbers:new$/, async (ctx) => { await ctx.answerCallbackQuery(); await editOrReply(ctx, "🌍 Выберите страну нового бесплатного номера:", new InlineKeyboard().text("🇷🇺 Россия", "numbers:new:RU").text("🇺🇸 США", "numbers:new:US").row().text("‹ Назад", "menu:numbers")); });
-  bot.callbackQuery(/^numbers:new:(RU|US)$/, async (ctx) => { await ctx.answerCallbackQuery(); const number = db.createNumber(ctx.from.id, ctx.chat.id, "free", ctx.match[1], true); await editOrReply(ctx, `✅ Новый номер: <code>${escapeHTML(number.display)}</code>\nНачальный код: <code>${number.login_code}</code>`, backKeyboard("menu:numbers")); });
-  bot.callbackQuery(/^shop:(premium|stars|number|username)$/, async (ctx) => { await ctx.answerCallbackQuery(); const kind = ctx.match[1]; const kb = new InlineKeyboard(); for (const product of productsOfKind(kind, db.starsRate())) kb.text(`${product.title} · ${product.starsPrice}⭐`, `product:${product.code}`).row(); if (kind === KINDS.stars) kb.text("✍️ Другая сумма", "stars:custom").row(); kb.text("‹ Назад", "menu:shop"); await editOrReply(ctx, "Выберите товар:", kb); });
-  bot.callbackQuery(/^stars:custom$/, async (ctx) => { await ctx.answerCallbackQuery(); db.setPending(ctx.from.id, "stars_amount"); await editOrReply(ctx, "Сколько Telegram Stars вы хотите потратить? Введите число от 1 до 99999.", backKeyboard("shop:stars")); });
-  bot.callbackQuery(/^product:(.+)$/, async (ctx) => { await ctx.answerCallbackQuery(); const product = findProduct(ctx.match[1], db.starsRate()); if (!product) return; await editOrReply(ctx, productText(product), productKeyboard(product, db, ctx.from.id)); });
-  bot.callbackQuery(/^target:(.+)$/, async (ctx) => { await ctx.answerCallbackQuery(); db.setPending(ctx.from.id, "target", { productCode: ctx.match[1] }); await editOrReply(ctx, t(db, ctx.from.id, config.defaultLanguage, "target", config.productName), backKeyboard(`product:${ctx.match[1]}`)); });
-  bot.callbackQuery(/^buy:([^:]+):(\d+)$/, async (ctx) => {
-    await ctx.answerCallbackQuery(); const product = findProduct(ctx.match[1], db.starsRate()); const targetID = Number(ctx.match[2]); if (!product) return;
-    if (product.kind === KINDS.username) { db.setPending(ctx.from.id, "username", { productCode: product.code, targetID }); return editOrReply(ctx, "Введите желаемый username (без @):", backKeyboard(`product:${product.code}`)); }
-    if (targetID > 0 && targetID !== db.user(ctx.from.id)?.server_user_id) db.rememberRecipient(ctx.from.id, targetID);
-    if (isOwner(config, ctx.from.id)) { await fulfill(product, targetID, ctx.from, ctx.chat.id, `owner-${Date.now()}`); return; }
-    await sendInvoice(ctx, product, targetID);
-  });
+    if (data === "admin") {
+      if (!isOwner(config, ctx.from.id)) return;
+      db.clearPending(ctx.from.id);
+      return editOrReply(ctx, "👑 <b>Админка</b>\n\nВыберите действие:", adminKeyboard());
+    }
+    if (data === "adm:sales") {
+      if (!isOwner(config, ctx.from.id)) return;
+      const lines = db.recentSales(20).map((sale) => `• ${new Date(sale.created_at * 1000).toISOString().slice(0, 16).replace("T", " ")} — <b>${escapeHTML(sale.title)}</b> (${sale.stars_price}⭐) → <code>${sale.recipient_id}</code> (от <code>${sale.buyer_id}</code>)`);
+      return editOrReply(ctx, lines.length ? `<b>📒 Последние продажи:</b>\n\n${lines.join("\n")}` : "📒 Логи магазина пусты.", backMenuKeyboard());
+    }
+    if (data.startsWith("adm:")) {
+      if (!isOwner(config, ctx.from.id)) return;
+      const action = data.slice(4);
+      const prompts = {
+        stars: ["give_stars", "⭐ <b>Выдача NexGram Stars</b>\n\nПришли: <code>nexgram_id количество</code>"],
+        premium: ["give_premium", "💎 <b>Выдача Premium</b>\n\nПришли: <code>nexgram_id месяцы</code>"],
+        username: ["give_username", "🎭 <b>Выдача коллекционного @username</b>\n\nПришли: <code>nexgram_id username ставка_TON</code>"],
+        invoice: ["adm_invoice", "🧾 <b>Выставить счёт</b>\n\nПришли: <code>telegram_id сумма_звёзд название</code>"],
+        refund: ["adm_refund", "↩️ <b>Возврат Telegram Stars</b>\n\nПришли <code>transaction_id</code> или <code>telegram_id transaction_id</code>."],
+        access: ["give_access", "📨 <b>Доступ к кодам</b>\n\nПришли: <code>номер telegram_id</code>"],
+        bcast: ["bcast_text", `📢 <b>Рассылка</b>\n\nПришли текст одним сообщением (HTML разрешён).\nПолучателей: <b>${db.users().length}</b>`],
+        gw: ["gw_text", "🎉 <b>Новая акция</b>\n\nШаг 1/3. Пришли текст акции (HTML разрешён)."],
+        promo: ["promo_new", "🏷 <b>Новый промокод</b>\n\nПришли: <code>код количество_stars макс_активаций</code>"],
+        rate: ["rate_set", `💱 <b>Курс NexGram Stars</b>\n\nТекущий: 1⭐ = <b>${db.starsRate()}</b> NexGram Stars.\n\nПришли новое число.`],
+      };
+      if (!prompts[action]) return;
+      db.setPending(ctx.from.id, prompts[action][0], { operationID: `admin:${ctx.from.id}:${Date.now()}:${randomInt(1_000_000)}` });
+      return editOrReply(ctx, prompts[action][1], backMenuKeyboard());
+    }
 
-  bot.callbackQuery(/^settings:lang:(ru|en)$/, async (ctx) => { db.setLanguage(ctx.from.id, ctx.match[1]); await ctx.answerCallbackQuery({ text: "OK" }); await editOrReply(ctx, t(db, ctx.from.id, config.defaultLanguage, "settings"), settingsKeyboard(db.user(ctx.from.id))); });
-  bot.callbackQuery(/^settings:notifications$/, async (ctx) => { const enabled = db.toggleNotifications(ctx.from.id); await ctx.answerCallbackQuery({ text: enabled ? "Включены" : "Выключены" }); await editOrReply(ctx, t(db, ctx.from.id, config.defaultLanguage, "settings"), settingsKeyboard(db.user(ctx.from.id))); });
-  bot.callbackQuery(/^settings:account$/, async (ctx) => { await ctx.answerCallbackQuery(); db.setPending(ctx.from.id, "account"); await editOrReply(ctx, t(db, ctx.from.id, config.defaultLanguage, "account", config.productName), backKeyboard("menu:settings")); });
-  bot.callbackQuery(/^bonus:daily$/, async (ctx) => { const result = db.claimDaily(ctx.from.id, config.dailyBonus); await ctx.answerCallbackQuery({ text: result.claimed ? `+${config.dailyBonus}` : "Уже получен сегодня" }); await editOrReply(ctx, `${t(db, ctx.from.id, config.defaultLanguage, "bonuses")}\n\nБаланс: <b>${result.balance}</b>`, backKeyboard("menu:bonuses")); });
-  bot.callbackQuery(/^bonus:spin$/, async (ctx) => {
-    await ctx.answerCallbackQuery(); const user = db.user(ctx.from.id); if (!user.server_user_id) { db.setPending(ctx.from.id, "account"); return editOrReply(ctx, t(db, ctx.from.id, config.defaultLanguage, "account", config.productName), backKeyboard("menu:bonuses")); }
-    try { const award = db.reserveSpin(ctx.from.id, user.server_user_id, rollPrize()); await gramsrv.grantStars(user.server_user_id, award.prize, "Daily bot wheel", `spin:${ctx.from.id}:${award.day}`); db.finishSpin(ctx.from.id, award.day); await editOrReply(ctx, `🎉 Вы выиграли <b>${award.prize} Stars</b>!`, backKeyboard("menu:bonuses")); }
-    catch (error) { await editOrReply(ctx, `⚠️ ${escapeHTML(error.message)}`, backKeyboard("menu:bonuses")); }
-  });
-
-  bot.callbackQuery(/^giveaway:([a-f0-9]+)$/, async (ctx) => { await ctx.answerCallbackQuery(); const user = db.user(ctx.from.id); if (!user.server_user_id) return ctx.reply(`Сначала укажите ${config.productName} ID в настройках.`); const id = ctx.match[1]; try { const item = db.claimGiveaway(id, ctx.from.id); try { await gramsrv.grantStars(user.server_user_id, item.stars_amount, `Giveaway ${id}`, `giveaway:${id}:${ctx.from.id}`); } catch (error) { db.releaseCampaignClaim("giveaway", id, ctx.from.id); throw error; } await ctx.reply(`✅ Получено ${item.stars_amount} Stars.`); } catch (error) { await ctx.reply(`⚠️ ${error.message}`); } });
-
-  bot.callbackQuery(/^admin:(.+)$/, async (ctx) => {
-    await ctx.answerCallbackQuery(); if (!isOwner(config, ctx.from.id)) return; const action = ctx.match[1];
-    if (action === "menu") return editOrReply(ctx, "🛡 <b>Админ-панель</b>", adminKeyboard());
-    if (action === "stats") { const stats = db.stats(); return editOrReply(ctx, `📊 Пользователи: <b>${stats.users}</b>\nНомера: <b>${stats.numbers}</b>\nПродажи: <b>${stats.sales}</b>`, backKeyboard("admin:menu")); }
-    if (action === "sales") { const lines = db.recentSales().map((sale) => `${sale.id}. ${escapeHTML(sale.product)} → <code>${sale.recipient_id}</code> · ${sale.stars_price}⭐`).join("\n"); return editOrReply(ctx, `📈 <b>Последние продажи</b>\n\n${lines || "—"}`, backKeyboard("admin:menu")); }
-    const prompts = {
-      broadcast: "Введите текст рассылки.",
-      stars: `Формат: ${config.productName.toUpperCase()}_ID AMOUNT`,
-      premium: `Формат: ${config.productName.toUpperCase()}_ID MONTHS`,
-      promo: "Формат: CODE STARS LIMIT",
-      giveaway: "Формат: STARS LIMIT Текст акции",
-      bonus: "Формат: TELEGRAM_ID AMOUNT",
-      invoice: "Формат: TELEGRAM_ID STARS Название",
-      access: "Формат: PHONE TELEGRAM_ID",
-      refund: "Отправьте transaction ID платежа Telegram Stars.",
-      reply: "Формат: TICKET_ID текст ответа",
-      rate: "Введите новый курс: сколько server Stars за 1 Telegram Star.",
-    };
-    if (prompts[action]) { db.setPending(ctx.from.id, `admin_${action}`, { operationID: `admin:${ctx.from.id}:${Date.now()}:${randomInt(1_000_000)}` }); return editOrReply(ctx, prompts[action], backKeyboard("admin:menu")); }
+    if (data.startsWith("cat:")) {
+      db.clearPending(ctx.from.id);
+      const kind = data.slice(4);
+      if (kind === KINDS.stars) {
+        db.setPending(ctx.from.id, "stars_amount");
+        const rate = db.starsRate();
+        return editOrReply(ctx, `⭐ <b>Покупка NexGram Stars</b>\n\nАктуальный курс: <b>1⭐ Telegram = ${rate} NexGram Stars</b>\n\nСколько <b>Telegram Stars</b> вы хотите потратить? Пришли число сообщением.\n\nНапример: <code>100</code> → получите ${100 * rate} NexGram Stars.`, backMenuKeyboard());
+      }
+      const titles = { premium: "💎 <b>NexGram Premium</b>\n\nВыбери срок:", number: "📞 <b>Анонимные номера +888</b>\n\nВыбери формат:", username: "🎭 <b>Коллекционные @username</b>\n\nВыбери ставку:" };
+      return titles[kind] ? editOrReply(ctx, titles[kind], categoryKeyboard(kind, db)) : editOrReply(ctx, "Категория не найдена.", shopKeyboard());
+    }
+    if (data.startsWith("p:")) {
+      db.clearPending(ctx.from.id);
+      const product = findProduct(data.slice(2), db.starsRate());
+      return product ? editOrReply(ctx, productText(product, db), productKeyboard(product)) : editOrReply(ctx, "Товар не найден.", shopKeyboard());
+    }
+    if (data.startsWith("buy:")) {
+      const [, code, targetMode] = data.split(":");
+      const product = findProduct(code, db.starsRate());
+      if (!product) return editOrReply(ctx, "Товар не найден.", shopKeyboard());
+      if (product.kind === KINDS.username) {
+        db.setPending(ctx.from.id, "username_input", { productCode: code });
+        return editOrReply(ctx, `<b>${escapeHTML(product.title)}</b>\n\n🎭 Пришли желаемый <b>@username</b> сообщением (5–32 символа, латиница/цифры/подчёркивание).\n\nПотом попросим <b>NexGram ID</b> получателя.`, backMenuKeyboard());
+      }
+      if ([KINDS.premium, KINDS.stars].includes(product.kind) || targetMode === "other") {
+        db.setPending(ctx.from.id, "target_id", { productCode: code });
+        return editOrReply(ctx, `<b>${escapeHTML(product.title)}</b>\n\n🆔 <b>Введите NexGram ID</b> получателя (свой или друга) — сообщением, до оплаты.\n\nИли выберите недавний ID.\n\n${ID_HELP_TEXT}`, targetKeyboard(code, ctx.from.id, db));
+      }
+      return startPurchase(ctx, product);
+    }
+    if (data.startsWith("rid:")) {
+      const [, code, rawID] = data.split(":");
+      const recipientID = positiveInteger(rawID);
+      const product = findProduct(code, db.starsRate());
+      if (!recipientID || !product) return;
+      db.clearPending(ctx.from.id);
+      return startPurchase(ctx, product, recipientID);
+    }
+    if (data.startsWith("gw:")) {
+      const giveawayID = data.slice(3);
+      db.setPending(ctx.from.id, "gw_claim", { giveawayID });
+      return ctx.reply(`🎁 <b>Получение награды</b>\n\nПришли свой <b>NexGram ID</b> сообщением.\n\n${ID_HELP_TEXT}`, { parse_mode: "HTML", reply_markup: backMenuKeyboard() });
+    }
   });
 
   bot.on("message:text", async (ctx) => {
-    if (ctx.message.text.startsWith("/")) return; const pending = db.pending(ctx.from.id); if (!pending) return;
     const input = ctx.message.text.trim();
+    if (input.startsWith("/")) return;
+    if (!(await requireSubscription(ctx, config))) return;
+
+    if (/^!(промокод|promo)\s+/i.test(input)) {
+      const code = input.split(/\s+/)[1]?.toLowerCase();
+      if (!code) return ctx.reply("Формат: <code>!промокод КОД</code>", { parse_mode: "HTML" });
+      db.setPending(ctx.from.id, "promo_claim", { code });
+      return ctx.reply(`🏷 Пришли свой <b>NexGram ID</b> сообщением.\n\n${ID_HELP_TEXT}`, { parse_mode: "HTML", reply_markup: backMenuKeyboard() });
+    }
+
+    const pending = db.pending(ctx.from.id);
+    if (!pending) return showMenu(ctx);
+    const keep = async (message, keyboard = backMenuKeyboard()) => ctx.reply(message, { parse_mode: "HTML", reply_markup: keyboard });
+
     try {
-      if (pending.kind === "account") { const id = Number(input); if (!Number.isSafeInteger(id) || id <= 0) throw new Error("invalid ID"); db.setServerUserID(ctx.from.id, id); db.clearPending(ctx.from.id); return ctx.reply(`✅ ${config.productName} ID: ${id}`, { reply_markup: mainKeyboard(isOwner(config, ctx.from.id)) }); }
-      if (pending.kind === "stars_amount") { const stars = Number(input); if (!Number.isSafeInteger(stars) || stars <= 0 || stars > 99999) throw new Error("amount must be from 1 to 99999"); const product = findProduct(`stars_${stars}`, db.starsRate()); db.clearPending(ctx.from.id); return ctx.reply(productText(product), { parse_mode: "HTML", reply_markup: productKeyboard(product, db, ctx.from.id) }); }
-      if (pending.kind === "target") { const id = Number(input); if (!Number.isSafeInteger(id) || id <= 0) throw new Error("invalid ID"); const product = findProduct(pending.payload.productCode, db.starsRate()); if (!product) throw new Error("product not found"); db.rememberRecipient(ctx.from.id, id); db.clearPending(ctx.from.id); if (product.kind === KINDS.username) { db.setPending(ctx.from.id, "username", { productCode: product.code, targetID: id }); return ctx.reply("Введите желаемый username без @:"); } if (isOwner(config, ctx.from.id)) return fulfill(product, id, ctx.from, ctx.chat.id, `owner-${Date.now()}`); await sendInvoice(ctx, product, id); return; }
-      if (pending.kind === "username") { const username = normalizeUsername(input); if (!username) throw new Error("username must be 5-32 latin characters and start with a letter"); const product = findProduct(pending.payload.productCode, db.starsRate()); db.clearPending(ctx.from.id); if (isOwner(config, ctx.from.id)) return fulfill(product, pending.payload.targetID, ctx.from, ctx.chat.id, `owner-${Date.now()}`, username); await sendInvoice(ctx, product, pending.payload.targetID, username); return; }
-      if (pending.kind === "support") { const ticket = db.addSupportMessage(ctx.from.id, ctx.chat.id, input); db.clearPending(ctx.from.id); for (const owner of config.ownerIDs) await bot.api.sendMessage(owner, `💬 Тикет #${ticket}\nОт: ${escapeHTML(userName(ctx.from))} (<code>${ctx.from.id}</code>)\n\n${escapeHTML(input)}`, { parse_mode: "HTML" }); return ctx.reply(`✅ Обращение #${ticket} отправлено.`); }
+      if (pending.kind === "target_id") {
+        const recipientID = positiveInteger(input);
+        if (!recipientID) return keep(`Неверный ID. Пришли только цифры.\n\n${ID_HELP_TEXT}`, targetKeyboard(pending.payload.productCode, ctx.from.id, db));
+        const product = findProduct(pending.payload.productCode, db.starsRate());
+        if (!product) throw new Error("Товар не найден");
+        db.clearPending(ctx.from.id);
+        return startPurchase(ctx, product, recipientID);
+      }
+      if (pending.kind === "stars_amount") {
+        const amount = positiveInteger(input, 100000);
+        if (!amount) return keep("Нужно положительное число Telegram Stars (максимум 100000). Попробуй ещё раз.");
+        const code = `stars_${amount}`;
+        db.setPending(ctx.from.id, "target_id", { productCode: code });
+        return keep(`Отлично — счёт будет на <b>${amount} ⭐ Telegram</b>, зачислим <b>${amount * db.starsRate()} NexGram Stars</b>.\n\n🆔 Теперь пришли <b>NexGram ID</b> получателя.\n\n${ID_HELP_TEXT}`, targetKeyboard(code, ctx.from.id, db));
+      }
+      if (pending.kind === "username_input") {
+        const username = normalizeUsername(input);
+        if (!username) return keep("Некорректный @username. Разрешено 5–32 символа: латиница, цифры, подчёркивание; первый символ — буква.");
+        db.setPending(ctx.from.id, "username_target", { productCode: pending.payload.productCode, username });
+        return keep(`Юзернейм: <b>@${escapeHTML(username)}</b>\n\n🆔 Теперь пришли <b>NexGram ID</b> получателя.\n\n${ID_HELP_TEXT}`);
+      }
+      if (pending.kind === "username_target") {
+        const recipientID = positiveInteger(input);
+        if (!recipientID) return keep(`Неверный ID. Пришли только цифры.\n\n${ID_HELP_TEXT}`);
+        const product = findProduct(pending.payload.productCode, db.starsRate());
+        if (!product) throw new Error("Товар не найден");
+        db.clearPending(ctx.from.id);
+        return startPurchase(ctx, product, recipientID, pending.payload.username);
+      }
+      if (pending.kind === "spin_id") {
+        const serverUserID = positiveInteger(input);
+        if (!serverUserID) return keep(`Неверный ID. Пришли только цифры.\n\n${ID_HELP_TEXT}`);
+        const award = db.reserveSpin(ctx.from.id, serverUserID, rollPrize());
+        await gramsrv.grantStars(serverUserID, award.prize, "Free bot wheel", `spin:${ctx.from.id}:${award.day}`);
+        db.finishSpin(ctx.from.id, award.day);
+        db.clearPending(ctx.from.id);
+        return keep(`🎰 <b>Крутим...</b>\n\n🎉 Поздравляем! Выпало <b>${award.prize} ⭐ NexGram Stars</b>\n\nНачислено на NexGram ID <code>${serverUserID}</code>.`, mainKeyboard(isOwner(config, ctx.from.id)));
+      }
+      if (pending.kind === "promo_claim") {
+        const serverUserID = positiveInteger(input);
+        if (!serverUserID) return keep(`Неверный NexGram ID.\n\n${ID_HELP_TEXT}`);
+        const code = pending.payload.code;
+        const promo = db.claimPromo(code, ctx.from.id);
+        try { await gramsrv.grantStars(serverUserID, promo.stars_amount, `Promo ${code}`, `promo:${code}:${ctx.from.id}`); }
+        catch (error) { db.releaseCampaignClaim("promo", code, ctx.from.id); throw error; }
+        db.clearPending(ctx.from.id);
+        return keep(`✅ Промокод активирован! Начислено <b>${promo.stars_amount} NexGram Stars</b> на ID <code>${serverUserID}</code>`, mainKeyboard(isOwner(config, ctx.from.id)));
+      }
+      if (pending.kind === "gw_claim") {
+        const serverUserID = positiveInteger(input);
+        if (!serverUserID) return keep(`Неверный NexGram ID.\n\n${ID_HELP_TEXT}`);
+        const giveawayID = pending.payload.giveawayID;
+        const item = db.claimGiveaway(giveawayID, ctx.from.id);
+        try { await gramsrv.grantStars(serverUserID, item.stars_amount, `Giveaway ${giveawayID}`, `giveaway:${giveawayID}:${ctx.from.id}`); }
+        catch (error) { db.releaseCampaignClaim("giveaway", giveawayID, ctx.from.id); throw error; }
+        db.clearPending(ctx.from.id);
+        return keep(`✅ Начислено <b>${item.stars_amount} NexGram Stars</b> на ID <code>${serverUserID}</code>`, mainKeyboard(isOwner(config, ctx.from.id)));
+      }
+
       if (!isOwner(config, ctx.from.id)) return;
-      if (pending.kind === "admin_broadcast") { db.clearPending(ctx.from.id); let ok = 0, failed = 0; for (const user of db.users()) { try { await bot.api.sendMessage(user.chat_id, input, { parse_mode: "HTML" }); ok++; } catch { failed++; } } return ctx.reply(`Рассылка завершена: ${ok} / ошибок ${failed}`); }
-      if (pending.kind === "admin_stars") { const [id, amount] = input.split(/\s+/).map(Number); if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(amount) || amount <= 0) throw new Error(`invalid ${config.productName} ID or amount`); await gramsrv.grantStars(id, amount, "Telegram bot administrator grant", pending.payload.operationID); db.clearPending(ctx.from.id); return ctx.reply(`✅ Выдано ${amount} Stars → ${config.productName} ID ${id}`); }
-      if (pending.kind === "admin_premium") { const [id, months] = input.split(/\s+/).map(Number); if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(months) || months <= 0) throw new Error(`invalid ${config.productName} ID or months`); await gramsrv.grantPremium(id, months, "Telegram bot administrator grant", pending.payload.operationID); db.clearPending(ctx.from.id); return ctx.reply(`✅ Premium на ${months} мес. → ${config.productName} ID ${id}`); }
-      if (pending.kind === "admin_promo") { const [code, stars, limit] = input.split(/\s+/); db.createPromo(code, Number(stars), Number(limit)); db.clearPending(ctx.from.id); return ctx.reply(`✅ Промокод ${code} создан.`); }
-      if (pending.kind === "admin_giveaway") { const [stars, limit, ...words] = input.split(/\s+/); const item = db.createGiveaway(words.join(" "), Number(stars), Number(limit)); db.clearPending(ctx.from.id); return ctx.reply(`🎁 ${escapeHTML(item.text)}`, { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("Забрать награду", `giveaway:${item.id}`) }); }
-      if (pending.kind === "admin_bonus") { const [id, amount] = input.split(/\s+/).map(Number); const balance = db.addBonus(id, amount); db.clearPending(ctx.from.id); return ctx.reply(`✅ Баланс ${id}: ${balance}`); }
-      if (pending.kind === "admin_invoice") { const [idRaw, starsRaw, ...words] = input.split(/\s+/); const id = Number(idRaw), stars = Number(starsRaw), title = words.join(" "); if (!id || !stars || !title) throw new Error("invalid invoice"); await bot.api.sendInvoice(id, title, `Счёт: ${title}`, `custom|${Buffer.from(title).toString("base64url")}`, "XTR", [{ label: title, amount: stars }]); db.clearPending(ctx.from.id); return ctx.reply("✅ Счёт отправлен."); }
-      if (pending.kind === "admin_access") { const [phone, telegramRaw] = input.split(/\s+/); const telegramID = Number(telegramRaw); if (!phone || !Number.isSafeInteger(telegramID) || telegramID <= 0) throw new Error("invalid phone or Telegram ID"); db.grantCodeAccess(phone, telegramID); db.clearPending(ctx.from.id); return ctx.reply(`✅ Доступ к кодам ${escapeHTML(phone)} выдан Telegram ID ${telegramID}.`, { parse_mode: "HTML" }); }
-      if (pending.kind === "admin_refund") { const chargeID = input.trim(); const sale = db.saleByCharge(chargeID); if (!sale) throw new Error("sale not found for this transaction ID"); if (db.isRefunded(chargeID)) throw new Error("payment was already refunded"); await bot.api.refundStarPayment(sale.buyer_id, chargeID); db.markRefunded(chargeID, sale.buyer_id); db.clearPending(ctx.from.id); await bot.api.sendMessage(sale.buyer_id, `↩️ Оплата Telegram Stars возвращена.\n\nЧек: <code>${escapeHTML(chargeID)}</code>`, { parse_mode: "HTML" }).catch(() => {}); return ctx.reply("✅ Возврат выполнен."); }
-      if (pending.kind === "admin_reply") { const [ticketRaw, ...words] = input.split(/\s+/); const ticketID = Number(ticketRaw), answer = words.join(" "); const ticket = db.supportMessage(ticketID); if (!ticket || !answer) throw new Error("ticket not found or reply is empty"); await bot.api.sendMessage(ticket.chat_id, `💬 <b>Ответ поддержки по обращению #${ticketID}</b>\n\n${escapeHTML(answer)}`, { parse_mode: "HTML" }); db.closeSupportMessage(ticketID); db.clearPending(ctx.from.id); return ctx.reply(`✅ Ответ по обращению #${ticketID} отправлен.`); }
-      if (pending.kind === "admin_rate") { const rate = Number(input); if (!Number.isSafeInteger(rate) || rate <= 0) throw new Error("invalid rate"); db.setSetting("stars_rate", rate); db.clearPending(ctx.from.id); return ctx.reply(`✅ Курс: 1⭐ = ${rate} Stars`); }
-    } catch (error) { await ctx.reply(`⚠️ ${escapeHTML(error.message)}`, { parse_mode: "HTML" }); }
+      const operationID = pending.payload.operationID ?? `admin:${ctx.from.id}:${Date.now()}`;
+      if (pending.kind === "give_stars") {
+        const [idRaw, amountRaw] = input.split(/\s+/); const id = positiveInteger(idRaw), amount = positiveInteger(amountRaw);
+        if (!id || !amount) return keep("Формат: <code>nexgram_id количество</code>");
+        await gramsrv.grantStars(id, amount, "Telegram bot administrator grant", operationID); db.clearPending(ctx.from.id);
+        return keep(`✅ Выдано ${amount} NexGram Stars → ID <code>${id}</code>`);
+      }
+      if (pending.kind === "give_premium") {
+        const [idRaw, monthsRaw] = input.split(/\s+/); const id = positiveInteger(idRaw), months = positiveInteger(monthsRaw, 1200);
+        if (!id || !months) return keep("Формат: <code>nexgram_id месяцы</code>");
+        await gramsrv.grantPremium(id, months, "Telegram bot administrator grant", operationID); db.clearPending(ctx.from.id);
+        return keep(`✅ Выдан Premium на ${months} мес. → ID <code>${id}</code>`);
+      }
+      if (pending.kind === "give_username") {
+        const [idRaw, usernameRaw, bidRaw] = input.split(/\s+/); const id = positiveInteger(idRaw), username = normalizeUsername(usernameRaw), bid = positiveInteger(bidRaw);
+        if (!id || !username || !bid) return keep("Формат: <code>nexgram_id username ставка_TON</code>");
+        await gramsrv.mintUsername(id, username, bid, operationID); db.clearPending(ctx.from.id);
+        return keep(`✅ Выдан коллекционный @${escapeHTML(username)} (${bid} TON) → ID <code>${id}</code>`);
+      }
+      if (pending.kind === "adm_invoice") {
+        const [telegramRaw, amountRaw, ...titleParts] = input.split(/\s+/); const telegramID = positiveInteger(telegramRaw), amount = positiveInteger(amountRaw, 100000), title = titleParts.join(" ").slice(0, 32);
+        if (!telegramID || !amount || !title) return keep("Формат: <code>telegram_id сумма_звёзд название</code>");
+        await bot.api.sendInvoice(telegramID, title, `Счёт на оплату: ${title}`, `custom|${Buffer.from(title).toString("base64url")}`, "XTR", [{ label: title, amount }]); db.clearPending(ctx.from.id);
+        return keep(`✅ Счёт на <b>${amount} ⭐</b> отправлен пользователю <code>${telegramID}</code>`);
+      }
+      if (pending.kind === "adm_refund") {
+        const parts = input.split(/\s+/); let telegramID, chargeID;
+        if (parts.length === 1) { chargeID = parts[0]; telegramID = db.saleByCharge(chargeID)?.buyer_id; }
+        else if (parts.length === 2) { telegramID = positiveInteger(parts[0]); chargeID = parts[1]; }
+        if (!telegramID || !chargeID) return keep("Не нашёл покупку. Пришли: <code>telegram_id transaction_id</code>");
+        if (db.isRefunded(chargeID)) throw new Error("Этот платёж уже возвращён");
+        await bot.api.refundStarPayment(telegramID, chargeID); db.markRefunded(chargeID, telegramID); db.clearPending(ctx.from.id);
+        await bot.api.sendMessage(telegramID, `↩️ Вам возвращена оплата Telegram Stars.\n\nЧек: <code>${escapeHTML(chargeID)}</code>`, { parse_mode: "HTML" }).catch(() => {});
+        return keep(`✅ Возврат выполнен\n\nПользователь: <code>${telegramID}</code>\nTransaction: <code>${escapeHTML(chargeID)}</code>`);
+      }
+      if (pending.kind === "give_access") {
+        const [phoneRaw, telegramRaw] = input.split(/\s+/); const phone = normalizePhone(phoneRaw), telegramID = positiveInteger(telegramRaw);
+        if (!phone || !telegramID) return keep("Формат: <code>номер telegram_id</code>");
+        db.grantCodeAccess(phone, telegramID); db.clearPending(ctx.from.id);
+        await bot.api.sendMessage(telegramID, `🔔 <b>Вам выдан доступ к кодам</b>\n\nНомер: <code>${escapeHTML(phone)}</code>`, { parse_mode: "HTML" }).catch(() => {});
+        return keep(`✅ Пользователь <code>${telegramID}</code> получил доступ к кодам номера <code>${escapeHTML(phone)}</code>`);
+      }
+      if (pending.kind === "bcast_text") {
+        if (!input) return keep("Пустой текст. Пришли текст рассылки.");
+        db.clearPending(ctx.from.id); await keep("📢 Рассылка стартовала…");
+        void broadcast(input).then(({ sent, failed }) => bot.api.sendMessage(ctx.from.id, `📢 Рассылка завершена: ✅ ${sent}, ❌ ${failed}`).catch(() => {}));
+        return;
+      }
+      if (pending.kind === "rate_set") {
+        const rate = positiveInteger(input);
+        if (!rate) return keep("Нужно положительное число.");
+        db.setSetting("stars_rate", rate); db.clearPending(ctx.from.id);
+        return keep(`✅ Курс обновлён: 1⭐ Telegram = <b>${rate}</b> NexGram Stars`);
+      }
+      if (pending.kind === "gw_text") {
+        if (!input) return keep("Пришли текст акции.");
+        db.setPending(ctx.from.id, "gw_max", { text: input });
+        return keep("Шаг 2/3. Пришли <b>количество активаций</b> (0 = без лимита).");
+      }
+      if (pending.kind === "gw_max") {
+        const limit = Number(input);
+        if (!Number.isSafeInteger(limit) || limit < 0) return keep("Нужно целое число ≥ 0.");
+        db.setPending(ctx.from.id, "gw_stars", { text: pending.payload.text, limit });
+        return keep("Шаг 3/3. Пришли <b>количество NexGram Stars</b> за одну активацию.");
+      }
+      if (pending.kind === "gw_stars") {
+        const stars = positiveInteger(input);
+        if (!stars) return keep("Нужно положительное число.");
+        const item = db.createGiveaway(pending.payload.text, stars, pending.payload.limit); db.clearPending(ctx.from.id);
+        await keep(`✅ Акция создана (ID: <code>${item.id}</code>). Начинаю рассылку…`);
+        const keyboard = new InlineKeyboard().text("🎁 Забрать награду", `gw:${item.id}`);
+        void broadcast(item.text, keyboard).then(({ sent, failed }) => bot.api.sendMessage(ctx.from.id, `🎉 Акция разослана: ✅ ${sent}, ❌ ${failed}`).catch(() => {}));
+        return;
+      }
+      if (pending.kind === "promo_new") {
+        const [code, starsRaw, limitRaw] = input.split(/\s+/); const stars = positiveInteger(starsRaw), limit = Number(limitRaw);
+        if (!code || !stars || !Number.isSafeInteger(limit) || limit < 0) return keep("Формат: <code>код количество_stars макс_активаций</code>");
+        const promo = db.createPromo(code, stars, limit); db.clearPending(ctx.from.id);
+        return keep(`✅ Промокод <code>${escapeHTML(promo.code)}</code> создан. Награда: ${promo.stars_amount} NexGram Stars, макс. активаций: ${promo.max_acts}.`);
+      }
+    } catch (error) {
+      console.error("bot action failed", pending.kind, error);
+      return keep(`⚠️ ${escapeHTML(error.message)}`);
+    }
   });
 
   bot.catch(({ error, ctx }) => {
@@ -271,3 +548,5 @@ export function createBot({ config, db, gramsrv }) {
   });
   return bot;
 }
+
+export const internals = { escapeHTML, normalizePhone, positiveInteger, rollPrize };

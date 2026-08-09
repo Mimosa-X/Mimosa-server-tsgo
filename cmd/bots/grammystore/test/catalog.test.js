@@ -12,7 +12,8 @@ test("dynamic Stars products use configured rate", () => {
 
 test("arbitrary Stars invoices are bounded and use the configured rate", () => {
   assert.equal(findProduct("stars_37", 25).starsAmount, 925);
-  assert.equal(findProduct("stars_100000", 25), null);
+  assert.equal(findProduct("stars_100000", 25).starsAmount, 2_500_000);
+  assert.equal(findProduct("stars_100001", 25), null);
   assert.equal(findProduct("stars_0", 25), null);
 });
 

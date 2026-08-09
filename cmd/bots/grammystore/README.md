@@ -1,67 +1,61 @@
-# grammY authentication and store bot
+# NexGram grammY store and authentication bot
 
-This service replaces the former JSON/Python bot with one grammY process and a
-transactional SQLite database. It deliberately runs independently from
-`cmd/telesrv`; a bot outage cannot stop MTProto.
+This service is a JavaScript/grammY port of the supplied legacy Go bot. It runs
+independently from `cmd/telesrv`, uses a transactional SQLite database, and keeps
+the gramsrv OTP webhook authenticated and idempotent.
 
-## Included functionality
+## Features
 
-- automatic persistent number and initial code on `/start`;
-- delivery and storage of real login codes through authenticated `POST /code`;
-- free replacement numbers and paid anonymous `+888` numbers;
-- Premium, server Stars and collectible username purchases through Telegram Stars;
-- arbitrary Stars invoices, payment deduplication and a durable sales journal;
-- account target IDs and three recent recipients;
-- daily bonuses, referrals and a weighted wheel;
-- promo codes and button-based giveaways;
-- support tickets;
-- language and notification settings;
-- owner-only statistics, broadcasts, Stars/Premium/bonus grants, invoices,
-  payment refunds, login-code access, support replies, sales and Stars-rate controls;
-- optional required-channel membership gate.
+- required-channel membership gate;
+- one free Russian or US number and paid anonymous `+888` numbers;
+- login-code delivery to the number owner and explicitly authorized viewers;
+- Premium, NexGram Stars, `+888` numbers and collectible username purchases;
+- purchases for another NexGram account and three recent recipient IDs;
+- Telegram Stars invoices with charge deduplication and a durable sales journal;
+- daily/weekly weighted prize wheel;
+- promo codes and button-based giveaway campaigns;
+- owner mode with Stars, Premium and collectible username grants;
+- owner-created invoices, refunds, broadcasts, code access and rate controls;
+- owner-only recent sales journal.
 
-The bot token and Admin API token must never be committed. `.env.example`
-contains names and safe local defaults only.
+All user-facing product text uses the NexGram name. Secrets are read only from
+the service environment and must never be committed.
 
 ## Local run
 
-Requirements: Node.js 22.13 or newer and a running gramsrv Admin API.
+Node.js 22.13 or newer is required because the bot uses `node:sqlite`.
 
 ```bash
 cd cmd/bots/grammystore
 cp .env.example .env
-nano .env
+# Fill BOT_TOKEN, OWNER_IDS, GRAMSRV_TOKEN and CODE_WEBHOOK_SECRET.
 npm ci
 npm test
 npm start
 ```
 
-Set `BOT_PUBLIC_USERNAME` so referral links are available before the first
-`getMe`. `OWNER_IDS` accepts comma-separated Telegram IDs. Users set their
-gramsrv account ID under Settings; Telegram IDs are not assumed to equal server
-account IDs.
+`OWNER_IDS` accepts comma-separated Telegram user IDs. `REQUIRED_CHANNEL` may
+be empty to disable the subscription gate. `PRODUCT_NAME` defaults to
+`NexGram`; deployment-specific values still belong in the environment.
 
-`PRODUCT_NAME` controls user-facing product text and defaults to `Telesrv`.
-Deployment-specific branding belongs in the service environment, not in source.
+## Database
 
-## Migrating the former Python bot
+The SQLite database stores users, numbers, OTP deliveries, pending multi-step
+actions, payments, sales, refunds, recent recipients, wheel reservations,
+promos and giveaways. Production should use:
 
-Never open the legacy database directly with the new service because its table
-names overlap but its columns are incompatible. Keep the old service stopped,
-copy its database, and create a separate destination:
-
-```bash
-npm run migrate:legacy -- /path/to/legacy.sqlite3 /path/to/new.sqlite3
+```text
+BOT_DB_PATH=/var/lib/telesrv-grammy-bot/bot.sqlite3
 ```
 
-The command refuses to overwrite its source or an existing destination. It
-preserves users, bonus balances, referrals, numbers, current login codes and
-support messages. Keep the legacy database backup for historical orders and
-broadcast drafts, which have no equivalent in the new Telegram Stars journal.
+Stop the service before copying the database, or use SQLite's online backup
+command. If a clean test launch is required, first back up all three files
+(`bot.sqlite3`, `bot.sqlite3-wal`, `bot.sqlite3-shm`) and only then remove the
+working copies while the service is stopped.
 
 ## Login-code webhook
 
-Configure gramsrv's code-delivery webhook for:
+Configure gramsrv as follows:
 
 ```text
 TELESRV_PHONE_CODE_DELIVERY_PROVIDER=webhook
@@ -69,41 +63,29 @@ TELESRV_OTP_WEBHOOK_URL=http://127.0.0.1:2800/v1/otp/deliveries
 TELESRV_OTP_WEBHOOK_SECRET=<same value as CODE_WEBHOOK_SECRET>
 ```
 
-gramsrv sends its version-1 JSON envelope and signs the exact request body as
-`X-Telesrv-Signature: sha256=<HMAC-SHA256(timestamp + "." + body)>`. The bot
-checks that signature, a five-minute timestamp window and `Idempotency-Key`.
-For example, the body contains:
+The bot verifies the gramsrv v1 HMAC signature, timestamp and idempotency key,
+persists the delivery, immediately returns HTTP 202, and sends the Telegram
+message asynchronously. This prevents Telegram Bot API latency from blocking
+`auth.sendCode`. The listener is loopback-only by default. `GET /healthz` is a
+read-only health endpoint.
 
-```json
-{"version":"1","delivery_id":"...","purpose":"login_sms","channel":"sms","recipient":"+79991234567","code":"12345","expires_at":"2026-08-09T12:00:00Z","expires_in":300}
-```
-
-The endpoint is loopback-only by default. It rejects requests without the
-HMAC secret, stores each delivery idempotently and returns HTTP 202 immediately;
-Telegram delivery then runs asynchronously for the number owner and explicitly
-granted support viewers. A slow Bot API therefore cannot turn `auth.sendCode`
-into a server-side timeout. `/healthz` is read-only.
-
-## Linux install
+## Linux installation
 
 ```bash
-sudo useradd --system --home /var/lib/gramsrv-grammy-bot --shell /usr/sbin/nologin telesrv-bot || true
-sudo install -d -o telesrv-bot -g telesrv-bot -m 0750 /opt/gramsrv-grammy-bot /var/lib/gramsrv-grammy-bot
-sudo cp -a package.json package-lock.json src /opt/gramsrv-grammy-bot/
-cd /opt/gramsrv-grammy-bot
+sudo useradd --system --home /var/lib/telesrv-grammy-bot --shell /usr/sbin/nologin telesrv-bot || true
+sudo install -d -o telesrv-bot -g telesrv-bot -m 0750 /opt/telesrv-grammy-bot /var/lib/telesrv-grammy-bot
+sudo cp -a package.json package-lock.json src /opt/telesrv-grammy-bot/
+sudo chown -R telesrv-bot:telesrv-bot /opt/telesrv-grammy-bot /var/lib/telesrv-grammy-bot
+cd /opt/telesrv-grammy-bot
 sudo npm ci --omit=dev
-sudo cp .env.example /etc/telesrv-grammy-bot.env
-sudo chmod 0600 /etc/telesrv-grammy-bot.env
-sudo cp deploy/telesrv-grammy-bot.service /etc/systemd/system/
+sudo install -m 0600 .env.example /etc/telesrv-grammy-bot.env
+# Fill the production secrets in /etc/telesrv-grammy-bot.env.
+sudo install -m 0644 deploy/telesrv-grammy-bot.service /etc/systemd/system/telesrv-grammy-bot.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now telesrv-grammy-bot
+sudo systemctl status telesrv-grammy-bot --no-pager
 sudo journalctl -u telesrv-grammy-bot -f
 ```
 
-Use `BOT_DB_PATH=/var/lib/gramsrv-grammy-bot/bot.sqlite3` in the production env.
-Back up the database with SQLite's online backup command or while the service is
-stopped; include `/etc/telesrv-grammy-bot.env` in a separate encrypted secret
-backup.
-
-The systemd unit intentionally has no hosting-specific values. Do not deploy it
-until the local branch has been reviewed and merged.
+The bot unit can be updated and restarted independently. Updating this service
+does not authorize updating or restarting the production `gramsrv` unit.

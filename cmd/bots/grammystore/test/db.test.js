@@ -19,6 +19,16 @@ test("start user receives persistent unique number and referral bonus is idempot
   assert.equal(first.id, same.id); assert.equal(db.user(1).bonus, 100); assert.equal(db.user(1).referral_count, 1);
 });
 
+test("a paid anonymous number does not hide the persistent free number", (t) => {
+  const db = fixture(t);
+  db.upsertUser({ id: 7, first_name: "Buyer" }, 70, "ru");
+  const free = db.createNumber(7, 70, "free", "RU", false);
+  const paid = db.createNumber(7, 70, "short", "ANON", true);
+  assert.notEqual(free.id, paid.id);
+  assert.equal(db.freeNumber(7).id, free.id);
+  assert.deepEqual(new Set(db.numbers(7).map((number) => number.id)), new Set([free.id, paid.id]));
+});
+
 test("payment charge can finish only once and failed work can retry", (t) => {
   const db = fixture(t);
   assert.equal(db.beginPayment("charge", 1, "payload", 10), true); db.failPayment("charge", "temporary");

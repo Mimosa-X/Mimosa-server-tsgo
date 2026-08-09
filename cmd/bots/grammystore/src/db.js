@@ -157,6 +157,7 @@ INSERT OR IGNORE INTO settings(key,value) VALUES('stars_rate','20');
   }
 
   currentNumber(ownerID) { return this.db.prepare("SELECT * FROM numbers WHERE owner_id=? AND is_current=1").get(ownerID) ?? null; }
+  freeNumber(ownerID) { return this.db.prepare("SELECT * FROM numbers WHERE owner_id=? AND format='free' ORDER BY id DESC LIMIT 1").get(ownerID) ?? null; }
   numbers(ownerID) { return this.db.prepare("SELECT * FROM numbers WHERE owner_id=? ORDER BY id DESC").all(ownerID); }
   findNumber(phone) { return this.db.prepare("SELECT * FROM numbers WHERE phone=? ORDER BY is_current DESC,id DESC LIMIT 1").get(normalizePhone(phone)) ?? null; }
   updateLoginCode(phone, code, expiresAt = now() + 300) {
@@ -219,9 +220,20 @@ INSERT OR IGNORE INTO settings(key,value) VALUES('stars_rate','20');
   }
   finishSpin(id, day) { this.db.prepare("UPDATE spin_awards SET status='done' WHERE telegram_id=? AND day=?").run(id, day); }
 
-  createPromo(code, stars, limit) { code = code.trim().toLowerCase(); this.db.prepare("INSERT INTO promos(code,stars_amount,max_acts,created_at) VALUES(?,?,?,?)").run(code, stars, limit, now()); return code; }
+  createPromo(code, stars, limit) {
+    code = String(code ?? "").trim().toLowerCase();
+    if (!code || !Number.isSafeInteger(stars) || stars <= 0 || !Number.isSafeInteger(limit) || limit < 0) throw new Error("invalid promo code parameters");
+    this.db.prepare("INSERT INTO promos(code,stars_amount,max_acts,created_at) VALUES(?,?,?,?)").run(code, stars, limit, now());
+    return this.db.prepare("SELECT * FROM promos WHERE code=?").get(code);
+  }
   claimPromo(code, id) { return this.claimCampaign("promo", code.trim().toLowerCase(), id); }
-  createGiveaway(text, stars, limit) { const id = randomBytes(4).toString("hex"); this.db.prepare("INSERT INTO giveaways(id,text,stars_amount,max_acts,created_at) VALUES(?,?,?,?,?)").run(id, text, stars, limit, now()); return this.db.prepare("SELECT * FROM giveaways WHERE id=?").get(id); }
+  createGiveaway(text, stars, limit) {
+    text = String(text ?? "").trim();
+    if (!text || !Number.isSafeInteger(stars) || stars <= 0 || !Number.isSafeInteger(limit) || limit < 0) throw new Error("invalid giveaway parameters");
+    const id = randomBytes(4).toString("hex");
+    this.db.prepare("INSERT INTO giveaways(id,text,stars_amount,max_acts,created_at) VALUES(?,?,?,?,?)").run(id, text, stars, limit, now());
+    return this.db.prepare("SELECT * FROM giveaways WHERE id=?").get(id);
+  }
   claimGiveaway(id, telegramID) { return this.claimCampaign("giveaway", id, telegramID); }
 
   releaseCampaignClaim(kind, key, telegramID) {

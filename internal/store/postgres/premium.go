@@ -746,6 +746,10 @@ SELECT disallow_premium_gifts FROM account_settings WHERE user_id=$1
 	if form.Kind == domain.PremiumPurchaseGift && form.RecipientUserID == form.BuyerUserID {
 		return domain.PremiumPaymentForm{}, domain.PremiumEntitlement{}, domain.User{}, domain.StarsBalance{}, domain.ErrPremiumGiftSelf
 	}
+	if form.Kind == domain.PremiumPurchaseGift && premiumUntil != nil && int(premiumUntil.Unix()) > req.Date {
+		return domain.PremiumPaymentForm{}, domain.PremiumEntitlement{}, domain.User{}, domain.StarsBalance{},
+			domain.PremiumSubscriptionActiveError{Until: int(premiumUntil.Unix())}
+	}
 
 	var balance int64
 	var granted bool
