@@ -11,6 +11,63 @@ const SPIN_PRIZES = Object.freeze([
   { amount: 15, weight: 530 },
 ]);
 
+export function fulfillmentForSale(sale, starsRate = 20) {
+  if (sale?.fulfillment?.kind) return sale.fulfillment;
+  if (!sale) throw new Error("Покупка не найдена");
+  if (sale.product === "custom") return { kind: "custom" };
+  let parsed = null;
+  try { if (sale.invoice_payload) parsed = parsePayload(sale.invoice_payload); } catch {}
+  const product = findProduct(sale.product, starsRate);
+  if (!product) throw new Error("Не удалось определить выданный товар");
+  if (product.kind === KINDS.stars) {
+    const titleAmount = Number(String(sale.title).match(/^(\d+)\s+NexGram Stars$/)?.[1] ?? 0);
+    const amount = parsed?.starsAmount || titleAmount || product.starsAmount;
+    return { kind: "stars", recipientID: sale.recipient_id, amount };
+  }
+  if (product.kind === KINDS.premium) return { kind: "premium", recipientID: sale.recipient_id, months: product.months, entitlementID: 0 };
+  if (product.kind === KINDS.username) return { kind: "username", recipientID: sale.recipient_id, username: normalizeUsername(parsed?.extra), bid: product.bid };
+  throw new Error("Для старой покупки номера нет точных данных; требуется ручная проверка");
+}
+
+export async function reverseSaleFulfillment(sale, db, gramsrv) {
+  const item = fulfillmentForSale(sale, db.starsRate());
+  const key = `refund:${sale.charge_id}:${item.kind}`;
+  if (item.kind === "custom") return item;
+  if (item.kind === "stars") await gramsrv.debitStars(item.recipientID, item.amount, "Telegram bot refund", key);
+  else if (item.kind === "premium") {
+    if (!positiveInteger(item.entitlementID)) throw new Error("У старой Premium-покупки нет ID выдачи; автоматический отзыв небезопасен");
+    await gramsrv.revokePremium(item.recipientID, item.entitlementID, "Telegram bot refund", key);
+  } else if (item.kind === "username") {
+    if (!item.username) throw new Error("У покупки не сохранён @username");
+    await gramsrv.revokeUsername(item.username, item.recipientID, key);
+  } else if (item.kind === "number") {
+    if (!positiveInteger(item.numberID) || !item.phone) throw new Error("У покупки не сохранены данные номера");
+    // Deletion is deliberately idempotent: a process may stop after deleting
+    // the number but before persisting the refund phase.
+    db.revokePurchasedNumber(item.ownerID, item.numberID, item.phone);
+  } else throw new Error("Неизвестный тип выдачи");
+  return item;
+}
+
+export async function executeCompensatedRefund({ sale, telegramID, db, gramsrv, refundStarPayment }) {
+  const chargeID = sale.charge_id;
+  const refund = db.beginRefund(chargeID, telegramID);
+  try {
+    if (!refund.internal_reversed) {
+      await reverseSaleFulfillment(sale, db, gramsrv);
+      db.markRefundInternal(chargeID);
+    }
+    try { await refundStarPayment(telegramID, chargeID); }
+    catch (error) {
+      if (!/REFUND.*ALREADY|ALREADY.*REFUND/i.test(String(error?.description ?? error?.message ?? error))) throw error;
+    }
+    db.markRefunded(chargeID, telegramID);
+  } catch (error) {
+    db.failRefund(chargeID, error.message);
+    throw error;
+  }
+}
+
 const FREE_COUNTRY_TEXT = "🎁 <b>Бесплатный номер</b>\n\nВыберите код страны для получения бесплатного номера.\nНа этот номер вы сможете получать коды входа <b>бесплатно</b>.";
 const ID_HELP_TEXT = "ℹ️ <b>Как получить свой NexGram ID</b>\n\n1. Перейдите в бот <b>@getmyid</b> (именно в <b>NexGram</b>, не в Telegram!)\n2. Нажмите «Старт»\n3. Скопируйте свой ID\n4. Пришлите его сюда сообщением";
 
@@ -176,23 +233,27 @@ export function createBot({ config, db, gramsrv }) {
   async function fulfill(product, recipientID, buyer, chatID, chargeID, extra = "") {
     if (db.saleByCharge(chargeID)) return;
     const commandKey = `payment:${chargeID}:${product.code}`;
-    let number;
+    let number, fulfillment;
     if (product.kind === KINDS.premium) {
       if (!positiveInteger(recipientID)) throw new Error("Некорректный NexGram ID получателя");
-      await gramsrv.grantPremium(recipientID, product.months, "Telegram bot purchase", commandKey);
+      const result = await gramsrv.grantPremium(recipientID, product.months, "Telegram bot purchase", commandKey);
+      fulfillment = { kind: "premium", recipientID, months: product.months, entitlementID: Number(result?.details?.entitlement_id ?? 0) };
     } else if (product.kind === KINDS.stars) {
       if (!positiveInteger(recipientID)) throw new Error("Некорректный NexGram ID получателя");
       await gramsrv.grantStars(recipientID, product.starsAmount, "Telegram bot purchase", commandKey);
+      fulfillment = { kind: "stars", recipientID, amount: product.starsAmount };
     } else if (product.kind === KINDS.username) {
       const username = normalizeUsername(extra);
       if (!positiveInteger(recipientID) || !username) throw new Error("Некорректный NexGram ID или @username");
       await gramsrv.mintUsername(recipientID, username, product.bid, commandKey);
+      fulfillment = { kind: "username", recipientID, username, bid: product.bid };
     } else if (product.kind === KINDS.number) {
       number = db.createNumber(buyer.id, chatID, product.numberFormat, "ANON", true);
       recipientID = buyer.id;
+      fulfillment = { kind: "number", ownerID: buyer.id, numberID: number.id, phone: number.phone, format: number.format };
     } else throw new Error("Неизвестный товар");
 
-    db.addSale({ product: product.code, title: product.title, starsPrice: product.starsPrice, recipientID, buyerID: buyer.id, buyerName: displayName(buyer), chargeID });
+    db.addSale({ product: product.code, title: product.title, starsPrice: product.starsPrice, recipientID, buyerID: buyer.id, buyerName: displayName(buyer), chargeID, fulfillment });
     if (number) {
       await bot.api.sendMessage(chatID, `✅ <b>Номер зарезервирован</b>\n\n📞 <code>${escapeHTML(number.display)}</code>\n\nКоды авторизации будут приходить сюда.`, { parse_mode: "HTML", reply_markup: backMenuKeyboard() });
     } else if (product.kind === KINDS.username) {
@@ -210,7 +271,8 @@ export function createBot({ config, db, gramsrv }) {
       await ctx.reply(`👑 <b>Тестовая покупка без оплаты</b>\n\n${escapeHTML(product.title)}\n(${product.starsPrice} ⭐ списано не будет)`, { parse_mode: "HTML" });
       return fulfill(product, targetID || ctx.from.id, ctx.from, ctx.chat.id, `owner-${ctx.from.id}-${Date.now()}-${randomInt(1_000_000)}`, extra);
     }
-    await ctx.api.sendInvoice(ctx.chat.id, product.title, product.description, buildPayload(product.code, targetID, extra), "XTR", [{ label: product.title, amount: product.starsPrice }]);
+    const starsAmount = product.kind === KINDS.stars ? product.starsAmount : 0;
+    await ctx.api.sendInvoice(ctx.chat.id, product.title, product.description, buildPayload(product.code, targetID, extra, starsAmount), "XTR", [{ label: product.title, amount: product.starsPrice }]);
   }
 
   bot.command(["start", "menu", "shop"], async (ctx) => {
@@ -236,7 +298,7 @@ export function createBot({ config, db, gramsrv }) {
       if (!query.invoice_payload.startsWith("custom|")) {
         const parsed = parsePayload(query.invoice_payload);
         const product = findProduct(parsed.code, db.starsRate());
-        if (!product || product.starsPrice !== query.total_amount) throw new Error("stale invoice");
+        if (!product || product.starsPrice !== query.total_amount || (product.kind === KINDS.stars && parsed.starsAmount <= 0)) throw new Error("stale invoice");
       }
       await ctx.answerPreCheckoutQuery(true);
     } catch {
@@ -251,13 +313,17 @@ export function createBot({ config, db, gramsrv }) {
     try {
       if (payment.invoice_payload.startsWith("custom|")) {
         const title = Buffer.from(payment.invoice_payload.slice(7), "base64url").toString("utf8");
-        db.addSale({ product: "custom", title, starsPrice: payment.total_amount, recipientID: ctx.from.id, buyerID: ctx.from.id, buyerName: displayName(ctx.from), chargeID });
+        db.addSale({ product: "custom", title, starsPrice: payment.total_amount, recipientID: ctx.from.id, buyerID: ctx.from.id, buyerName: displayName(ctx.from), chargeID, fulfillment: { kind: "custom" } });
         await ctx.reply(`✅ <b>Оплата получена</b>\n\n${escapeHTML(title)} — ${payment.total_amount} ⭐\n\nЧек: <code>${escapeHTML(chargeID)}</code>`, { parse_mode: "HTML" });
         for (const ownerID of config.ownerIDs) await bot.api.sendMessage(ownerID, `💰 Счёт оплачен: <code>${ctx.from.id}</code> → ${escapeHTML(title)} (${payment.total_amount} ⭐)`, { parse_mode: "HTML" }).catch(() => {});
       } else {
         const parsed = parsePayload(payment.invoice_payload);
-        const product = findProduct(parsed.code, db.starsRate());
+        let product = findProduct(parsed.code, db.starsRate());
         if (!product || payment.currency !== "XTR" || payment.total_amount !== product.starsPrice) throw new Error("Параметры оплаченного товара изменились");
+        if (product.kind === KINDS.stars) {
+          if (parsed.starsAmount <= 0) throw new Error("В счёте не зафиксировано количество NexGram Stars");
+          product = { ...product, starsAmount: parsed.starsAmount, title: `${parsed.starsAmount} NexGram Stars` };
+        }
         await fulfill(product, parsed.targetUserID || ctx.from.id, ctx.from, ctx.chat.id, chargeID, parsed.extra);
       }
       db.finishPayment(chargeID);
@@ -482,11 +548,15 @@ export function createBot({ config, db, gramsrv }) {
       }
       if (pending.kind === "adm_refund") {
         const parts = input.split(/\s+/); let telegramID, chargeID;
-        if (parts.length === 1) { chargeID = parts[0]; telegramID = db.saleByCharge(chargeID)?.buyer_id; }
+        let sale;
+        if (parts.length === 1) { chargeID = parts[0]; sale = db.saleByCharge(chargeID); telegramID = sale?.buyer_id; }
         else if (parts.length === 2) { telegramID = positiveInteger(parts[0]); chargeID = parts[1]; }
         if (!telegramID || !chargeID) return keep("Не нашёл покупку. Пришли: <code>telegram_id transaction_id</code>");
         if (db.isRefunded(chargeID)) throw new Error("Этот платёж уже возвращён");
-        await bot.api.refundStarPayment(telegramID, chargeID); db.markRefunded(chargeID, telegramID); db.clearPending(ctx.from.id);
+        sale ??= db.saleByCharge(chargeID);
+        if (!sale || sale.buyer_id !== telegramID || sale.payment_status !== "done") throw new Error("Завершённая покупка или её владелец не найдены в журнале");
+        await executeCompensatedRefund({ sale, telegramID, db, gramsrv, refundStarPayment: bot.api.refundStarPayment.bind(bot.api) });
+        db.clearPending(ctx.from.id);
         await bot.api.sendMessage(telegramID, `↩️ Вам возвращена оплата Telegram Stars.\n\nЧек: <code>${escapeHTML(chargeID)}</code>`, { parse_mode: "HTML" }).catch(() => {});
         return keep(`✅ Возврат выполнен\n\nПользователь: <code>${telegramID}</code>\nTransaction: <code>${escapeHTML(chargeID)}</code>`);
       }

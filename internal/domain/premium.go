@@ -420,11 +420,12 @@ type PremiumAdminGrantRequest struct {
 }
 
 type PremiumAdminRevokeRequest struct {
-	UserID      int64
-	ActorUserID int64
-	Date        int
-	Reason      string
-	CommandKey  string
+	UserID        int64
+	ActorUserID   int64
+	EntitlementID int64
+	Date          int
+	Reason        string
+	CommandKey    string
 }
 
 type PremiumRefundRequest struct {

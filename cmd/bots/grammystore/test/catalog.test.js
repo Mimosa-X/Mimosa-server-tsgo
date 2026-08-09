@@ -2,8 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { buildPayload, findProduct, normalizeUsername, parsePayload } from "../src/catalog.js";
 
-test("invoice payload round-trips unicode extras", () => {
-  assert.deepEqual(parsePayload(buildPayload("uname_10", 123, "юзер_name")), { code: "uname_10", targetUserID: 123, extra: "юзер_name" });
+test("invoice payload round-trips unicode extras and a Stars snapshot", () => {
+  assert.deepEqual(parsePayload(buildPayload("uname_10", 123, "юзер_name")), { code: "uname_10", targetUserID: 123, extra: "юзер_name", starsAmount: 0 });
+  assert.deepEqual(parsePayload(buildPayload("stars_1", 456, "", 20)), { code: "stars_1", targetUserID: 456, extra: "", starsAmount: 20 });
+  assert.deepEqual(parsePayload("store|stars_1|456|"), { code: "stars_1", targetUserID: 456, extra: "", starsAmount: 0 });
 });
 
 test("dynamic Stars products use configured rate", () => {

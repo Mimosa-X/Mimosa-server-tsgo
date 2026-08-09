@@ -60,7 +60,12 @@ test("code access, support replies, refunds and pending wheel awards are durable
   db.closeSupportMessage(ticket);
   assert.equal(db.supportMessage(ticket).status, "answered");
 
-  db.addSale({ product: "stars_1", title: "20 Stars", starsPrice: 1, recipientID: 100, buyerID: 1, buyerName: "Owner", chargeID: "charge-refund" });
+  db.addSale({ product: "stars_1", title: "20 NexGram Stars", starsPrice: 1, recipientID: 100, buyerID: 1, buyerName: "Owner", chargeID: "charge-refund", fulfillment: { kind: "stars", recipientID: 100, amount: 20 } });
+  assert.deepEqual(db.saleByCharge("charge-refund").fulfillment, { kind: "stars", recipientID: 100, amount: 20 });
+  assert.equal(db.beginRefund("charge-refund", 1).internal_reversed, 0);
+  db.markRefundInternal("charge-refund");
+  db.failRefund("charge-refund", "telegram unavailable");
+  assert.equal(db.refundByCharge("charge-refund").status, "internal_reversed");
   db.markRefunded("charge-refund", 1);
   assert.equal(db.isRefunded("charge-refund"), true);
 
@@ -68,4 +73,15 @@ test("code access, support replies, refunds and pending wheel awards are durable
   assert.equal(db.reserveSpin(1, 100, 999).prize, 50);
   db.finishSpin(1, reserved.day);
   assert.throws(() => db.reserveSpin(1, 100, 50));
+});
+
+test("refunding a paid number removes it and restores the previous number", (t) => {
+  const db = fixture(t);
+  db.upsertUser({ id: 5, first_name: "Buyer" }, 50, "ru");
+  const free = db.createNumber(5, 50, "free", "RU", false);
+  const paid = db.createNumber(5, 50, "short", "ANON", true);
+  assert.equal(db.revokePurchasedNumber(5, paid.id, paid.phone), true);
+  assert.equal(db.revokePurchasedNumber(5, paid.id, paid.phone), false);
+  assert.equal(db.currentNumber(5).id, free.id);
+  assert.equal(db.findNumber(paid.phone), null);
 });

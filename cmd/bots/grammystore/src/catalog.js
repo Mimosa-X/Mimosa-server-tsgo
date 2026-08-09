@@ -48,14 +48,16 @@ export function normalizeUsername(value) {
   return /^[a-z][a-z0-9_]{4,31}$/.test(username) ? username : "";
 }
 
-export function buildPayload(productCode, targetUserID = 0, extra = "") {
+export function buildPayload(productCode, targetUserID = 0, extra = "", starsAmount = 0) {
   const encoded = Buffer.from(extra, "utf8").toString("base64url");
-  return `store|${productCode}|${targetUserID}|${encoded}`;
+  return `store|${productCode}|${targetUserID}|${encoded}|${starsAmount}`;
 }
 
 export function parsePayload(payload) {
-  const [scope, code, target, encoded = ""] = String(payload).split("|", 4);
+  const [scope, code, target, encoded = "", rawStarsAmount = "0"] = String(payload).split("|", 5);
   const targetUserID = Number(target);
-  if (scope !== "store" || !code || !Number.isSafeInteger(targetUserID) || targetUserID < 0) throw new Error("invalid invoice payload");
-  return { code, targetUserID, extra: Buffer.from(encoded, "base64url").toString("utf8") };
+  const starsAmount = Number(rawStarsAmount || 0);
+  if (scope !== "store" || !code || !Number.isSafeInteger(targetUserID) || targetUserID < 0 ||
+      !Number.isSafeInteger(starsAmount) || starsAmount < 0) throw new Error("invalid invoice payload");
+  return { code, targetUserID, extra: Buffer.from(encoded, "base64url").toString("utf8"), starsAmount };
 }

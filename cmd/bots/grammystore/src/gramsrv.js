@@ -24,8 +24,16 @@ export class GramsrvClient {
     return this.post("/v1/accounts/grant-stars", this.command(reason, { user_id: userID, amount }, idempotencyKey));
   }
 
+  debitStars(userID, amount, reason = "Telegram bot refund", idempotencyKey = "") {
+    return this.post("/v1/accounts/debit-stars", this.command(reason, { user_id: userID, amount }, idempotencyKey));
+  }
+
   grantPremium(userID, months, reason = "Telegram bot purchase", idempotencyKey = "") {
     return this.post("/v1/accounts/grant-premium", this.command(reason, { user_id: userID, months }, idempotencyKey));
+  }
+
+  revokePremium(userID, entitlementID, reason = "Telegram bot refund", idempotencyKey = "") {
+    return this.post("/v1/accounts/grant-premium", this.command(reason, { user_id: userID, months: 0, entitlement_id: entitlementID }, idempotencyKey));
   }
 
   mintUsername(userID, username, bidTON, idempotencyKey = "") {
@@ -39,6 +47,13 @@ export class GramsrvClient {
       crypto_amount: amount,
       url: `${this.config.publicBaseURL}/nft/username/${username}`,
       purchase_date: Math.floor(Date.now() / 1000),
+    }, idempotencyKey));
+  }
+  revokeUsername(username, expectedOwnerUserID, idempotencyKey = "") {
+    return this.post("/v1/collectible-usernames/revoke", this.command("Telegram bot refund", {
+      username,
+      expected_owner_user_id: String(expectedOwnerUserID),
+      burn: false,
     }, idempotencyKey));
   }
 }
