@@ -2,7 +2,8 @@ import http from "node:http";
 import { loadConfig } from "./config.js";
 import { BotDatabase } from "./db.js";
 import { GramsrvClient } from "./gramsrv.js";
-import { createBot } from "./bot.js";
+import { commandList, createBot } from "./bot.js";
+import { normalizeLanguage, translate } from "./i18n.js";
 import { parseTelesrvDelivery, verifyTelesrvSignature } from "./otp.js";
 
 const config = loadConfig();
@@ -13,14 +14,40 @@ const bot = createBot({ config, db, gramsrv });
 function escapeHTML(value) { return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"); }
 function json(response, status, body) { response.writeHead(status, { "content-type": "application/json; charset=utf-8" }); response.end(JSON.stringify(body)); }
 
+function languageByChatID(chatID) {
+  return normalizeLanguage(db.userByChatID(chatID)?.language, config.defaultLanguage);
+}
+
+function loginCodeMessage(language, recipient, code, unbound = false) {
+  const variables = {
+    product: escapeHTML(config.productName),
+    phone: escapeHTML(recipient),
+    code: escapeHTML(code),
+  };
+  const lines = [
+    translate(language, "otpTitle", variables),
+    "",
+    translate(language, "otpPhone", variables),
+    translate(language, "otpCode", variables),
+    "",
+    translate(language, "otpWarning", variables),
+  ];
+  if (unbound) lines.push("", translate(language, "otpUnbound", variables));
+  return lines.join("\n");
+}
+
 async function deliverLoginCode(recipient, code, chatIDs) {
-  const message = `🔐 <b>Код входа ${escapeHTML(config.productName)}</b>\n\n📞 <code>${escapeHTML(recipient)}</code>\n🔑 <code>${escapeHTML(code)}</code>\n\nНикому не сообщайте этот код.`;
   let delivered = 0;
   for (const chatID of chatIDs) {
-    try { await bot.api.sendMessage(chatID, message, { parse_mode: "HTML" }); delivered++; }
+    try {
+      await bot.api.sendMessage(chatID, loginCodeMessage(languageByChatID(chatID), recipient, code), { parse_mode: "HTML" });
+      delivered++;
+    }
     catch (error) { console.error("OTP delivery failed", chatID, error); }
   }
-  if (!delivered) for (const owner of config.ownerIDs) await bot.api.sendMessage(owner, `${message}\n\n⚠️ Номер не привязан.`, { parse_mode: "HTML" }).catch(() => {});
+  if (!delivered) for (const owner of config.ownerIDs) {
+    await bot.api.sendMessage(owner, loginCodeMessage(languageByChatID(owner), recipient, code, true), { parse_mode: "HTML" }).catch(() => {});
+  }
 }
 
 const server = http.createServer((request, response) => {
@@ -52,11 +79,9 @@ server.listen(config.codePort, config.codeHost, () => console.log(`OTP webhook l
 const me = await bot.api.getMe();
 bot.botInfo = me;
 console.log(`Starting @${me.username}`);
-await bot.api.setMyCommands([
-  { command: "start", description: "Открыть главное меню" },
-  { command: "menu", description: "Главное меню" },
-  { command: "promo_code", description: "Активировать промокод" },
-]);
+await bot.api.setMyCommands(commandList(config.defaultLanguage));
+await bot.api.setMyCommands(commandList("ru"), { language_code: "ru" });
+await bot.api.setMyCommands(commandList("en"), { language_code: "en" });
 
 let stopping = false;
 async function shutdown(signal) {

@@ -135,12 +135,22 @@ INSERT OR IGNORE INTO settings(key,value) VALUES('stars_rate','20');
   }
 
   user(id) { return this.db.prepare("SELECT * FROM users WHERE telegram_id=?").get(id) ?? null; }
+  userByChatID(chatID) { return this.db.prepare("SELECT * FROM users WHERE chat_id=? ORDER BY updated_at DESC LIMIT 1").get(chatID) ?? null; }
   users() { return this.db.prepare("SELECT * FROM users ORDER BY created_at").all(); }
+  notificationRecipients(ttlDays = 30) {
+    const threshold = now() - Math.max(1, ttlDays) * 86400;
+    return this.db.prepare("SELECT * FROM users WHERE notifications=1 AND updated_at>=? ORDER BY created_at").all(threshold);
+  }
   stats() { return { users: this.db.prepare("SELECT count(*) n FROM users").get().n, numbers: this.db.prepare("SELECT count(*) n FROM numbers").get().n, sales: this.db.prepare("SELECT count(*) n FROM sales").get().n }; }
   setLanguage(id, language) { this.db.prepare("UPDATE users SET language=?,updated_at=? WHERE telegram_id=?").run(language, now(), id); }
   toggleNotifications(id) { this.db.prepare("UPDATE users SET notifications=1-notifications,updated_at=? WHERE telegram_id=?").run(now(), id); return Boolean(this.user(id)?.notifications); }
   setServerUserID(id, serverUserID) { this.db.prepare("UPDATE users SET server_user_id=?,updated_at=? WHERE telegram_id=?").run(serverUserID, now(), id); }
-  addBonus(id, amount) { this.db.prepare("UPDATE users SET bonus=MAX(0,bonus+?),updated_at=? WHERE telegram_id=?").run(amount, now(), id); return this.user(id)?.bonus ?? 0; }
+  addBonus(id, amount) {
+    if (!Number.isSafeInteger(amount)) throw new Error("invalid bonus amount");
+    const result = this.db.prepare("UPDATE users SET bonus=MAX(0,bonus+?),updated_at=? WHERE telegram_id=?").run(amount, now(), id);
+    if (!result.changes) throw new Error("invalid Telegram ID");
+    return this.user(id).bonus;
+  }
 
   claimDaily(id, amount) {
     return this.tx(() => {
@@ -170,7 +180,6 @@ INSERT OR IGNORE INTO settings(key,value) VALUES('stars_rate','20');
   }
 
   currentNumber(ownerID) { return this.db.prepare("SELECT * FROM numbers WHERE owner_id=? AND is_current=1").get(ownerID) ?? null; }
-  freeNumber(ownerID) { return this.db.prepare("SELECT * FROM numbers WHERE owner_id=? AND format='free' ORDER BY id DESC LIMIT 1").get(ownerID) ?? null; }
   numbers(ownerID) { return this.db.prepare("SELECT * FROM numbers WHERE owner_id=? ORDER BY id DESC").all(ownerID); }
   findNumber(phone) { return this.db.prepare("SELECT * FROM numbers WHERE phone=? ORDER BY is_current DESC,id DESC LIMIT 1").get(normalizePhone(phone)) ?? null; }
   updateLoginCode(phone, code, expiresAt = now() + 300) {
@@ -200,6 +209,21 @@ INSERT OR IGNORE INTO settings(key,value) VALUES('stars_rate','20');
     });
   }
   grantCodeAccess(phone, telegramID) { this.db.prepare("INSERT OR IGNORE INTO code_access(phone,telegram_id) VALUES(?,?)").run(normalizePhone(phone), telegramID); }
+
+  revokePurchasedNumber(ownerID, numberID, phone) {
+    return this.tx(() => {
+      const number = this.db.prepare("SELECT * FROM numbers WHERE id=? AND owner_id=? AND phone=?").get(numberID, ownerID, normalizePhone(phone));
+      if (!number) return false;
+      if (number.format === "free") throw new Error("the persistent free number cannot be refunded");
+      this.db.prepare("DELETE FROM code_access WHERE phone=?").run(number.phone);
+      this.db.prepare("DELETE FROM numbers WHERE id=?").run(number.id);
+      if (number.is_current) {
+        const previous = this.db.prepare("SELECT id FROM numbers WHERE owner_id=? ORDER BY id DESC LIMIT 1").get(ownerID);
+        if (previous) this.db.prepare("UPDATE numbers SET is_current=1 WHERE id=?").run(previous.id);
+      }
+      return true;
+    });
+  }
 
   getSetting(key, fallback = "") { return this.db.prepare("SELECT value FROM settings WHERE key=?").get(key)?.value ?? fallback; }
   setSetting(key, value) { this.db.prepare("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(key, String(value)); }
@@ -235,29 +259,14 @@ INSERT OR IGNORE INTO settings(key,value) VALUES('stars_rate','20');
 
   createPromo(code, stars, limit) {
     code = String(code ?? "").trim().toLowerCase();
-    if (!code || !Number.isSafeInteger(stars) || stars <= 0 || !Number.isSafeInteger(limit) || limit < 0) throw new Error("invalid promo code parameters");
+    if (!/^[a-z0-9_-]{3,32}$/.test(code) || !Number.isSafeInteger(stars) || stars <= 0 || !Number.isSafeInteger(limit) || limit < 0) throw new Error("invalid promo parameters");
     this.db.prepare("INSERT INTO promos(code,stars_amount,max_acts,created_at) VALUES(?,?,?,?)").run(code, stars, limit, now());
-    return this.db.prepare("SELECT * FROM promos WHERE code=?").get(code);
-  }
-
-  revokePurchasedNumber(ownerID, numberID, phone) {
-    return this.tx(() => {
-      const number = this.db.prepare("SELECT * FROM numbers WHERE id=? AND owner_id=? AND phone=?").get(numberID, ownerID, normalizePhone(phone));
-      if (!number) return false;
-      if (number.format === "free") throw new Error("the persistent free number cannot be refunded");
-      this.db.prepare("DELETE FROM code_access WHERE phone=?").run(number.phone);
-      this.db.prepare("DELETE FROM numbers WHERE id=?").run(number.id);
-      if (number.is_current) {
-        const previous = this.db.prepare("SELECT id FROM numbers WHERE owner_id=? ORDER BY id DESC LIMIT 1").get(ownerID);
-        if (previous) this.db.prepare("UPDATE numbers SET is_current=1 WHERE id=?").run(previous.id);
-      }
-      return true;
-    });
+    return code;
   }
   claimPromo(code, id) { return this.claimCampaign("promo", code.trim().toLowerCase(), id); }
   createGiveaway(text, stars, limit) {
     text = String(text ?? "").trim();
-    if (!text || !Number.isSafeInteger(stars) || stars <= 0 || !Number.isSafeInteger(limit) || limit < 0) throw new Error("invalid giveaway parameters");
+    if (!text || text.length > 1000 || !Number.isSafeInteger(stars) || stars <= 0 || !Number.isSafeInteger(limit) || limit < 0) throw new Error("invalid giveaway parameters");
     const id = randomBytes(4).toString("hex");
     this.db.prepare("INSERT INTO giveaways(id,text,stars_amount,max_acts,created_at) VALUES(?,?,?,?,?)").run(id, text, stars, limit, now());
     return this.db.prepare("SELECT * FROM giveaways WHERE id=?").get(id);

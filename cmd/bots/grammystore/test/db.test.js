@@ -19,16 +19,6 @@ test("start user receives persistent unique number and referral bonus is idempot
   assert.equal(first.id, same.id); assert.equal(db.user(1).bonus, 100); assert.equal(db.user(1).referral_count, 1);
 });
 
-test("a paid anonymous number does not hide the persistent free number", (t) => {
-  const db = fixture(t);
-  db.upsertUser({ id: 7, first_name: "Buyer" }, 70, "ru");
-  const free = db.createNumber(7, 70, "free", "RU", false);
-  const paid = db.createNumber(7, 70, "short", "ANON", true);
-  assert.notEqual(free.id, paid.id);
-  assert.equal(db.freeNumber(7).id, free.id);
-  assert.deepEqual(new Set(db.numbers(7).map((number) => number.id)), new Set([free.id, paid.id]));
-});
-
 test("payment charge can finish only once and failed work can retry", (t) => {
   const db = fixture(t);
   assert.equal(db.beginPayment("charge", 1, "payload", 10), true); db.failPayment("charge", "temporary");
@@ -75,7 +65,7 @@ test("code access, support replies, refunds and pending wheel awards are durable
   assert.throws(() => db.reserveSpin(1, 100, 50));
 });
 
-test("refunding a paid number removes it and restores the previous number", (t) => {
+test("refunding a paid number removes it and restores the persistent free number", (t) => {
   const db = fixture(t);
   db.upsertUser({ id: 5, first_name: "Buyer" }, 50, "ru");
   const free = db.createNumber(5, 50, "free", "RU", false);
@@ -84,4 +74,27 @@ test("refunding a paid number removes it and restores the previous number", (t) 
   assert.equal(db.revokePurchasedNumber(5, paid.id, paid.phone), false);
   assert.equal(db.currentNumber(5).id, free.id);
   assert.equal(db.findNumber(paid.phone), null);
+});
+
+test("language and notification preferences persist and broadcasts honor them", (t) => {
+  const db = fixture(t);
+  db.upsertUser({ id: 1, first_name: "One" }, 101, "ru");
+  db.upsertUser({ id: 2, first_name: "Two" }, 202, "en");
+  db.setLanguage(1, "en");
+  assert.equal(db.user(1).language, "en");
+  assert.equal(db.userByChatID(101).telegram_id, 1);
+  assert.deepEqual(db.notificationRecipients().map((user) => user.telegram_id), [1, 2]);
+  assert.equal(db.toggleNotifications(2), false);
+  assert.deepEqual(db.notificationRecipients().map((user) => user.telegram_id), [1]);
+  db.db.prepare("UPDATE users SET updated_at=0 WHERE telegram_id=1").run();
+  assert.deepEqual(db.notificationRecipients(30), []);
+});
+
+test("administrator mutations reject invalid input and missing users", (t) => {
+  const db = fixture(t);
+  assert.throws(() => db.createPromo("x", 10, 1));
+  assert.throws(() => db.createPromo("valid", -1, 1));
+  assert.throws(() => db.createGiveaway("", 10, 1));
+  assert.throws(() => db.createGiveaway("valid", 10, -1));
+  assert.throws(() => db.addBonus(999, 10));
 });
