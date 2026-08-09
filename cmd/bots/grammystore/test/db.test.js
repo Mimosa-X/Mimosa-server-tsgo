@@ -60,7 +60,7 @@ test("code access, support replies, refunds and pending wheel awards are durable
   db.closeSupportMessage(ticket);
   assert.equal(db.supportMessage(ticket).status, "answered");
 
-  db.addSale({ product: "stars_1", title: "20 NexGram Stars", starsPrice: 1, recipientID: 100, buyerID: 1, buyerName: "Owner", chargeID: "charge-refund", fulfillment: { kind: "stars", recipientID: 100, amount: 20 } });
+  db.addSale({ product: "stars_1", title: "20 Telesrv Stars", starsPrice: 1, recipientID: 100, buyerID: 1, buyerName: "Owner", chargeID: "charge-refund", fulfillment: { kind: "stars", recipientID: 100, amount: 20 } });
   assert.deepEqual(db.saleByCharge("charge-refund").fulfillment, { kind: "stars", recipientID: 100, amount: 20 });
   assert.equal(db.beginRefund("charge-refund", 1).internal_reversed, 0);
   db.markRefundInternal("charge-refund");

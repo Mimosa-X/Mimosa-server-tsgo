@@ -8,7 +8,7 @@ import { executeCompensatedRefund, fulfillmentForSale, reverseSaleFulfillment } 
 
 test("legacy Stars sale resolves the exact granted amount from its title", () => {
   const item = fulfillmentForSale({
-    product: "stars_1", title: "20 NexGram Stars", recipient_id: 1780243200,
+    product: "stars_1", title: "20 LegacyBrand Stars", recipient_id: 1780243200,
     invoice_payload: "store|stars_1|1780243200|", fulfillment: {},
   }, 50);
   assert.deepEqual(item, { kind: "stars", recipientID: 1780243200, amount: 20 });
@@ -42,7 +42,7 @@ test("Telegram retry does not debit the internal product twice", async (t) => {
   const db = new BotDatabase(path.join(dir, "bot.sqlite3"));
   t.after(() => { db.close(); rmSync(dir, { recursive: true, force: true }); });
   db.addSale({
-    product: "stars_1", title: "20 NexGram Stars", starsPrice: 1, recipientID: 1001,
+    product: "stars_1", title: "20 Telesrv Stars", starsPrice: 1, recipientID: 1001,
     buyerID: 7, buyerName: "Buyer", chargeID: "charge-retry",
     fulfillment: { kind: "stars", recipientID: 1001, amount: 20 },
   });

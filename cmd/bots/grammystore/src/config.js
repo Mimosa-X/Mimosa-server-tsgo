@@ -29,7 +29,7 @@ export function loadConfig() {
   if (webhookSecret.length < 24) throw new Error("CODE_WEBHOOK_SECRET must contain at least 24 characters");
   return Object.freeze({
     botToken: required("BOT_TOKEN"),
-    productName: (process.env.PRODUCT_NAME ?? "NexGram").trim() || "NexGram",
+    productName: (process.env.PRODUCT_NAME ?? "Telesrv").trim() || "Telesrv",
     ownerIDs: ownerIDs(),
     publicUsername: (process.env.BOT_PUBLIC_USERNAME ?? "").replace(/^@/, "").trim(),
     gramsrvAPI: (process.env.GRAMSRV_API ?? "http://127.0.0.1:2399").replace(/\/+$/, ""),

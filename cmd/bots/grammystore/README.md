@@ -1,4 +1,4 @@
-# NexGram grammY store and authentication bot
+# Telesrv grammY store and authentication bot
 
 This service is a JavaScript/grammY port of the supplied legacy Go bot. It runs
 independently from `cmd/telesrv`, uses a transactional SQLite database, and keeps
@@ -9,8 +9,8 @@ the gramsrv OTP webhook authenticated and idempotent.
 - required-channel membership gate;
 - one free Russian or US number and paid anonymous `+888` numbers;
 - login-code delivery to the number owner and explicitly authorized viewers;
-- Premium, NexGram Stars, `+888` numbers and collectible username purchases;
-- purchases for another NexGram account and three recent recipient IDs;
+- Premium, Telesrv Stars, `+888` numbers and collectible username purchases;
+- purchases for another Telesrv account and three recent recipient IDs;
 - Telegram Stars invoices with charge deduplication and a durable sales journal;
 - daily/weekly weighted prize wheel;
 - promo codes and button-based giveaway campaigns;
@@ -18,7 +18,7 @@ the gramsrv OTP webhook authenticated and idempotent.
 - owner-created invoices, refunds, broadcasts, code access and rate controls;
 - owner-only recent sales journal.
 
-All user-facing product text uses the NexGram name. Secrets are read only from
+All user-facing product text uses the Telesrv name. Secrets are read only from
 the service environment and must never be committed.
 
 ## Local run
@@ -36,7 +36,7 @@ npm start
 
 `OWNER_IDS` accepts comma-separated Telegram user IDs. `REQUIRED_CHANNEL` may
 be empty to disable the subscription gate. `PRODUCT_NAME` defaults to
-`NexGram`; deployment-specific values still belong in the environment.
+`Telesrv`; deployment-specific values still belong in the environment.
 
 ## Database
 
