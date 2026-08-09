@@ -735,8 +735,16 @@ func (s *MessageStore) resolvePrivateSendReply(ctx context.Context, req domain.S
 	if peer.ID == 0 {
 		peer = domain.Peer{Type: domain.PeerTypeUser, ID: req.RecipientUserID}
 	}
-	if peer.Type != domain.PeerTypeUser || peer.ID != req.RecipientUserID {
+	if peer.Type != domain.PeerTypeUser && peer.Type != domain.PeerTypeChannel {
 		return nil, nil, domain.ErrReplyMessageIDInvalid
+	}
+	// Channel messages are validated at the RPC boundary through Channels.GetMessages.
+	// They have no private message_box row, so retain the cross-dialog reference
+	// and quote verbatim in both recipient projections.
+	if peer.Type == domain.PeerTypeChannel {
+		reply := cloneMessageReply(req.ReplyTo)
+		reply.Peer = peer
+		return reply, cloneMessageReply(reply), nil
 	}
 	source, err := s.q.GetMessageBoxForReply(ctx, sqlcgen.GetMessageBoxForReplyParams{
 		OwnerUserID: req.SenderUserID,
@@ -754,6 +762,12 @@ func (s *MessageStore) resolvePrivateSendReply(ctx context.Context, req domain.S
 	senderReply.MessageID = int(source.BoxID)
 	senderReply.Peer = peer
 	if req.SenderUserID == req.RecipientUserID {
+		return senderReply, cloneMessageReply(senderReply), nil
+	}
+	if peer.ID != req.RecipientUserID {
+		// A cross-dialog reply references the sender's source box. There is no
+		// corresponding row in the destination dialog to remap to; both sides
+		// therefore receive the explicit source peer/message pair.
 		return senderReply, cloneMessageReply(senderReply), nil
 	}
 

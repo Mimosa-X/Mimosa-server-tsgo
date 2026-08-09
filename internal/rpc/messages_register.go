@@ -714,6 +714,12 @@ func (r *Router) registerMessages(d *tlprofile.Dispatcher) {
 			if isLegacyInputPeerChat(req.Peer) {
 				return &tg.MessagesMessages{}, nil
 			}
+			// P2P calls are stored exclusively in private message boxes. Returning
+			// an empty result is important here: falling through to channel history
+			// would make ordinary channel posts appear in the Calls tab.
+			if filter.PhoneCallsOnly {
+				return &tg.MessagesMessages{}, nil
+			}
 			if messagesSearchFilterChatPhotos(req.Filter) {
 				view, err := r.resolveInputPeerChannelView(ctx, userID, req.Peer, filter.Peer.ID)
 				if err != nil {
