@@ -87,10 +87,10 @@ into a server-side timeout. `/healthz` is read-only.
 ## Linux install
 
 ```bash
-sudo useradd --system --home /var/lib/telesrv-grammy-bot --shell /usr/sbin/nologin telesrv-bot || true
-sudo install -d -o telesrv-bot -g telesrv-bot -m 0750 /opt/telesrv-grammy-bot /var/lib/telesrv-grammy-bot
-sudo cp -a package.json package-lock.json src /opt/telesrv-grammy-bot/
-cd /opt/telesrv-grammy-bot
+sudo useradd --system --home /var/lib/gramsrv-grammy-bot --shell /usr/sbin/nologin telesrv-bot || true
+sudo install -d -o telesrv-bot -g telesrv-bot -m 0750 /opt/gramsrv-grammy-bot /var/lib/gramsrv-grammy-bot
+sudo cp -a package.json package-lock.json src /opt/gramsrv-grammy-bot/
+cd /opt/gramsrv-grammy-bot
 sudo npm ci --omit=dev
 sudo cp .env.example /etc/telesrv-grammy-bot.env
 sudo chmod 0600 /etc/telesrv-grammy-bot.env
@@ -100,7 +100,7 @@ sudo systemctl enable --now telesrv-grammy-bot
 sudo journalctl -u telesrv-grammy-bot -f
 ```
 
-Use `BOT_DB_PATH=/var/lib/telesrv-grammy-bot/bot.sqlite3` in the production env.
+Use `BOT_DB_PATH=/var/lib/gramsrv-grammy-bot/bot.sqlite3` in the production env.
 Back up the database with SQLite's online backup command or while the service is
 stopped; include `/etc/telesrv-grammy-bot.env` in a separate encrypted secret
 backup.

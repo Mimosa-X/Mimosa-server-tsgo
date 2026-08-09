@@ -7,9 +7,9 @@ Wants=network-online.target
 Type=simple
 User=telesrv-bot
 Group=telesrv-bot
-WorkingDirectory=/opt/telesrv-grammy-bot
+WorkingDirectory=/opt/gramsrv-grammy-bot
 EnvironmentFile=/etc/telesrv-grammy-bot.env
-ExecStart=/usr/bin/node /opt/telesrv-grammy-bot/src/index.js
+ExecStart=/usr/bin/node /opt/gramsrv-grammy-bot/src/index.js
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=20
@@ -17,7 +17,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/telesrv-grammy-bot
+ReadWritePaths=/var/lib/gramsrv-grammy-bot
 
 [Install]
 WantedBy=multi-user.target
