@@ -277,7 +277,11 @@ type MessageFilter struct {
 	// userFull.pinned_msg_id 的查询路径）。
 	PinnedOnly     bool
 	MusicOnly      bool
-	NeedTotalCount bool
+	PhoneCallsOnly bool
+	// MissedPhoneCallsOnly narrows PhoneCallsOnly to incoming calls that ended
+	// with the protocol-level "missed" reason.
+	MissedPhoneCallsOnly bool
+	NeedTotalCount       bool
 	// SavedPeer 非零时仅返回 self-chat 中该 saved 子会话的消息
 	// （messages.getSavedHistory）；Peer 必须同时是 self。
 	SavedPeer Peer

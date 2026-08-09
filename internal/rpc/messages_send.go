@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -330,7 +331,7 @@ func (r *Router) messageReplyFromInput(ctx context.Context, userID int64, peer d
 	replyPeer := peer
 	if inputPeer, ok := reply.GetReplyToPeerID(); ok {
 		parsed, err := r.checkedDomainPeerFromInputPeer(ctx, userID, inputPeer)
-		if err != nil || parsed != peer {
+		if err != nil {
 			return nil, replyMessageIDInvalidErr()
 		}
 		replyPeer = parsed
@@ -344,6 +345,19 @@ func (r *Router) messageReplyFromInput(ctx context.Context, userID int64, peer d
 	}
 	if reply.ReplyToMsgID == 0 && topMsgID == 0 {
 		return nil, replyMessageIDInvalidErr()
+	}
+	// inputReplyToMessage.reply_to_peer_id is explicitly allowed to point to a
+	// different dialog. Private-source existence is checked transactionally by
+	// MessageStore; channel sources are validated here because they live in the
+	// channel store rather than message_boxes.
+	if replyPeer.Type == domain.PeerTypeChannel && reply.ReplyToMsgID > 0 {
+		if r.deps.Channels == nil {
+			return nil, replyMessageIDInvalidErr()
+		}
+		history, err := r.deps.Channels.GetMessages(ctx, userID, replyPeer.ID, []int{reply.ReplyToMsgID})
+		if err != nil || len(history.Messages) != 1 || history.Messages[0].ID != reply.ReplyToMsgID {
+			return nil, replyMessageIDInvalidErr()
+		}
 	}
 	quoteText, _ := reply.GetQuoteText()
 	if utf8.RuneCountInString(quoteText) > maxReplyQuoteLength {
@@ -717,21 +731,9 @@ func (r *Router) usersForMessageUpdate(ctx context.Context, ownerUserID int64, m
 			}
 		}
 	}
-	if msg.From.Type == domain.PeerTypeUser {
-		add(msg.From.ID)
-	}
-	if msg.Peer.Type == domain.PeerTypeUser {
-		add(msg.Peer.ID)
-	}
-	if msg.Forward != nil && msg.Forward.From.Type == domain.PeerTypeUser {
-		add(msg.Forward.From.ID)
-	}
-	add(msg.ViaBotID)
-	if msg.ReplyTo != nil && msg.ReplyTo.Peer.Type == domain.PeerTypeUser {
-		add(msg.ReplyTo.Peer.ID)
-	}
-	if msg.Media != nil && msg.Media.Contact != nil {
-		add(msg.Media.Contact.UserID)
+	ids := appendMessageUserIDs(nil, make(map[int64]struct{}), msg)
+	for _, id := range ids {
+		add(id)
 	}
 	// A non-min User replaces the cached peer on iOS. Keep the complete
 	// username vector on synchronous message echoes instead of letting this
@@ -754,21 +756,8 @@ func (r *Router) usersForMessageUpdates(ctx context.Context, ownerUserID int64, 
 		ids = append(ids, id)
 	}
 	for _, msg := range messages {
-		if msg.From.Type == domain.PeerTypeUser {
-			addID(msg.From.ID)
-		}
-		if msg.Peer.Type == domain.PeerTypeUser {
-			addID(msg.Peer.ID)
-		}
-		if msg.Forward != nil && msg.Forward.From.Type == domain.PeerTypeUser {
-			addID(msg.Forward.From.ID)
-		}
-		addID(msg.ViaBotID)
-		if msg.ReplyTo != nil && msg.ReplyTo.Peer.Type == domain.PeerTypeUser {
-			addID(msg.ReplyTo.Peer.ID)
-		}
-		if msg.Media != nil && msg.Media.Contact != nil {
-			addID(msg.Media.Contact.UserID)
+		for _, id := range appendMessageUserIDs(nil, make(map[int64]struct{}), msg) {
+			addID(id)
 		}
 	}
 	if len(ids) == 0 {
@@ -807,6 +796,46 @@ func (r *Router) chatsForMessageUpdate(ctx context.Context, ownerUserID int64, m
 	return r.chatsForMessageUpdates(ctx, ownerUserID, []domain.Message{msg})
 }
 
+func appendMessageUserIDs(ids []int64, seen map[int64]struct{}, msg domain.Message) []int64 {
+	add := func(id int64) {
+		if id == 0 {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	for _, peer := range []domain.Peer{msg.From, msg.Peer} {
+		if peer.Type == domain.PeerTypeUser {
+			add(peer.ID)
+		}
+	}
+	if msg.Forward != nil && msg.Forward.From.Type == domain.PeerTypeUser {
+		add(msg.Forward.From.ID)
+	}
+	add(msg.ViaBotID)
+	if msg.ReplyTo != nil && msg.ReplyTo.Peer.Type == domain.PeerTypeUser {
+		add(msg.ReplyTo.Peer.ID)
+	}
+	if msg.Media != nil && msg.Media.Contact != nil {
+		add(msg.Media.Contact.UserID)
+	}
+	userRefs := make(map[int64]struct{})
+	channelRefs := make(map[int64]struct{})
+	collectMessagePeerRefs(msg, 0, userRefs, channelRefs)
+	extra := make([]int64, 0, len(userRefs))
+	for id := range userRefs {
+		extra = append(extra, id)
+	}
+	sort.Slice(extra, func(i, j int) bool { return extra[i] < extra[j] })
+	for _, id := range extra {
+		add(id)
+	}
+	return ids
+}
+
 func appendMessageChannelIDs(ids []int64, seen map[int64]struct{}, msg domain.Message) []int64 {
 	add := func(id int64) {
 		if id == 0 {
@@ -818,17 +847,27 @@ func appendMessageChannelIDs(ids []int64, seen map[int64]struct{}, msg domain.Me
 		seen[id] = struct{}{}
 		ids = append(ids, id)
 	}
-	if msg.From.Type == domain.PeerTypeChannel {
-		add(msg.From.ID)
-	}
-	if msg.Peer.Type == domain.PeerTypeChannel {
-		add(msg.Peer.ID)
+	for _, peer := range []domain.Peer{msg.From, msg.Peer} {
+		if peer.Type == domain.PeerTypeChannel {
+			add(peer.ID)
+		}
 	}
 	if msg.Forward != nil && msg.Forward.From.Type == domain.PeerTypeChannel {
 		add(msg.Forward.From.ID)
 	}
 	if msg.ReplyTo != nil && msg.ReplyTo.Peer.Type == domain.PeerTypeChannel {
 		add(msg.ReplyTo.Peer.ID)
+	}
+	userRefs := make(map[int64]struct{})
+	channelRefs := make(map[int64]struct{})
+	collectMessagePeerRefs(msg, 0, userRefs, channelRefs)
+	extra := make([]int64, 0, len(channelRefs))
+	for id := range channelRefs {
+		extra = append(extra, id)
+	}
+	sort.Slice(extra, func(i, j int) bool { return extra[i] < extra[j] })
+	for _, id := range extra {
+		add(id)
 	}
 	return ids
 }
