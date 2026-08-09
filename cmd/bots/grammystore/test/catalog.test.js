@@ -1,0 +1,22 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { buildPayload, findProduct, normalizeUsername, parsePayload } from "../src/catalog.js";
+
+test("invoice payload round-trips unicode extras", () => {
+  assert.deepEqual(parsePayload(buildPayload("uname_10", 123, "юзер_name")), { code: "uname_10", targetUserID: 123, extra: "юзер_name" });
+});
+
+test("dynamic Stars products use configured rate", () => {
+  assert.equal(findProduct("stars_25", 30).starsAmount, 750);
+});
+
+test("arbitrary Stars invoices are bounded and use the configured rate", () => {
+  assert.equal(findProduct("stars_37", 25).starsAmount, 925);
+  assert.equal(findProduct("stars_100000", 25), null);
+  assert.equal(findProduct("stars_0", 25), null);
+});
+
+test("collectible username validation is canonical", () => {
+  assert.equal(normalizeUsername(" @Valid_Name "), "valid_name");
+  assert.equal(normalizeUsername("1bad"), "");
+});
