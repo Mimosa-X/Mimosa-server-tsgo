@@ -42,6 +42,10 @@ export function loadConfig() {
     codeWebhookSecret: webhookSecret,
     requiredChannel: (process.env.REQUIRED_CHANNEL ?? "").trim(),
     requiredChannelURL: (process.env.REQUIRED_CHANNEL_URL ?? "").trim(),
+    defaultLanguage: (process.env.DEFAULT_LANGUAGE ?? "ru").toLowerCase() === "en" ? "en" : "ru",
     defaultNumberCountry: (process.env.DEFAULT_NUMBER_COUNTRY ?? "RU").toUpperCase() === "US" ? "US" : "RU",
+    referralBonus: integer("REFERRAL_BONUS", 100, { min: 0 }),
+    dailyBonus: integer("DAILY_BONUS", 15, { min: 0 }),
+    notificationTTLDays: integer("NOTIFICATION_TTL_DAYS", 30, { min: 1 }),
   });
 }
