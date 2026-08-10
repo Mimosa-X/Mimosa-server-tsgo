@@ -30,6 +30,7 @@ const (
 	ActionRefundPremium           = "account.refund_premium"
 	ActionUpsertPremiumPlan       = "premium.plan.upsert"
 	ActionGrantStars              = "account.grant_stars"
+	ActionDebitStars              = "account.debit_stars"
 	ActionSetVerified             = "account.set_verified"
 	ActionSetUserFlags            = "account.set_flags"
 	ActionSetSupport              = "account.set_support"
@@ -238,6 +239,7 @@ type AccountService interface {
 
 type StarsService interface {
 	Credit(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string) (domain.StarsBalance, error)
+	Debit(ctx context.Context, userID, amount int64, reason domain.StarsTransactionReason, peer domain.Peer, title, desc string) (domain.StarsBalance, error)
 }
 
 type BroadcastService interface {
@@ -862,8 +864,9 @@ type SetAccountFrozenRequest struct {
 
 type GrantPremiumRequest struct {
 	CommandMeta
-	UserID int64 `json:"user_id"`
-	Months int   `json:"months"`
+	UserID        int64 `json:"user_id"`
+	Months        int   `json:"months"`
+	EntitlementID int64 `json:"entitlement_id,omitempty"`
 }
 
 type RefundPremiumRequest struct {
@@ -887,6 +890,12 @@ type UpsertPremiumPlanRequest struct {
 }
 
 type GrantStarsRequest struct {
+	CommandMeta
+	UserID int64 `json:"user_id"`
+	Amount int64 `json:"amount"`
+}
+
+type DebitStarsRequest struct {
 	CommandMeta
 	UserID int64 `json:"user_id"`
 	Amount int64 `json:"amount"`
@@ -1152,8 +1161,9 @@ type TransferCollectibleUsernameRequest struct {
 // permanently when Burn is set.
 type RevokeCollectibleUsernameRequest struct {
 	CommandMeta
-	Username string `json:"username"`
-	Burn     bool   `json:"burn"`
+	Username            string `json:"username"`
+	ExpectedOwnerUserID int64  `json:"expected_owner_user_id,string,omitempty"`
+	Burn                bool   `json:"burn"`
 }
 
 // DeleteCollectibleUsernameRequest erases a collectible asset entirely. Unlike a
@@ -1452,8 +1462,14 @@ func (s *Service) GrantPremium(ctx context.Context, req GrantPremiumRequest) (Co
 	if req.Months < 0 || req.Months > maxPremiumMonths {
 		return CommandResult{}, fmt.Errorf("months must be between 0 and %d", maxPremiumMonths)
 	}
+	if req.EntitlementID < 0 || (req.Months > 0 && req.EntitlementID != 0) {
+		return CommandResult{}, fmt.Errorf("entitlement_id is only valid when months is 0")
+	}
 	if s == nil || s.users == nil {
 		return CommandResult{}, fmt.Errorf("admin user dependency is not configured")
+	}
+	if req.EntitlementID > 0 && s.premium == nil {
+		return CommandResult{}, fmt.Errorf("exact premium entitlement revoke is not configured")
 	}
 	return s.runCommand(ctx, req.CommandMeta, ActionGrantPremium, req.UserID, domain.Peer{}, req, func() (CommandResult, error) {
 		u, found, err := s.users.AdminUser(ctx, req.UserID)
@@ -1467,6 +1483,9 @@ func (s *Service) GrantPremium(ctx context.Context, req GrantPremiumRequest) (Co
 			return CommandResult{}, domain.ErrPremiumBotUnsupported
 		}
 		details := premiumCommandDetails(u, req.Months, s.now())
+		if req.EntitlementID > 0 {
+			details["entitlement_id"] = req.EntitlementID
+		}
 		if req.DryRun {
 			return CommandResult{Message: "dry-run completed", Details: details}, nil
 		}
@@ -1476,7 +1495,7 @@ func (s *Service) GrantPremium(ctx context.Context, req GrantPremiumRequest) (Co
 			if req.Months == 0 {
 				updated, err = s.premium.Revoke(ctx, domain.PremiumAdminRevokeRequest{
 					UserID: req.UserID, ActorUserID: actorID, Date: int(s.now().Unix()),
-					Reason: req.Reason, CommandKey: strings.TrimSpace(req.CommandID),
+					Reason: req.Reason, CommandKey: strings.TrimSpace(req.CommandID), EntitlementID: req.EntitlementID,
 				})
 			} else {
 				durationDays := req.Months * 30
@@ -1485,11 +1504,15 @@ func (s *Service) GrantPremium(ctx context.Context, req GrantPremiumRequest) (Co
 				} else if !errors.Is(planErr, domain.ErrPremiumPlanUnavailable) {
 					return CommandResult{}, planErr
 				}
-				_, updated, err = s.premium.Grant(ctx, domain.PremiumAdminGrantRequest{
+				var entitlement domain.PremiumEntitlement
+				entitlement, updated, err = s.premium.Grant(ctx, domain.PremiumAdminGrantRequest{
 					UserID: req.UserID, ActorUserID: actorID, Months: req.Months,
 					DurationDays: durationDays, Date: int(s.now().Unix()),
 					Reason: req.Reason, CommandKey: strings.TrimSpace(req.CommandID),
 				})
+				if err == nil {
+					details["entitlement_id"] = entitlement.ID
+				}
 			}
 		} else {
 			updated, err = s.users.GrantPremium(ctx, req.UserID, req.Months)
@@ -1668,6 +1691,40 @@ func (s *Service) GrantStars(ctx context.Context, req GrantStarsRequest) (Comman
 			details["notify_error"] = err.Error()
 		}
 		return CommandResult{Message: "stars granted", Details: details}, nil
+	})
+}
+
+func (s *Service) DebitStars(ctx context.Context, req DebitStarsRequest) (CommandResult, error) {
+	if req.UserID <= 0 {
+		return CommandResult{}, fmt.Errorf("user_id is required")
+	}
+	if req.Amount <= 0 || req.Amount > maxStarsGrant {
+		return CommandResult{}, fmt.Errorf("amount must be between 1 and %d", maxStarsGrant)
+	}
+	if s == nil || s.users == nil || s.stars == nil {
+		return CommandResult{}, fmt.Errorf("admin stars dependencies are not configured")
+	}
+	return s.runCommand(ctx, req.CommandMeta, ActionDebitStars, req.UserID, domain.Peer{}, req, func() (CommandResult, error) {
+		u, found, err := s.users.AdminUser(ctx, req.UserID)
+		if err != nil {
+			return CommandResult{}, err
+		}
+		if !found {
+			return CommandResult{}, domain.ErrUserNotFound
+		}
+		details := map[string]any{"amount": req.Amount, "username": u.Username, "phone": u.Phone, "would_debit": true}
+		if req.DryRun {
+			return CommandResult{Message: "dry-run completed", Details: details}, nil
+		}
+		balance, err := s.stars.Debit(ctx, req.UserID, req.Amount, domain.StarsReasonAdjust, domain.Peer{}, "Admin Stars debit", req.Reason)
+		if err != nil {
+			return CommandResult{}, err
+		}
+		details["updated_balance"] = balance.Balance
+		if err := s.notifyStarsBalanceChanged(ctx, balance); err != nil {
+			details["notify_error"] = err.Error()
+		}
+		return CommandResult{Message: "stars debited", Details: details}, nil
 	})
 }
 
@@ -2489,6 +2546,9 @@ func (s *Service) RevokeCollectibleUsername(ctx context.Context, req RevokeColle
 	if !domain.ValidCollectibleUsername(req.Username) {
 		return CommandResult{}, codedError(CodeUsernameInvalid, domain.ErrUsernameInvalid)
 	}
+	if req.ExpectedOwnerUserID < 0 {
+		return CommandResult{}, fmt.Errorf("expected_owner_user_id must not be negative")
+	}
 	return s.runCommand(ctx, req.CommandMeta, ActionRevokeCollectibleUsername, 0, domain.Peer{}, req, func() (CommandResult, error) {
 		details := map[string]any{"username": req.Username, "burn": req.Burn}
 		asset, err := s.usernames.Collectible(ctx, req.Username)
@@ -2503,6 +2563,9 @@ func (s *Service) RevokeCollectibleUsername(ctx context.Context, req RevokeColle
 			return CommandResult{Details: details}, codedError(CodeCollectibleBurned, domain.ErrCollectibleUsernameBurned)
 		}
 		if !req.Burn && !asset.Owned() {
+			return CommandResult{Details: details}, codedError(CodeCollectibleNotOwned, domain.ErrCollectibleUsernameNotOwned)
+		}
+		if req.ExpectedOwnerUserID > 0 && asset.Owner != (domain.Peer{Type: domain.PeerTypeUser, ID: req.ExpectedOwnerUserID}) {
 			return CommandResult{Details: details}, codedError(CodeCollectibleNotOwned, domain.ErrCollectibleUsernameNotOwned)
 		}
 		if req.DryRun {

@@ -224,6 +224,9 @@ func (r *Router) resolvePremiumInvoice(
 			}
 			return domain.PremiumInvoice{}, userIDInvalidErr()
 		}
+		if err := r.rejectActivePremiumGiftRecipient(recipient); err != nil {
+			return domain.PremiumInvoice{}, err
+		}
 		if restricted, err := r.premiumGiftsRestricted(ctx, recipient.ID); err != nil {
 			return domain.PremiumInvoice{}, internalErr()
 		} else if restricted {
@@ -271,6 +274,9 @@ func (r *Router) resolvePremiumInvoice(
 				return domain.PremiumInvoice{}, tgerr.New(400, "PREMIUM_GIFT_SELF_INVALID")
 			}
 			return domain.PremiumInvoice{}, userIDInvalidErr()
+		}
+		if err := r.rejectActivePremiumGiftRecipient(recipient); err != nil {
+			return domain.PremiumInvoice{}, err
 		}
 		if restricted, err := r.premiumGiftsRestricted(ctx, recipient.ID); err != nil {
 			return domain.PremiumInvoice{}, internalErr()
@@ -329,6 +335,9 @@ func (r *Router) resolvePremiumInvoice(
 			if !found || recipient.ID <= 0 || recipient.ID == userID || recipient.Bot ||
 				recipient.Deleted || domain.IsSystemUserID(recipient.ID) {
 				return domain.PremiumInvoice{}, userIDInvalidErr()
+			}
+			if err := r.rejectActivePremiumGiftRecipient(recipient); err != nil {
+				return domain.PremiumInvoice{}, err
 			}
 			if restricted, err := r.premiumGiftsRestricted(ctx, recipient.ID); err != nil {
 				return domain.PremiumInvoice{}, internalErr()
@@ -404,6 +413,14 @@ func (r *Router) premiumGiftsRestricted(ctx context.Context, userID int64) (bool
 	return settings.GlobalPrivacy.DisallowedGifts.PremiumGifts, nil
 }
 
+func (r *Router) rejectActivePremiumGiftRecipient(recipient domain.User) error {
+	now := r.clock.Now().Unix()
+	if !recipient.PremiumActiveAt(now) {
+		return nil
+	}
+	return tgerr.New(420, fmt.Sprintf("PREMIUM_SUB_ACTIVE_UNTIL_%d", recipient.PremiumUntil))
+}
+
 func premiumInvoiceFromPlan(
 	kind domain.PremiumPurchaseKind,
 	recipientID int64,
@@ -434,7 +451,10 @@ func (r *Router) invalidatePremiumUserCaches(ctx context.Context, userIDs ...int
 }
 
 func premiumPaymentErr(err error) error {
+	var active domain.PremiumSubscriptionActiveError
 	switch {
+	case errors.As(err, &active):
+		return tgerr.New(420, fmt.Sprintf("PREMIUM_SUB_ACTIVE_UNTIL_%d", active.Until))
 	case errors.Is(err, domain.ErrStarsInsufficient):
 		return balanceTooLowErr()
 	case errors.Is(err, domain.ErrPremiumFormExpired):

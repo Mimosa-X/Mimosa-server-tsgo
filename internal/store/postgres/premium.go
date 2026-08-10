@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"telesrv/internal/domain"
 	"telesrv/internal/store/postgres/sqlcgen"
@@ -746,6 +747,10 @@ SELECT disallow_premium_gifts FROM account_settings WHERE user_id=$1
 	if form.Kind == domain.PremiumPurchaseGift && form.RecipientUserID == form.BuyerUserID {
 		return domain.PremiumPaymentForm{}, domain.PremiumEntitlement{}, domain.User{}, domain.StarsBalance{}, domain.ErrPremiumGiftSelf
 	}
+	if form.Kind == domain.PremiumPurchaseGift && premiumUntil != nil && int(premiumUntil.Unix()) > req.Date {
+		return domain.PremiumPaymentForm{}, domain.PremiumEntitlement{}, domain.User{}, domain.StarsBalance{},
+			domain.PremiumSubscriptionActiveError{Until: int(premiumUntil.Unix())}
+	}
 
 	var balance int64
 	var granted bool
@@ -1322,7 +1327,7 @@ func (s *PremiumStore) RevokePremiumEntitlements(
 ) (domain.User, error) {
 	req.CommandKey, req.Reason = strings.TrimSpace(req.CommandKey), strings.TrimSpace(req.Reason)
 	if s == nil || s.db == nil || req.UserID <= 0 || req.ActorUserID <= 0 ||
-		req.Date <= 0 || req.CommandKey == "" || len(req.CommandKey) > 256 || len(req.Reason) > 1024 {
+		req.EntitlementID < 0 || req.Date <= 0 || req.CommandKey == "" || len(req.CommandKey) > 256 || len(req.Reason) > 1024 {
 		return domain.User{}, domain.ErrPremiumFormInvalid
 	}
 	if user, found, err := s.loadPremiumAdminRevoke(ctx, req); err != nil || found {
@@ -1340,21 +1345,30 @@ func (s *PremiumStore) RevokePremiumEntitlements(
 			isBot || deletedAt != nil || domain.IsSystemUserID(req.UserID) {
 			return domain.ErrPremiumRecipientInvalid
 		}
-		tag, err := tx.Exec(ctx, `UPDATE premium_entitlements
+		var tag pgconn.CommandTag
+		var err error
+		if req.EntitlementID > 0 {
+			tag, err = tx.Exec(ctx, `UPDATE premium_entitlements
+SET status='revoked',revoked_at=to_timestamp($3),reason=$4,updated_at=now()
+WHERE id=$1 AND user_id=$2 AND source='admin' AND status='active'`, req.EntitlementID, req.UserID, req.Date, req.Reason)
+		} else {
+			tag, err = tx.Exec(ctx, `UPDATE premium_entitlements
 SET status='revoked',revoked_at=to_timestamp($2),reason=$3,updated_at=now()
 WHERE user_id=$1 AND status='active'`, req.UserID, req.Date, req.Reason)
+		}
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE users
-SET premium_expires_at=NULL,premium_updated_at=to_timestamp($2),updated_at=now() WHERE id=$1`,
-			req.UserID, req.Date); err != nil {
+		if req.EntitlementID > 0 && tag.RowsAffected() != 1 {
+			return domain.ErrPremiumFormInvalid
+		}
+		if err := compactPremiumEntitlements(ctx, tx, req.UserID, req.Date); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO premium_audit_events
-(actor_user_id,target_user_id,action,command_key,reason,metadata)
-VALUES($1,$2,'admin_revoke',$3,$4,jsonb_build_object('revoked_count',$5::bigint))`,
-			req.ActorUserID, req.UserID, req.CommandKey, req.Reason, tag.RowsAffected()); err != nil {
+(actor_user_id,target_user_id,entitlement_id,action,command_key,reason,metadata)
+VALUES($1,$2,NULLIF($3,0),'admin_revoke',$4,$5,jsonb_build_object('revoked_count',$6::bigint,'entitlement_id',$3::bigint))`,
+			req.ActorUserID, req.UserID, req.EntitlementID, req.CommandKey, req.Reason, tag.RowsAffected()); err != nil {
 			return err
 		}
 		var found bool
@@ -1376,17 +1390,17 @@ func (s *PremiumStore) loadPremiumAdminRevoke(
 	ctx context.Context,
 	req domain.PremiumAdminRevokeRequest,
 ) (domain.User, bool, error) {
-	var targetID int64
-	err := s.db.QueryRow(ctx, `SELECT target_user_id FROM premium_audit_events
+	var targetID, entitlementID int64
+	err := s.db.QueryRow(ctx, `SELECT target_user_id,COALESCE(entitlement_id,0) FROM premium_audit_events
 WHERE actor_user_id=$1 AND action='admin_revoke' AND command_key=$2`,
-		req.ActorUserID, req.CommandKey).Scan(&targetID)
+		req.ActorUserID, req.CommandKey).Scan(&targetID, &entitlementID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.User{}, false, nil
 	}
 	if err != nil {
 		return domain.User{}, false, err
 	}
-	if targetID != req.UserID {
+	if targetID != req.UserID || entitlementID != req.EntitlementID {
 		return domain.User{}, false, domain.ErrPremiumFormInvalid
 	}
 	user, found, err := NewUserStore(s.db).ByID(ctx, targetID)

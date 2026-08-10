@@ -50,7 +50,12 @@ test("code access, support replies, refunds and pending wheel awards are durable
   db.closeSupportMessage(ticket);
   assert.equal(db.supportMessage(ticket).status, "answered");
 
-  db.addSale({ product: "stars_1", title: "20 Stars", starsPrice: 1, recipientID: 100, buyerID: 1, buyerName: "Owner", chargeID: "charge-refund" });
+  db.addSale({ product: "stars_1", title: "20 Telesrv Stars", starsPrice: 1, recipientID: 100, buyerID: 1, buyerName: "Owner", chargeID: "charge-refund", fulfillment: { kind: "stars", recipientID: 100, amount: 20 } });
+  assert.deepEqual(db.saleByCharge("charge-refund").fulfillment, { kind: "stars", recipientID: 100, amount: 20 });
+  assert.equal(db.beginRefund("charge-refund", 1).internal_reversed, 0);
+  db.markRefundInternal("charge-refund");
+  db.failRefund("charge-refund", "telegram unavailable");
+  assert.equal(db.refundByCharge("charge-refund").status, "internal_reversed");
   db.markRefunded("charge-refund", 1);
   assert.equal(db.isRefunded("charge-refund"), true);
 
@@ -58,4 +63,38 @@ test("code access, support replies, refunds and pending wheel awards are durable
   assert.equal(db.reserveSpin(1, 100, 999).prize, 50);
   db.finishSpin(1, reserved.day);
   assert.throws(() => db.reserveSpin(1, 100, 50));
+});
+
+test("refunding a paid number removes it and restores the persistent free number", (t) => {
+  const db = fixture(t);
+  db.upsertUser({ id: 5, first_name: "Buyer" }, 50, "ru");
+  const free = db.createNumber(5, 50, "free", "RU", false);
+  const paid = db.createNumber(5, 50, "short", "ANON", true);
+  assert.equal(db.revokePurchasedNumber(5, paid.id, paid.phone), true);
+  assert.equal(db.revokePurchasedNumber(5, paid.id, paid.phone), false);
+  assert.equal(db.currentNumber(5).id, free.id);
+  assert.equal(db.findNumber(paid.phone), null);
+});
+
+test("language and notification preferences persist and broadcasts honor them", (t) => {
+  const db = fixture(t);
+  db.upsertUser({ id: 1, first_name: "One" }, 101, "ru");
+  db.upsertUser({ id: 2, first_name: "Two" }, 202, "en");
+  db.setLanguage(1, "en");
+  assert.equal(db.user(1).language, "en");
+  assert.equal(db.userByChatID(101).telegram_id, 1);
+  assert.deepEqual(db.notificationRecipients().map((user) => user.telegram_id), [1, 2]);
+  assert.equal(db.toggleNotifications(2), false);
+  assert.deepEqual(db.notificationRecipients().map((user) => user.telegram_id), [1]);
+  db.db.prepare("UPDATE users SET updated_at=0 WHERE telegram_id=1").run();
+  assert.deepEqual(db.notificationRecipients(30), []);
+});
+
+test("administrator mutations reject invalid input and missing users", (t) => {
+  const db = fixture(t);
+  assert.throws(() => db.createPromo("x", 10, 1));
+  assert.throws(() => db.createPromo("valid", -1, 1));
+  assert.throws(() => db.createGiveaway("", 10, 1));
+  assert.throws(() => db.createGiveaway("valid", 10, -1));
+  assert.throws(() => db.addBonus(999, 10));
 });

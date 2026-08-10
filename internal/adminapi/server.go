@@ -157,6 +157,13 @@ type collectiblePhoneService interface {
 	CollectiblePhoneTransfers(context.Context, int64, int) ([]domain.CollectiblePhoneTransfer, error)
 }
 
+// starsDebitService keeps the compensating-refund endpoint optional for older
+// lightweight Service implementations while the production admin service
+// provides it.
+type starsDebitService interface {
+	DebitStars(context.Context, admin.DebitStarsRequest) (admin.CommandResult, error)
+}
+
 func Start(ctx context.Context, cfg Config, svc Service, log *zap.Logger) (*http.Server, error) {
 	cfg.Addr = strings.TrimSpace(cfg.Addr)
 	if cfg.Addr == "" {
@@ -212,6 +219,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /v1/premium/users/{id}/entitlements", s.authorized(PermissionPremiumManage, s.handlePremiumEntitlements))
 	mux.HandleFunc("GET /v1/premium/payments/{id}", s.authorized(PermissionPremiumManage, s.handlePremiumPayment))
 	mux.HandleFunc("POST /v1/accounts/grant-stars", s.authenticated(s.handleGrantStars))
+	mux.HandleFunc("POST /v1/accounts/debit-stars", s.authenticated(s.handleDebitStars))
 	mux.HandleFunc("POST /v1/accounts/set-verified", s.authenticated(s.handleSetVerified))
 	mux.HandleFunc("POST /v1/accounts/set-flags", s.authenticated(s.handleSetUserFlags))
 	mux.HandleFunc("POST /v1/accounts/set-support", s.authenticated(s.handleSetSupport))
@@ -454,6 +462,20 @@ func (s *Server) handleGrantStars(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result, err := s.svc.GrantStars(r.Context(), req)
+	writeCommandResult(w, result, err)
+}
+
+func (s *Server) handleDebitStars(w http.ResponseWriter, r *http.Request) {
+	var req admin.DebitStarsRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	svc, ok := s.svc.(starsDebitService)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "stars debit is not configured")
+		return
+	}
+	result, err := svc.DebitStars(r.Context(), req)
 	writeCommandResult(w, result, err)
 }
 

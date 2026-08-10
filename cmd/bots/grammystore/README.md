@@ -11,11 +11,16 @@ transactional SQLite database. It deliberately runs independently from
 - free replacement numbers and paid anonymous `+888` numbers;
 - Premium, server Stars and collectible username purchases through Telegram Stars;
 - arbitrary Stars invoices, payment deduplication and a durable sales journal;
+- compensated refunds that revoke the exact Stars, Premium entitlement,
+  collectible username or paid number before returning Telegram Stars;
 - account target IDs and three recent recipients;
 - daily bonuses, referrals and a weighted wheel;
 - promo codes and button-based giveaways;
 - support tickets;
-- language and notification settings;
+- complete Russian and English localization for menus, keyboards, invoices,
+  errors, login codes and Bot API command descriptions;
+- per-user language and notification settings; broadcasts skip disabled and
+  stale recipients;
 - owner-only statistics, broadcasts, Stars/Premium/bonus grants, invoices,
   payment refunds, login-code access, support replies, sales and Stars-rate controls;
 - optional required-channel membership gate.
@@ -43,6 +48,16 @@ account IDs.
 
 `PRODUCT_NAME` controls user-facing product text and defaults to `Telesrv`.
 Deployment-specific branding belongs in the service environment, not in source.
+`DEFAULT_LANGUAGE` is used until Telegram supplies or the user selects a
+supported language. The selection is stored in SQLite and is not overwritten by
+later updates from Telegram. Bot command descriptions are registered separately
+for `ru` and `en` client locales.
+
+Each paid fulfillment is snapshotted in the sales journal. Refunds are phased and
+idempotent: if Telegram is temporarily unavailable after the server-side product
+has been revoked, retrying the same transaction does not revoke it twice. Legacy
+Premium and anonymous-number purchases without exact fulfillment metadata fail
+safe and require manual review instead of touching unrelated account state.
 
 ## Migrating the former Python bot
 

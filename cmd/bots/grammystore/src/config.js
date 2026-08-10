@@ -42,7 +42,6 @@ export function loadConfig() {
     codeWebhookSecret: webhookSecret,
     requiredChannel: (process.env.REQUIRED_CHANNEL ?? "").trim(),
     requiredChannelURL: (process.env.REQUIRED_CHANNEL_URL ?? "").trim(),
-    supportUsername: (process.env.SUPPORT_USERNAME ?? "").replace(/^@/, "").trim(),
     defaultLanguage: (process.env.DEFAULT_LANGUAGE ?? "ru").toLowerCase() === "en" ? "en" : "ru",
     defaultNumberCountry: (process.env.DEFAULT_NUMBER_COUNTRY ?? "RU").toUpperCase() === "US" ? "US" : "RU",
     referralBonus: integer("REFERRAL_BONUS", 100, { min: 0 }),

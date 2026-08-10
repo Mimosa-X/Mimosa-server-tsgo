@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS processed_payments (
 );
 CREATE TABLE IF NOT EXISTS sales (
   id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER NOT NULL, product TEXT NOT NULL, title TEXT NOT NULL,
-  stars_price INTEGER NOT NULL, recipient_id INTEGER NOT NULL, buyer_id INTEGER NOT NULL, buyer_name TEXT NOT NULL DEFAULT '', charge_id TEXT NOT NULL UNIQUE
+  stars_price INTEGER NOT NULL, recipient_id INTEGER NOT NULL, buyer_id INTEGER NOT NULL, buyer_name TEXT NOT NULL DEFAULT '', charge_id TEXT NOT NULL UNIQUE,
+  fulfillment_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS recent_recipients (
   buyer_id INTEGER NOT NULL, recipient_id INTEGER NOT NULL, used_at INTEGER NOT NULL, PRIMARY KEY(buyer_id, recipient_id)
@@ -85,7 +86,9 @@ CREATE TABLE IF NOT EXISTS support_messages (
   status TEXT NOT NULL DEFAULT 'open', created_at INTEGER NOT NULL, answered_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS refunds (
-  charge_id TEXT PRIMARY KEY, telegram_id INTEGER NOT NULL, refunded_at INTEGER NOT NULL
+  charge_id TEXT PRIMARY KEY, telegram_id INTEGER NOT NULL, refunded_at INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'completed', internal_reversed INTEGER NOT NULL DEFAULT 1,
+  error TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS spin_awards (
   telegram_id INTEGER NOT NULL, day TEXT NOT NULL, week TEXT NOT NULL, server_user_id INTEGER NOT NULL,
@@ -98,6 +101,16 @@ CREATE TABLE IF NOT EXISTS otp_deliveries (
 );
 INSERT OR IGNORE INTO settings(key,value) VALUES('stars_rate','20');
 `);
+    this.ensureColumn("sales", "fulfillment_json", "TEXT NOT NULL DEFAULT '{}'");
+    this.ensureColumn("refunds", "status", "TEXT NOT NULL DEFAULT 'completed'");
+    this.ensureColumn("refunds", "internal_reversed", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureColumn("refunds", "error", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("refunds", "updated_at", "INTEGER NOT NULL DEFAULT 0");
+  }
+
+  ensureColumn(table, column, definition) {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all();
+    if (!columns.some((item) => item.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
   close() { this.db.close(); }
@@ -122,12 +135,22 @@ INSERT OR IGNORE INTO settings(key,value) VALUES('stars_rate','20');
   }
 
   user(id) { return this.db.prepare("SELECT * FROM users WHERE telegram_id=?").get(id) ?? null; }
+  userByChatID(chatID) { return this.db.prepare("SELECT * FROM users WHERE chat_id=? ORDER BY updated_at DESC LIMIT 1").get(chatID) ?? null; }
   users() { return this.db.prepare("SELECT * FROM users ORDER BY created_at").all(); }
+  notificationRecipients(ttlDays = 30) {
+    const threshold = now() - Math.max(1, ttlDays) * 86400;
+    return this.db.prepare("SELECT * FROM users WHERE notifications=1 AND updated_at>=? ORDER BY created_at").all(threshold);
+  }
   stats() { return { users: this.db.prepare("SELECT count(*) n FROM users").get().n, numbers: this.db.prepare("SELECT count(*) n FROM numbers").get().n, sales: this.db.prepare("SELECT count(*) n FROM sales").get().n }; }
   setLanguage(id, language) { this.db.prepare("UPDATE users SET language=?,updated_at=? WHERE telegram_id=?").run(language, now(), id); }
   toggleNotifications(id) { this.db.prepare("UPDATE users SET notifications=1-notifications,updated_at=? WHERE telegram_id=?").run(now(), id); return Boolean(this.user(id)?.notifications); }
   setServerUserID(id, serverUserID) { this.db.prepare("UPDATE users SET server_user_id=?,updated_at=? WHERE telegram_id=?").run(serverUserID, now(), id); }
-  addBonus(id, amount) { this.db.prepare("UPDATE users SET bonus=MAX(0,bonus+?),updated_at=? WHERE telegram_id=?").run(amount, now(), id); return this.user(id)?.bonus ?? 0; }
+  addBonus(id, amount) {
+    if (!Number.isSafeInteger(amount)) throw new Error("invalid bonus amount");
+    const result = this.db.prepare("UPDATE users SET bonus=MAX(0,bonus+?),updated_at=? WHERE telegram_id=?").run(amount, now(), id);
+    if (!result.changes) throw new Error("invalid Telegram ID");
+    return this.user(id).bonus;
+  }
 
   claimDaily(id, amount) {
     return this.tx(() => {
@@ -187,6 +210,21 @@ INSERT OR IGNORE INTO settings(key,value) VALUES('stars_rate','20');
   }
   grantCodeAccess(phone, telegramID) { this.db.prepare("INSERT OR IGNORE INTO code_access(phone,telegram_id) VALUES(?,?)").run(normalizePhone(phone), telegramID); }
 
+  revokePurchasedNumber(ownerID, numberID, phone) {
+    return this.tx(() => {
+      const number = this.db.prepare("SELECT * FROM numbers WHERE id=? AND owner_id=? AND phone=?").get(numberID, ownerID, normalizePhone(phone));
+      if (!number) return false;
+      if (number.format === "free") throw new Error("the persistent free number cannot be refunded");
+      this.db.prepare("DELETE FROM code_access WHERE phone=?").run(number.phone);
+      this.db.prepare("DELETE FROM numbers WHERE id=?").run(number.id);
+      if (number.is_current) {
+        const previous = this.db.prepare("SELECT id FROM numbers WHERE owner_id=? ORDER BY id DESC LIMIT 1").get(ownerID);
+        if (previous) this.db.prepare("UPDATE numbers SET is_current=1 WHERE id=?").run(previous.id);
+      }
+      return true;
+    });
+  }
+
   getSetting(key, fallback = "") { return this.db.prepare("SELECT value FROM settings WHERE key=?").get(key)?.value ?? fallback; }
   setSetting(key, value) { this.db.prepare("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(key, String(value)); }
   starsRate() { const value = Number(this.getSetting("stars_rate", "20")); return Number.isSafeInteger(value) && value > 0 ? value : 20; }
@@ -219,9 +257,20 @@ INSERT OR IGNORE INTO settings(key,value) VALUES('stars_rate','20');
   }
   finishSpin(id, day) { this.db.prepare("UPDATE spin_awards SET status='done' WHERE telegram_id=? AND day=?").run(id, day); }
 
-  createPromo(code, stars, limit) { code = code.trim().toLowerCase(); this.db.prepare("INSERT INTO promos(code,stars_amount,max_acts,created_at) VALUES(?,?,?,?)").run(code, stars, limit, now()); return code; }
+  createPromo(code, stars, limit) {
+    code = String(code ?? "").trim().toLowerCase();
+    if (!/^[a-z0-9_-]{3,32}$/.test(code) || !Number.isSafeInteger(stars) || stars <= 0 || !Number.isSafeInteger(limit) || limit < 0) throw new Error("invalid promo parameters");
+    this.db.prepare("INSERT INTO promos(code,stars_amount,max_acts,created_at) VALUES(?,?,?,?)").run(code, stars, limit, now());
+    return code;
+  }
   claimPromo(code, id) { return this.claimCampaign("promo", code.trim().toLowerCase(), id); }
-  createGiveaway(text, stars, limit) { const id = randomBytes(4).toString("hex"); this.db.prepare("INSERT INTO giveaways(id,text,stars_amount,max_acts,created_at) VALUES(?,?,?,?,?)").run(id, text, stars, limit, now()); return this.db.prepare("SELECT * FROM giveaways WHERE id=?").get(id); }
+  createGiveaway(text, stars, limit) {
+    text = String(text ?? "").trim();
+    if (!text || text.length > 1000 || !Number.isSafeInteger(stars) || stars <= 0 || !Number.isSafeInteger(limit) || limit < 0) throw new Error("invalid giveaway parameters");
+    const id = randomBytes(4).toString("hex");
+    this.db.prepare("INSERT INTO giveaways(id,text,stars_amount,max_acts,created_at) VALUES(?,?,?,?,?)").run(id, text, stars, limit, now());
+    return this.db.prepare("SELECT * FROM giveaways WHERE id=?").get(id);
+  }
   claimGiveaway(id, telegramID) { return this.claimCampaign("giveaway", id, telegramID); }
 
   releaseCampaignClaim(kind, key, telegramID) {
@@ -263,11 +312,27 @@ INSERT OR IGNORE INTO settings(key,value) VALUES('stars_rate','20');
   }
   finishPayment(chargeID) { this.db.prepare("UPDATE processed_payments SET status='done',error='',updated_at=? WHERE charge_id=?").run(now(), chargeID); }
   failPayment(chargeID, error) { this.db.prepare("UPDATE processed_payments SET status='failed',error=?,updated_at=? WHERE charge_id=?").run(String(error).slice(0, 1000), now(), chargeID); }
-  addSale(sale) { this.db.prepare(`INSERT OR IGNORE INTO sales(created_at,product,title,stars_price,recipient_id,buyer_id,buyer_name,charge_id) VALUES(?,?,?,?,?,?,?,?)`).run(now(), sale.product, sale.title, sale.starsPrice, sale.recipientID, sale.buyerID, sale.buyerName ?? "", sale.chargeID); }
-  saleByCharge(chargeID) { return this.db.prepare("SELECT * FROM sales WHERE charge_id=?").get(chargeID) ?? null; }
+  addSale(sale) { this.db.prepare(`INSERT OR IGNORE INTO sales(created_at,product,title,stars_price,recipient_id,buyer_id,buyer_name,charge_id,fulfillment_json) VALUES(?,?,?,?,?,?,?,?,?)`).run(now(), sale.product, sale.title, sale.starsPrice, sale.recipientID, sale.buyerID, sale.buyerName ?? "", sale.chargeID, JSON.stringify(sale.fulfillment ?? {})); }
+  saleByCharge(chargeID) {
+    const row = this.db.prepare(`SELECT s.*,p.invoice_payload,p.status payment_status FROM sales s LEFT JOIN processed_payments p ON p.charge_id=s.charge_id WHERE s.charge_id=?`).get(chargeID);
+    if (!row) return null;
+    try { row.fulfillment = JSON.parse(row.fulfillment_json || "{}"); } catch { row.fulfillment = {}; }
+    return row;
+  }
   recentSales(limit = 20) { return this.db.prepare("SELECT * FROM sales ORDER BY id DESC LIMIT ?").all(limit); }
-  isRefunded(chargeID) { return Boolean(this.db.prepare("SELECT 1 FROM refunds WHERE charge_id=?").get(chargeID)); }
-  markRefunded(chargeID, telegramID) { this.db.prepare("INSERT OR IGNORE INTO refunds(charge_id,telegram_id,refunded_at) VALUES(?,?,?)").run(chargeID, telegramID, now()); }
+  refundByCharge(chargeID) { return this.db.prepare("SELECT * FROM refunds WHERE charge_id=?").get(chargeID) ?? null; }
+  isRefunded(chargeID) { return this.refundByCharge(chargeID)?.status === "completed"; }
+  beginRefund(chargeID, telegramID) {
+    this.db.prepare(`INSERT INTO refunds(charge_id,telegram_id,refunded_at,status,internal_reversed,error,updated_at)
+      VALUES(?,?,0,'reversing',0,'',?) ON CONFLICT(charge_id) DO UPDATE SET telegram_id=excluded.telegram_id,
+      status=CASE WHEN refunds.status='completed' THEN refunds.status WHEN refunds.internal_reversed=1 THEN 'internal_reversed' ELSE 'reversing' END,
+      error='',updated_at=excluded.updated_at`).run(chargeID, telegramID, now());
+    return this.refundByCharge(chargeID);
+  }
+  markRefundInternal(chargeID) { this.db.prepare("UPDATE refunds SET status='internal_reversed',internal_reversed=1,error='',updated_at=? WHERE charge_id=?").run(now(), chargeID); }
+  failRefund(chargeID, error) { this.db.prepare("UPDATE refunds SET status=CASE WHEN internal_reversed=1 THEN 'internal_reversed' ELSE 'failed' END,error=?,updated_at=? WHERE charge_id=?").run(String(error).slice(0, 1000), now(), chargeID); }
+  markRefunded(chargeID, telegramID) { this.db.prepare(`INSERT INTO refunds(charge_id,telegram_id,refunded_at,status,internal_reversed,error,updated_at) VALUES(?,?,?,'completed',1,'',?)
+    ON CONFLICT(charge_id) DO UPDATE SET telegram_id=excluded.telegram_id,refunded_at=excluded.refunded_at,status='completed',internal_reversed=1,error='',updated_at=excluded.updated_at`).run(chargeID, telegramID, now(), now()); }
 
   addSupportMessage(id, chatID, text) { const result = this.db.prepare("INSERT INTO support_messages(telegram_id,chat_id,text,created_at) VALUES(?,?,?,?)").run(id, chatID, text, now()); return Number(result.lastInsertRowid); }
   supportMessage(ticketID) { return this.db.prepare("SELECT * FROM support_messages WHERE id=?").get(ticketID) ?? null; }
