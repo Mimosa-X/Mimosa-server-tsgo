@@ -333,6 +333,10 @@ func randomIDEmptyErr() error { return tgerr.New(400, "RANDOM_ID_EMPTY") }
 // 成功发送不一致。Layer 227 为该错误定义的 code 是 500。
 func randomIDDuplicateErr() error { return tgerr.New(500, "RANDOM_ID_DUPLICATE") }
 
+// secretChatRandomIDDuplicateErr 使用 Telegram messages.requestEncryption 的官方
+// BAD_REQUEST 语义；普通消息历史上使用的 500 映射保持独立，避免扩大改动范围。
+func secretChatRandomIDDuplicateErr() error { return tgerr.New(400, "RANDOM_ID_DUPLICATE") }
+
 // scheduleDateInvalidErr 表示当前阶段不支持定时消息。
 func scheduleDateInvalidErr() error { return tgerr.New(400, "SCHEDULE_DATE_INVALID") }
 

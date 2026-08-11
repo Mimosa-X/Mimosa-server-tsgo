@@ -29,6 +29,8 @@ func secretChatErr(err error) error {
 		return encryptionAlreadyAcceptedErr()
 	case errors.Is(err, domain.ErrSecretChatAlreadyDeclined):
 		return encryptionAlreadyDeclinedErr()
+	case errors.Is(err, domain.ErrSecretChatRandomIDDuplicate):
+		return secretChatRandomIDDuplicateErr()
 	case errors.Is(err, domain.ErrSecretChatNotFound):
 		return chatIDInvalidErr()
 	default:
@@ -152,6 +154,9 @@ func (r *Router) discardSecretChatsForAuthKey(ctx context.Context, businessAuthK
 func (r *Router) onMessagesRequestEncryption(ctx context.Context, req *tg.MessagesRequestEncryptionRequest) (tg.EncryptedChatClass, error) {
 	if req == nil {
 		return nil, inputRequestInvalidErr()
+	}
+	if req.RandomID == 0 || int(int32(req.RandomID)) != req.RandomID {
+		return nil, secretChatRandomIDDuplicateErr()
 	}
 	if r.deps.SecretChats == nil || r.deps.Users == nil {
 		return nil, notImplementedErr()

@@ -95,7 +95,7 @@ func TestInvokeWithoutUpdatesBaselineCommitsResultAndSecretEventsWithoutSubscrib
 	authKeyID := [8]byte{21}
 	deviceKey := businessAuthKeyInt64(authKeyID)
 	queue := memory.NewEncryptedQueueStore()
-	secret := appsecret.NewService(memory.NewSecretChatStore(), queue, &seqSecretChatIDAllocator{})
+	secret := appsecret.NewService(memory.NewSecretChatStore(), queue)
 	eventID, err := queue.AppendStateEvent(context.Background(), domain.EncryptedStateEvent{
 		TargetUserID: userID,
 		ChatID:       77,

@@ -43,24 +43,6 @@ func (s *ChannelIDCounterSource) Current(ctx context.Context, _ int64) (int, err
 	return id, nil
 }
 
-// SecretChatIDCounterSource 从 secret_chats 表恢复全局 secret chat id（迁移 0137）。
-type SecretChatIDCounterSource struct {
-	db sqlcgen.DBTX
-}
-
-// NewSecretChatIDCounterSource 创建 Redis SecretChatIDAllocator 的 PG 恢复源。
-func NewSecretChatIDCounterSource(db sqlcgen.DBTX) *SecretChatIDCounterSource {
-	return &SecretChatIDCounterSource{db: db}
-}
-
-func (s *SecretChatIDCounterSource) Current(ctx context.Context, _ int64) (int, error) {
-	var id int
-	if err := s.db.QueryRow(ctx, `SELECT COALESCE(MAX(chat_id), 0) FROM secret_chats`).Scan(&id); err != nil {
-		return 0, fmt.Errorf("max secret chat id: %w", err)
-	}
-	return id, nil
-}
-
 // ChannelMessageIDCounterSource 从 channel_messages 恢复某 channel 的当前最大 message id。
 type ChannelMessageIDCounterSource struct {
 	db sqlcgen.DBTX

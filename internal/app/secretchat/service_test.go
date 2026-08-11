@@ -10,24 +10,6 @@ import (
 	"telesrv/internal/store/memory"
 )
 
-// fakeChatIDAllocator 是单调自增的测试分配器（无 Redis）。
-type fakeChatIDAllocator struct{ n int }
-
-func (a *fakeChatIDAllocator) NextSecretChatID(context.Context) (int, error) {
-	a.n++
-	return a.n, nil
-}
-
-func (a *fakeChatIDAllocator) NextSecretChatIDAtLeast(_ context.Context, floor int) (int, error) {
-	if a.n < floor {
-		a.n = floor
-	}
-	a.n++
-	return a.n, nil
-}
-
-func (a *fakeChatIDAllocator) CurrentSecretChatID(context.Context) (int, error) { return a.n, nil }
-
 // validGA 返回一个落在合法 DH 区间的 256 字节 g_a（首字节 0x55 ≈ 2^2046，
 // 既 > 2^1984 又 < p≈0xc7..）。
 func validGA() []byte {
@@ -41,7 +23,7 @@ func validGA() []byte {
 
 func newTestService() (*Service, *memory.SecretChatStore) {
 	st := memory.NewSecretChatStore()
-	return NewService(st, memory.NewEncryptedQueueStore(), &fakeChatIDAllocator{}), st
+	return NewService(st, memory.NewEncryptedQueueStore()), st
 }
 
 const (
@@ -71,8 +53,8 @@ func TestRequestEncryption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RequestEncryption: %v", err)
 	}
-	if chat.ID <= 0 || chat.ID > 0x7fffffff {
-		t.Fatalf("chat id out of int32 range: %d", chat.ID)
+	if chat.ID != int(requestFixture().RandomID) {
+		t.Fatalf("chat id = %d, want request random_id %d", chat.ID, requestFixture().RandomID)
 	}
 	if chat.State != domain.SecretChatStateRequested {
 		t.Fatalf("state = %q, want requested", chat.State)
@@ -104,6 +86,94 @@ func TestRequestEncryptionIdempotent(t *testing.T) {
 	}
 	if first.ID != second.ID {
 		t.Fatalf("idempotent re-request must return same chat: %d vs %d", first.ID, second.ID)
+	}
+}
+
+func TestRequestEncryptionConcurrentExactRetry(t *testing.T) {
+	svc, _ := newTestService()
+	ctx := context.Background()
+	results := make([]domain.SecretChat, 2)
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], errs[i] = svc.RequestEncryption(ctx, requestFixture())
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent request %d: %v", i, err)
+		}
+	}
+	if results[0].ID != int(requestFixture().RandomID) || results[1].ID != results[0].ID ||
+		results[1].AdminAccessHash != results[0].AdminAccessHash ||
+		results[1].ParticipantAccessHash != results[0].ParticipantAccessHash {
+		t.Fatalf("concurrent exact retry diverged: first=%+v second=%+v", results[0], results[1])
+	}
+}
+
+func TestRequestEncryptionPreservesNegativeRandomID(t *testing.T) {
+	svc, _ := newTestService()
+	req := requestFixture()
+	req.RandomID = -12345
+	chat, err := svc.RequestEncryption(context.Background(), req)
+	if err != nil {
+		t.Fatalf("request negative random_id: %v", err)
+	}
+	if chat.ID != int(req.RandomID) || chat.RandomID != req.RandomID {
+		t.Fatalf("chat id/random_id = %d/%d, want %d", chat.ID, chat.RandomID, req.RandomID)
+	}
+}
+
+func TestRequestEncryptionRejectsChangedIntentAndGlobalCollision(t *testing.T) {
+	svc, _ := newTestService()
+	ctx := context.Background()
+	if _, err := svc.RequestEncryption(ctx, requestFixture()); err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+
+	changedPeer := requestFixture()
+	changedPeer.ParticipantUserID++
+	if _, err := svc.RequestEncryption(ctx, changedPeer); !errors.Is(err, domain.ErrSecretChatRandomIDDuplicate) {
+		t.Fatalf("changed peer err = %v, want ErrSecretChatRandomIDDuplicate", err)
+	}
+
+	changedGA := requestFixture()
+	changedGA.GA = validGA()
+	changedGA.GA[1] ^= 0x01
+	if _, err := svc.RequestEncryption(ctx, changedGA); !errors.Is(err, domain.ErrSecretChatRandomIDDuplicate) {
+		t.Fatalf("changed g_a err = %v, want ErrSecretChatRandomIDDuplicate", err)
+	}
+
+	otherAuthKey := requestFixture()
+	otherAuthKey.AdminUserID++
+	otherAuthKey.AdminAuthKeyID++
+	if _, err := svc.RequestEncryption(ctx, otherAuthKey); !errors.Is(err, domain.ErrSecretChatRandomIDDuplicate) {
+		t.Fatalf("global collision err = %v, want ErrSecretChatRandomIDDuplicate", err)
+	}
+}
+
+func TestRequestEncryptionRejectsZeroAndDiscardedReuse(t *testing.T) {
+	svc, _ := newTestService()
+	ctx := context.Background()
+	zero := requestFixture()
+	zero.RandomID = 0
+	if _, err := svc.RequestEncryption(ctx, zero); !errors.Is(err, domain.ErrSecretChatRandomIDDuplicate) {
+		t.Fatalf("zero random_id err = %v, want ErrSecretChatRandomIDDuplicate", err)
+	}
+
+	chat, err := svc.RequestEncryption(ctx, requestFixture())
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	if _, _, err := svc.DiscardEncryption(ctx, chat.ID, adminUser, adminAuthKey, true); err != nil {
+		t.Fatalf("discard: %v", err)
+	}
+	if _, err := svc.RequestEncryption(ctx, requestFixture()); !errors.Is(err, domain.ErrSecretChatRandomIDDuplicate) {
+		t.Fatalf("discarded reuse err = %v, want ErrSecretChatRandomIDDuplicate", err)
 	}
 }
 

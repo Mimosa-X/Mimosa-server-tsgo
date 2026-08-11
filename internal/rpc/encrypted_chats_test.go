@@ -21,24 +21,6 @@ import (
 	"telesrv/internal/store/memory"
 )
 
-// seqSecretChatIDAllocator 是单调自增的测试 chat id 分配器。
-type seqSecretChatIDAllocator struct{ n int }
-
-func (a *seqSecretChatIDAllocator) NextSecretChatID(context.Context) (int, error) {
-	a.n++
-	return a.n, nil
-}
-
-func (a *seqSecretChatIDAllocator) NextSecretChatIDAtLeast(_ context.Context, floor int) (int, error) {
-	if a.n < floor {
-		a.n = floor
-	}
-	a.n++
-	return a.n, nil
-}
-
-func (a *seqSecretChatIDAllocator) CurrentSecretChatID(context.Context) (int, error) { return a.n, nil }
-
 func dhParam(lead byte) []byte {
 	b := make([]byte, 256)
 	for i := range b {
@@ -79,7 +61,7 @@ func newEncryptedFixture(t *testing.T) *encryptedFixture {
 	queueStore := memory.NewEncryptedQueueStore()
 	router := New(Config{}, Deps{
 		Users:       appusers.NewService(userStore),
-		SecretChats: appsecret.NewService(secretStore, queueStore, &seqSecretChatIDAllocator{}),
+		SecretChats: appsecret.NewService(secretStore, queueStore),
 		Updates:     appupdates.NewService(memory.NewUpdateStateStore(), memory.NewUpdateEventStore()),
 		Files:       &fakeFiles{},
 		Sessions:    sessions,
@@ -173,6 +155,9 @@ func TestEncryptedChatRealDHHandshakeAcrossExactLayers(t *testing.T) {
 				t.Fatalf("requestEncryption: %v", err)
 			}
 			waiting := waitingClass.(*tg.EncryptedChatWaiting)
+			if waiting.ID != 909 {
+				t.Fatalf("waiting id = %d, want request random_id 909", waiting.ID)
+			}
 			chat, ok, err := f.store.GetSecretChat(f.ctx, waiting.ID)
 			if err != nil || !ok {
 				t.Fatalf("stored requested chat: ok=%v err=%v", ok, err)
@@ -253,6 +238,9 @@ func TestEncryptedChatRPCHappyPath(t *testing.T) {
 	if !ok {
 		t.Fatalf("request response = %T, want *tg.EncryptedChatWaiting", res)
 	}
+	if waiting.ID != 777 {
+		t.Fatalf("waiting id = %d, want request random_id 777", waiting.ID)
+	}
 	// 推送给接受方的 encryptedChatRequested（携 g_a）。
 	recs := f.sessions.records()
 	if len(recs) != 1 || recs[0].userID != f.participant.ID {
@@ -262,8 +250,8 @@ func TestEncryptedChatRPCHappyPath(t *testing.T) {
 	if !ok {
 		t.Fatalf("participant payload = %T, want EncryptedChatRequested", encChatPayload(t, recs[0]))
 	}
-	if requested.ID != waiting.ID {
-		t.Fatalf("chat id mismatch admin=%d participant=%d", waiting.ID, requested.ID)
+	if requested.ID != 777 {
+		t.Fatalf("participant requested id = %d, want request random_id 777", requested.ID)
 	}
 	if string(requested.GA) != string(ga) {
 		t.Fatal("requested g_a not relayed verbatim")
@@ -417,6 +405,58 @@ func TestRequestEncryptionSelf(t *testing.T) {
 		GA:       dhParam(0x55),
 	})
 	assertPhoneRPCErr(t, err, "USER_ID_INVALID")
+}
+
+func TestRequestEncryptionRandomIDContractRPC(t *testing.T) {
+	f := newEncryptedFixture(t)
+	request := func(randomID int) (tg.EncryptedChatClass, error) {
+		return f.router.onMessagesRequestEncryption(f.adminCtx(), &tg.MessagesRequestEncryptionRequest{
+			UserID:   &tg.InputUser{UserID: f.participant.ID, AccessHash: f.participant.AccessHash},
+			RandomID: randomID,
+			GA:       dhParam(0x55),
+		})
+	}
+
+	negative, err := request(-808)
+	if err != nil {
+		t.Fatalf("negative random_id: %v", err)
+	}
+	if got := negative.(*tg.EncryptedChatWaiting).ID; got != -808 {
+		t.Fatalf("negative waiting id = %d, want -808", got)
+	}
+	negativeChat, found, err := f.store.GetSecretChat(f.ctx, -808)
+	if err != nil || !found {
+		t.Fatalf("stored negative chat: found=%v err=%v", found, err)
+	}
+	accepted, err := f.router.onMessagesAcceptEncryption(f.participantCtx(), &tg.MessagesAcceptEncryptionRequest{
+		Peer:           tg.InputEncryptedChat{ChatID: -808, AccessHash: negativeChat.ParticipantAccessHash},
+		GB:             dhParam(0x66),
+		KeyFingerprint: 0x1234,
+	})
+	if err != nil {
+		t.Fatalf("accept negative chat id: %v", err)
+	}
+	if got := accepted.(*tg.EncryptedChat).ID; got != -808 {
+		t.Fatalf("accepted id = %d, want -808", got)
+	}
+
+	if _, err := request(0); err == nil {
+		t.Fatal("zero random_id succeeded, want RANDOM_ID_DUPLICATE")
+	} else {
+		assertPhoneRPCErr(t, err, "RANDOM_ID_DUPLICATE")
+	}
+
+	// 同一全局 chat_id 改变握手意图不能被幂等吞掉。
+	changed := &tg.MessagesRequestEncryptionRequest{
+		UserID:   &tg.InputUser{UserID: f.participant.ID, AccessHash: f.participant.AccessHash},
+		RandomID: -808,
+		GA:       dhParam(0x66),
+	}
+	if _, err := f.router.onMessagesRequestEncryption(f.adminCtx(), changed); err == nil {
+		t.Fatal("changed intent succeeded, want RANDOM_ID_DUPLICATE")
+	} else {
+		assertPhoneRPCErr(t, err, "RANDOM_ID_DUPLICATE")
+	}
 }
 
 func TestAcceptEncryptionWrongAccessHashRPC(t *testing.T) {
