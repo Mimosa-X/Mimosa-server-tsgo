@@ -1,38 +1,59 @@
-# Local setup and how to adapt IPs / ports for your server
+# Local setup
 
-This short guide explains how to take the repository files and configure them to run on your server with your IPs and ports.
+This guide shows the shortest safe path for running gramsrv on a development
+machine or a small test server.
 
-1) Checkout the prepared branch
+## 1. Prepare local configuration
+
+The repository intentionally tracks only `.env.example`. Your real `.env` is
+ignored by Git and must not be committed.
+
+Linux / macOS:
 
 ```bash
-git fetch origin
-git checkout -b setup/local-dev origin/setup/local-dev
+cp .env.example .env
+${EDITOR:-nano} .env
 ```
 
-2) Copy .env.local to .env (or export variables)
+Windows PowerShell:
 
-```bash
-cp .env.local .env
-# or load variables to the current shell
-export $(grep -v '^#' .env.local | xargs)
+```powershell
+Copy-Item .env.example .env
+notepad .env
 ```
 
-3) Replace placeholders
+If you prefer a different config filename, set `TELESRV_CONFIG` as a process
+environment variable before starting the server.
 
-- TELESRV_ADVERTISE_IP: set to your public IP or DNS name (the value clients will use to reach media/calls).
-- TELESRV_LISTEN: the bind address for the MTProto server. Keep 0.0.0.0 if you want to accept external connections, or 127.0.0.1 for local-only testing.
-- TELESRV_POSTGRES_DSN / TELESRV_REDIS_ADDR: set to your actual Postgres / Redis endpoints if different from local compose.
-- TELESRV_PUBLIC_BASE_URL / TELESRV_PUBLIC_WEB_BASE_URL: set to your external HTTPS base URLs used in generated links.
+## 2. Set the network values
 
-4) Start Postgres and Redis (recommended: docker compose)
+Review at least these values in `.env`:
+
+- `TELESRV_LISTEN` is the MTProto bind address. Use `0.0.0.0:2398` when
+  external clients must connect to this host, or `127.0.0.1:2398` for
+  same-machine testing only.
+- `TELESRV_ADVERTISE_IP` must be a client-reachable IPv4 or IPv6 address, not a
+  DNS name. Use `127.0.0.1` only when the patched client runs on the same
+  machine. Use a LAN or public IP for phones, other computers, or remote tests.
+- `TELESRV_PUBLIC_BASE_URL` and `TELESRV_PUBLIC_WEB_BASE_URL` are HTTP(S) URLs
+  used in generated public links. Put hostnames here, not in
+  `TELESRV_ADVERTISE_IP`.
+- `TELESRV_DEV_AUTH_CODE=12345` is convenient for local development but must not
+  be exposed as a production login code.
+
+## 3. Start Postgres and Redis
+
+The development compose file exposes Postgres on `127.0.0.1:5432` and Redis on
+`127.0.0.1:6399`, matching the defaults in `.env.example`.
 
 ```bash
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
-If you changed Postgres/Redis ports, update TELESRV_POSTGRES_DSN and TELESRV_REDIS_ADDR accordingly.
+If you use external Postgres or Redis, update `TELESRV_POSTGRES_DSN` and
+`TELESRV_REDIS_ADDR` in `.env`.
 
-5) Build and run the server
+## 4. Build and run the server
 
 Linux / macOS:
 
@@ -41,30 +62,22 @@ go build -o bin/gramsrv ./cmd/telesrv
 ./bin/gramsrv
 ```
 
-Windows (PowerShell):
+Windows PowerShell:
 
 ```powershell
 go build -o bin/gramsrv.exe ./cmd/telesrv
 .\bin\gramsrv.exe
 ```
 
-6) Public deployment notes
+## 5. First-start checklist
 
-- Keep TELESRV_PUBLIC_LINK_WEB_ADDR on loopback and use a reverse proxy (nginx) to present HTTPS and public hostname/ports to users.
-- If you expose MTProto on a custom port, update TELESRV_LISTEN and make sure firewall / NAT maps it.
-- For Telegram client compatibility (patched clients), you will also need to export data/server_rsa.pub and use it in the client patch as described in README.
+After startup, confirm:
 
-7) Short checklist after first start
+- migrations completed successfully;
+- `data/server_rsa.pem` was created if it did not already exist;
+- MTProto is listening on `TELESRV_LISTEN`;
+- Postgres and Redis connections are healthy;
+- patched clients use the matching DC address, port, and server RSA key.
 
-- `data/server_rsa.pem` was created
-- migrations applied successfully
-- MTProto is listening on the configured TELESRV_LISTEN
-- Redis/Postgres connections are healthy
-
-8) Next steps you may want me to do for you
-
-- Create a small docker-compose override with host port mappings for production
-- Add a README section in Russian with step-by-step commands tailored to your server
-- Create a GitHub Actions workflow to build the binary on commits
-
-If you want, I can now open a pull request in your repository from setup/local-dev to your main branch, or you can pull the branch locally. Tell me which you'd prefer.
+For the complete configuration reference, see
+[`docs/configuration.en.md`](configuration.en.md).
