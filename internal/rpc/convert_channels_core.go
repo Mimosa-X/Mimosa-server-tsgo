@@ -671,6 +671,23 @@ func tgChannelFull(view domain.ChannelView, publicBaseURL ...string) *tg.Channel
 	return full
 }
 
+// applyChannelStatsCapability completes the config-dependent half of the
+// channelFull statistics capability. TDLib deliberately clears
+// can_view_stats when stats_dc is absent or invalid, so these fields must be
+// projected as one invariant rather than as independent optional hints.
+// A manually constructed zero-value Router config is treated as unavailable;
+// production config validation requires a positive canonical DC.
+func (r *Router) applyChannelStatsCapability(full *tg.ChannelFull) {
+	if full == nil || !full.CanViewStats {
+		return
+	}
+	if r.cfg.DC <= 0 {
+		full.CanViewStats = false
+		return
+	}
+	full.SetStatsDC(r.cfg.DC)
+}
+
 func channelMemberIsAdmin(member domain.ChannelMember) bool {
 	return member.Role == domain.ChannelRoleCreator || member.Role == domain.ChannelRoleAdmin
 }

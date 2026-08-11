@@ -3,6 +3,7 @@ package secretchat
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"telesrv/internal/domain"
@@ -172,6 +173,63 @@ func TestAcceptEncryptionDoubleAccept(t *testing.T) {
 	_, err := svc.AcceptEncryption(ctx, chat.ID, partUser, int64(0x3333), chat.ParticipantAccessHash, validGA(), keyFP)
 	if !errors.Is(err, domain.ErrSecretChatAlreadyAccepted) {
 		t.Fatalf("err = %v, want ErrSecretChatAlreadyAccepted", err)
+	}
+}
+
+func TestAcceptEncryptionConcurrentDevicesSingleWinner(t *testing.T) {
+	svc, st := newTestService()
+	ctx := context.Background()
+	chat, err := svc.RequestEncryption(ctx, requestFixture())
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+
+	authKeys := []int64{partAuthKey, otherAuthKey}
+	errs := make([]error, len(authKeys))
+	var wg sync.WaitGroup
+	for i, authKeyID := range authKeys {
+		wg.Add(1)
+		go func(i int, authKeyID int64) {
+			defer wg.Done()
+			_, errs[i] = svc.AcceptEncryption(ctx, chat.ID, partUser, authKeyID, chat.ParticipantAccessHash, validGA(), keyFP)
+		}(i, authKeyID)
+	}
+	wg.Wait()
+
+	winners := 0
+	losers := 0
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			winners++
+		case errors.Is(err, domain.ErrSecretChatAlreadyAccepted):
+			losers++
+		default:
+			t.Fatalf("concurrent accept err = %v", err)
+		}
+	}
+	if winners != 1 || losers != 1 {
+		t.Fatalf("concurrent accepts winners=%d losers=%d, want 1/1", winners, losers)
+	}
+
+	stored, ok, err := st.GetSecretChat(ctx, chat.ID)
+	if err != nil || !ok {
+		t.Fatalf("get accepted chat: ok=%v err=%v", ok, err)
+	}
+	if stored.State != domain.SecretChatStateNormal ||
+		(stored.ParticipantAuthKeyID != partAuthKey && stored.ParticipantAuthKeyID != otherAuthKey) {
+		t.Fatalf("accepted chat = %+v, want normal bound to one participant device", stored)
+	}
+	loserAuthKeyID := partAuthKey
+	if stored.ParticipantAuthKeyID == partAuthKey {
+		loserAuthKeyID = otherAuthKey
+	}
+	if _, _, err := svc.DiscardEncryption(ctx, chat.ID, partUser, loserAuthKeyID, true); !errors.Is(err, domain.ErrSecretChatNotFound) {
+		t.Fatalf("loser discard err = %v, want ErrSecretChatNotFound", err)
+	}
+	stored, ok, err = st.GetSecretChat(ctx, chat.ID)
+	if err != nil || !ok || stored.State != domain.SecretChatStateNormal {
+		t.Fatalf("chat after loser discard = %+v ok=%v err=%v, want normal", stored, ok, err)
 	}
 }
 

@@ -21,7 +21,7 @@
 | `TELESRV_LISTEN` | string / `0.0.0.0:2398` | MTProto TCP 监听地址，必须与 patched 客户端可达地址/端口一致。 |
 | `TELESRV_ADVERTISE_IP` | string / `127.0.0.1` | 写入 `help.getConfig.DCOptions`、媒体与通话回退路径的客户端可达 IP。默认 loopback 只适合纯本机 TDesktop；Android、局域网或远端验证必须显式设为宿主机 LAN IP/公网 IP。Windows 本地重启优先用 `scripts\restart-local-server.ps1 -Listen 0.0.0.0:2398 -AdvertiseIP <client-reachable-ip>`，避免手动 `Start-Process` 漏掉环境变量。 |
 | `TELESRV_RSA_KEY` | path / `data/server_rsa.pem` | MTProto RSA 私钥；缺失时自动生成。属于敏感文件，重启和升级间必须稳定保存。 |
-| `TELESRV_DC` | int / `2` | 服务端输出配置及媒体/DC 元数据使用的规范 DC ID；当前单后端不会按它分区密钥交换状态。 |
+| `TELESRV_DC` | positive TL int32 / `2` | 服务端输出配置、媒体/DC 元数据和 `channelFull.stats_dc` 使用的规范 DC ID；必须在 `1..2147483647`，否则启动失败。当前单后端不会按它分区密钥交换状态。 |
 | `TELESRV_DEFAULT_COUNTRY_CODE` | ISO alpha-2 / `CN` | `help.getNearestDc` 返回的登录页默认国家。客户端把 `CN` 映射为国际区号 `+86`、`US` 映射为 `+1`。输入会 trim、转大写并校验为国家或自治地区；格式错误或未知值会让启动失败。 |
 | `TELESRV_STRICT_DC_CHECK` | bool / `false` | 默认 `false`，永久与临时密钥交换接受任意 wire int32 DC 标签。设为 `true` 时永久标签必须等于 `TELESRV_DC`、临时标签绝对值必须等于 `TELESRV_DC`；它仅是诊断开关，不提供多 DC 隔离。 |
 | `TELESRV_WEBSOCKET_ENABLE` | bool / `true` | 在 MTProto 监听端口启用 MTProto-over-WebSocket 分流。 |

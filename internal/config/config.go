@@ -1004,6 +1004,9 @@ func Load() (Config, error) {
 	if err := validateBlobStorageConfig(cfg); err != nil {
 		return Config{}, err
 	}
+	if cfg.DC <= 0 || int64(cfg.DC) > int64(1<<31-1) {
+		return Config{}, fmt.Errorf("TELESRV_DC must be a positive TL int32")
+	}
 	if cfg.UpdateRequestTimeout <= 0 || cfg.UpdateRequestTimeout > 30*time.Second {
 		return Config{}, fmt.Errorf("TELESRV_UPDATE_REQUEST_TIMEOUT must be greater than zero and at most 30s")
 	}
