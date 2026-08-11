@@ -56,8 +56,8 @@ func TestChannelsCreateChannelResponseCarriesTdlibMessageMappingOnlyForCaller(t 
 				t.Fatalf("mapping = %#v, want positive message id and non-zero random id", updates.Updates[0])
 			}
 			create, ok := updates.Updates[1].(*tg.UpdateNewChannelMessage)
-			if !ok || create.Pts != 1 || create.PtsCount != 1 {
-				t.Fatalf("create update = %#v, want pts=1 pts_count=1", updates.Updates[1])
+			if !ok || create.Pts != domain.FirstChannelEventPts || create.PtsCount != 1 {
+				t.Fatalf("create update = %#v, want pts=2 pts_count=1", updates.Updates[1])
 			}
 			service, ok := create.Message.(*tg.MessageService)
 			if !ok || service.ID != mapping.ID {

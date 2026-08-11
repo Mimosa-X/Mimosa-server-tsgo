@@ -115,7 +115,9 @@ func (s *ChannelStore) CreateChannel(ctx context.Context, req domain.CreateChann
 	if err != nil {
 		return domain.CreateChannelResult{}, fmt.Errorf("allocate channel message id: %w", err)
 	}
-	pts := 1
+	// PTS 1 is the empty channel message-box baseline. The create service
+	// message is the first real event, so its post-event state is 2.
+	pts := domain.FirstChannelEventPts
 	channel := domain.Channel{
 		ID:                channelID,
 		AccessHash:        accessHash,
@@ -166,6 +168,13 @@ func (s *ChannelStore) CreateChannel(ctx context.Context, req domain.CreateChann
 	}
 	if err := insertChannelEventTx(ctx, tx, event); err != nil {
 		return domain.CreateChannelResult{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+UPDATE channel_update_checkpoints
+SET retained_through_pts = $2,
+    updated_at = now()
+WHERE channel_id = $1`, channelID, domain.InitialChannelPts); err != nil {
+		return domain.CreateChannelResult{}, fmt.Errorf("initialize channel pts baseline: %w", err)
 	}
 	for _, member := range members {
 		readMax := 0

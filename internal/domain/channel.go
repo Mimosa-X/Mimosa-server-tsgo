@@ -7,6 +7,11 @@ import (
 )
 
 const (
+	// InitialChannelPts is the empty message-box state used by official clients
+	// before the first real channel event. The first event therefore has PTS 2.
+	InitialChannelPts = 1
+	// FirstChannelEventPts is the PTS after the first single-count channel event.
+	FirstChannelEventPts = InitialChannelPts + 1
 	// MaxChannelDifferenceLimit limits a single updates.getChannelDifference page.
 	MaxChannelDifferenceLimit = 100
 	// MaxChannelDifferenceTooLongMessages limits the latest message snapshot returned by channelDifferenceTooLong.
