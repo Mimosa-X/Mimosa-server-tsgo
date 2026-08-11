@@ -112,18 +112,21 @@ func (r *Router) tgResolvedChannelPeerWithStories(ctx context.Context, viewerUse
 }
 
 func (r *Router) tgGlobalChannelMessages(ctx context.Context, viewerUserID int64, history domain.ChannelHistory) tg.MessagesMessagesClass {
+	r.maybeEnqueueExpiredChannelWebPageResolves(viewerUserID, history.Messages)
 	out := tgGlobalChannelMessages(viewerUserID, history)
 	r.applyPeerReadModelsToMessages(ctx, viewerUserID, out)
 	return out
 }
 
 func (r *Router) tgMessagesMessages(ctx context.Context, viewerUserID int64, list domain.MessageList) tg.MessagesMessagesClass {
+	r.maybeEnqueueExpiredPrivateWebPageResolves(list.Messages)
 	out := tgMessagesMessages(viewerUserID, list)
 	r.applyPeerReadModelsToMessages(ctx, viewerUserID, out)
 	return out
 }
 
 func (r *Router) tgChannelHistoryMessages(ctx context.Context, viewerUserID int64, history domain.ChannelHistory) tg.MessagesMessagesClass {
+	r.maybeEnqueueExpiredChannelWebPageResolves(viewerUserID, history.Messages)
 	out := tgChannelHistoryMessages(viewerUserID, history)
 	if linked, ok := r.linkedDiscussionChat(ctx, viewerUserID, history.Channel.ID); ok {
 		switch value := out.(type) {
@@ -173,6 +176,8 @@ func (r *Router) applyStoryMaxIDsToMessageReactionsList(ctx context.Context, vie
 }
 
 func (r *Router) tgGlobalSearchMessages(ctx context.Context, viewerUserID int64, limit int, private domain.MessageList, channel domain.ChannelHistory) tg.MessagesMessagesClass {
+	r.maybeEnqueueExpiredPrivateWebPageResolves(private.Messages)
+	r.maybeEnqueueExpiredChannelWebPageResolves(viewerUserID, channel.Messages)
 	out := tgGlobalSearchMessages(viewerUserID, limit, private, channel)
 	r.applyPeerReadModelsToMessages(ctx, viewerUserID, out)
 	return out

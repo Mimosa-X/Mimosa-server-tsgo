@@ -460,14 +460,8 @@ func (r *Router) onMessagesGetMessages(ctx context.Context, ids []tg.InputMessag
 	}
 
 	out := make([]tg.MessageClass, 0, len(ids))
-	requestedIDs := make([]int, 0, len(ids))
-	for _, input := range ids {
-		id, ok := inputMessageBoxID(input)
-		if !ok || id <= 0 || id > domain.MaxMessageBoxID {
-			continue
-		}
-		requestedIDs = append(requestedIDs, id)
-	}
+	trace := newGetMessagesInputTrace(ids)
+	requestedIDs := trace.lookupIDs
 	list, err := r.deps.Messages.GetMessages(ctx, userID, requestedIDs)
 	if err != nil {
 		return nil, internalErr()
@@ -491,6 +485,7 @@ func (r *Router) onMessagesGetMessages(ctx context.Context, ids []tg.InputMessag
 		found = append(found, msg)
 		out = append(out, tgMessage(msg))
 	}
+	r.maybeEnqueueExpiredPrivateWebPageResolves(found)
 	chats := r.chatsForMessageUpdates(ctx, userID, found)
 	result := &tg.MessagesMessages{
 		Messages: out,
@@ -498,6 +493,7 @@ func (r *Router) onMessagesGetMessages(ctx context.Context, ids []tg.InputMessag
 		Chats:    chats,
 	}
 	r.applyPeerReadModelsToMessages(ctx, userID, result)
+	r.logPrivateGetMessagesTrace(ctx, trace, found, result)
 	return result, nil
 }
 
@@ -627,8 +623,7 @@ func (r *Router) onMessagesSearchGlobal(ctx context.Context, req *tg.MessagesSea
 		}
 	}
 	if req.UsersOnly || r.deps.Channels == nil {
-		result := appendCommunitySearchChat(tgMessagesMessages(userID, r.enrichMessageList(ctx, userID, limitMessageList(private, limit))), communityView)
-		r.applyPeerReadModelsToMessages(ctx, userID, result)
+		result := appendCommunitySearchChat(r.tgMessagesMessages(ctx, userID, r.enrichMessageList(ctx, userID, limitMessageList(private, limit))), communityView)
 		return result, nil
 	}
 	channelHistory, err := r.deps.Channels.SearchJoinedMessages(ctx, userID, domain.ChannelGlobalSearchRequest{

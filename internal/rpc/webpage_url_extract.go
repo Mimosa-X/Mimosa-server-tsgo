@@ -266,10 +266,15 @@ func (r *Router) webPagePendingOrCachedMedia(ctx context.Context, rawURL string,
 	if !ok {
 		return nil
 	}
-	if page, found := r.deps.Files.LookupWebPage(ctx, normalized); found && page.State == domain.MessageWebPageStateDone {
-		page.ForceLargeMedia = forceLarge
-		page.ForceSmallMedia = forceSmall
-		return &domain.MessageMedia{Kind: domain.MessageMediaKindWebPage, InvertMedia: invertMedia, WebPage: &page}
+	if page, found := r.deps.Files.LookupWebPage(ctx, normalized); found {
+		if page.State == domain.MessageWebPageStateEmpty {
+			return nil
+		}
+		if page.State == domain.MessageWebPageStateDone {
+			page.ForceLargeMedia = forceLarge
+			page.ForceSmallMedia = forceSmall
+			return &domain.MessageMedia{Kind: domain.MessageMediaKindWebPage, InvertMedia: invertMedia, WebPage: &page}
+		}
 	}
 	return &domain.MessageMedia{
 		Kind:        domain.MessageMediaKindWebPage,
