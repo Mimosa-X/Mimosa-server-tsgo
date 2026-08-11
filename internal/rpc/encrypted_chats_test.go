@@ -2,12 +2,18 @@ package rpc
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/binary"
+	"math/big"
 	"testing"
 
+	"github.com/iamxvbaba/td/bin"
 	"github.com/iamxvbaba/td/clock"
 	"github.com/iamxvbaba/td/tg"
+	"github.com/iamxvbaba/td/tlprofile"
 	"go.uber.org/zap/zaptest"
 
+	appphone "telesrv/internal/app/phone"
 	appsecret "telesrv/internal/app/secretchat"
 	appupdates "telesrv/internal/app/updates"
 	appusers "telesrv/internal/app/users"
@@ -115,6 +121,118 @@ func encChatPayload(t *testing.T, rec phonePushRecord) tg.EncryptedChatClass {
 		t.Fatalf("pushed update = %T, want UpdateEncryption", updates.Updates[0])
 	}
 	return upd.Chat
+}
+
+func secretChatDHFixture(t *testing.T, wantNegativeFingerprint bool) (ga, gb []byte, fingerprint int64) {
+	t.Helper()
+	prime := new(big.Int).SetBytes(appphone.DHPrime())
+	generator := big.NewInt(int64(appphone.DHG))
+	privateA := new(big.Int).SetBytes(make([]byte, 256))
+	privateA.SetBit(privateA, 2046, 1)
+	privateA.Add(privateA, big.NewInt(0x12345))
+	gaInt := new(big.Int).Exp(generator, privateA, prime)
+	ga = gaInt.Bytes()
+
+	for n := int64(1); n < 128; n++ {
+		privateB := new(big.Int).SetBit(new(big.Int), 2045, 1)
+		privateB.Add(privateB, big.NewInt(0x54321+n))
+		gbInt := new(big.Int).Exp(generator, privateB, prime)
+		sharedA := new(big.Int).Exp(gbInt, privateA, prime)
+		sharedB := new(big.Int).Exp(gaInt, privateB, prime)
+		if sharedA.Cmp(sharedB) != 0 {
+			t.Fatal("DH fixture derived different shared keys")
+		}
+		key := make([]byte, 256)
+		sharedBytes := sharedA.Bytes()
+		copy(key[len(key)-len(sharedBytes):], sharedBytes)
+		digest := sha1.Sum(key)
+		fingerprint = int64(binary.LittleEndian.Uint64(digest[12:20]))
+		if (fingerprint < 0) == wantNegativeFingerprint {
+			return ga, gbInt.Bytes(), fingerprint
+		}
+	}
+	t.Fatalf("could not generate DH fixture with negative=%v fingerprint", wantNegativeFingerprint)
+	return nil, nil, 0
+}
+
+func TestEncryptedChatRealDHHandshakeAcrossExactLayers(t *testing.T) {
+	for _, negative := range []bool{false, true} {
+		name := "positive_fingerprint"
+		if negative {
+			name = "negative_fingerprint"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newEncryptedFixture(t)
+			ga, gb, fingerprint := secretChatDHFixture(t, negative)
+			waitingClass, err := f.router.onMessagesRequestEncryption(f.adminCtx(), &tg.MessagesRequestEncryptionRequest{
+				UserID:   &tg.InputUser{UserID: f.participant.ID, AccessHash: f.participant.AccessHash},
+				RandomID: 909,
+				GA:       ga,
+			})
+			if err != nil {
+				t.Fatalf("requestEncryption: %v", err)
+			}
+			waiting := waitingClass.(*tg.EncryptedChatWaiting)
+			chat, ok, err := f.store.GetSecretChat(f.ctx, waiting.ID)
+			if err != nil || !ok {
+				t.Fatalf("stored requested chat: ok=%v err=%v", ok, err)
+			}
+
+			f.sessions.reset()
+			if _, err := f.router.onMessagesAcceptEncryption(f.participantCtx(), &tg.MessagesAcceptEncryptionRequest{
+				Peer:           tg.InputEncryptedChat{ChatID: chat.ID, AccessHash: chat.ParticipantAccessHash},
+				GB:             gb,
+				KeyFingerprint: fingerprint,
+			}); err != nil {
+				t.Fatalf("acceptEncryption: %v", err)
+			}
+
+			var adminUpdates *tg.Updates
+			for _, rec := range f.sessions.records() {
+				if rec.userID == f.admin.ID {
+					adminUpdates = rec.msg.(*tg.Updates)
+					break
+				}
+			}
+			if adminUpdates == nil {
+				t.Fatal("missing accepted update for the initiating device")
+			}
+
+			for _, profile := range []tlprofile.Profile{
+				tlprofile.Profile225,
+				tlprofile.Profile226,
+				tlprofile.Profile227,
+				tlprofile.Profile228,
+			} {
+				var body bin.Buffer
+				if err := tlprofile.EncodeObject(profile, adminUpdates, &body); err != nil {
+					t.Fatalf("encode accepted update for profile %d: %v", profile, err)
+				}
+				decoded, err := tlprofile.DecodeObject(profile, &bin.Buffer{Buf: body.Buf}, tlprofile.Limits{})
+				if err != nil {
+					t.Fatalf("decode accepted update for profile %d: %v", profile, err)
+				}
+				updates, ok := decoded.(*tg.Updates)
+				if !ok || len(updates.Updates) != 1 {
+					t.Fatalf("profile %d decoded update = %T", profile, decoded)
+				}
+				encUpdate, ok := updates.Updates[0].(*tg.UpdateEncryption)
+				if !ok {
+					t.Fatalf("profile %d nested update = %T", profile, updates.Updates[0])
+				}
+				accepted, ok := encUpdate.Chat.(*tg.EncryptedChat)
+				if !ok {
+					t.Fatalf("profile %d chat = %T", profile, encUpdate.Chat)
+				}
+				if new(big.Int).SetBytes(accepted.GAOrB).Cmp(new(big.Int).SetBytes(gb)) != 0 {
+					t.Fatalf("profile %d changed g_b", profile)
+				}
+				if accepted.KeyFingerprint != fingerprint {
+					t.Fatalf("profile %d fingerprint = %d, want %d", profile, accepted.KeyFingerprint, fingerprint)
+				}
+			}
+		})
+	}
 }
 
 func TestEncryptedChatRPCHappyPath(t *testing.T) {

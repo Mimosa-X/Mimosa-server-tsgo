@@ -11,9 +11,14 @@ import (
 	"fmt"
 )
 
-// DHConfigVersion 是 messages.getDhConfig 的静态版本号。p/g 是编译期常量，
+// DHConfigVersion 是 messages.getDhConfig 的服务端配置版本。p/g 是编译期常量，
 // 客户端缓存命中（请求 version 相同）时只回 dhConfigNotModified{random}。
-const DHConfigVersion = 1
+//
+// 版本 1 是 server-ready 之前沿用的占位值，不能继续复用：TDLib/DrKLO 会把 version
+// 与 p/g 一起持久化；私有 DC 客户端若带着同为 1、但来自另一配置 profile 的缓存，
+// 服务端错误返回 NotModified 会让密聊两端用不同 p/g，表现为接受方 Ready、发起方因
+// key fingerprint mismatch 立即 Closed。该版本必须在 p/g 变化时再次递增。
+const DHConfigVersion = 20260811
 
 // DHG 是 DH generator。与官方一致取 3：TDesktop MTP::IsPrimeAndGood 对
 // 「官方 2048-bit prime + g∈{3,4,5,7}」有白名单快速通过路径，DrKLO native 同。

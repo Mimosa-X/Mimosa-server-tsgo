@@ -579,6 +579,18 @@ func TestPhoneUserFullCallFlags(t *testing.T) {
 func TestMessagesGetDhConfig(t *testing.T) {
 	f := newPhoneFixture(t, stubPrivacy{})
 
+	// Version 1 was the pre-server-ready placeholder.  A private-DC client may
+	// still have that version cached with parameters from a different profile;
+	// treating it as current lets the two secret-chat endpoints derive different
+	// auth keys while acceptEncryption itself appears to succeed.
+	legacy, err := f.router.onMessagesGetDhConfig(f.callerCtx(), &tg.MessagesGetDhConfigRequest{Version: 1, RandomLength: 256})
+	if err != nil {
+		t.Fatalf("getDhConfig legacy version: %v", err)
+	}
+	if _, ok := legacy.(*tg.MessagesDhConfig); !ok {
+		t.Fatalf("legacy version result = %T, want full MessagesDhConfig", legacy)
+	}
+
 	res, err := f.router.onMessagesGetDhConfig(f.callerCtx(), &tg.MessagesGetDhConfigRequest{Version: 0, RandomLength: 256})
 	if err != nil {
 		t.Fatalf("getDhConfig: %v", err)
