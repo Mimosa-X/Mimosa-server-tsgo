@@ -165,6 +165,9 @@ func (r *Router) onUsersGetFullUser(ctx context.Context, id tg.InputUserClass) (
 		if !applyContactNoteToUserFull(u, &full) {
 			return nil, internalErr()
 		}
+		if err := r.applyContactPeerStateToUserFull(ctx, currentUserID, u.ID, &full); err != nil {
+			return nil, err
+		}
 		if err := r.applyTranslationDisabledToUserFull(ctx, currentUserID, u.ID, &full); err != nil {
 			return nil, err
 		}
@@ -187,6 +190,9 @@ func (r *Router) onUsersGetFullUser(ctx context.Context, id tg.InputUserClass) (
 	if !applyContactNoteToUserFull(u, &full) {
 		return nil, internalErr()
 	}
+	if err := r.applyContactPeerStateToUserFull(ctx, currentUserID, u.ID, &full); err != nil {
+		return nil, err
+	}
 	if err := r.applyTranslationDisabledToUserFull(ctx, currentUserID, u.ID, &full); err != nil {
 		return nil, err
 	}
@@ -203,6 +209,49 @@ func (r *Router) onUsersGetFullUser(ctx context.Context, id tg.InputUserClass) (
 		Users:    []tg.UserClass{user},
 		Chats:    chats,
 	}, nil
+}
+
+// applyContactPeerStateToUserFull keeps users.getFullUser on the same
+// owner-scoped contact read model as contacts.getBlocked and
+// messages.getPeerSettings. Official clients treat UserFull.blocked as an
+// authoritative replacement for their local block state, so omitting these
+// fields can undo a block learned from contacts.getBlocked or updatePeerBlocked.
+//
+// The contact service guarantees BlockContact == !blocked for a non-self user.
+// Reusing the peer-settings projection avoids a second block-store lookup while
+// retaining the shared viewer/peer cache and its mutation invalidation rules.
+func (r *Router) applyContactPeerStateToUserFull(ctx context.Context, viewerUserID, targetUserID int64, full *tg.UserFull) error {
+	if full == nil {
+		return internalErr()
+	}
+	full.SetBlocked(false)
+	full.SetBlockedMyStoriesFrom(false)
+	full.Settings = tg.PeerSettings{}
+	if viewerUserID == 0 || targetUserID == 0 || viewerUserID == targetUserID {
+		return nil
+	}
+
+	peer := domain.Peer{Type: domain.PeerTypeUser, ID: targetUserID}
+	loadEpoch := r.peerSettingsProjectionCache.LoadEpoch()
+	settings, ok := r.peerSettingsProjectionCache.Lookup(viewerUserID, peer)
+	if !ok {
+		var err error
+		settings, err = r.buildPeerSettingsProjection(ctx, viewerUserID, peer)
+		if err != nil {
+			return err
+		}
+		r.peerSettingsProjectionCache.StoreIfEpoch(viewerUserID, peer, settings, loadEpoch)
+	}
+	full.Settings = tgPeerSettings(settings)
+	if r.deps.Contacts != nil {
+		blocked := !settings.BlockContact
+		full.SetBlocked(blocked)
+		// telesrv currently models the main and stories block switches as one
+		// durable relation. Keep both wire flags consistent until independent
+		// stories-only blocking is introduced.
+		full.SetBlockedMyStoriesFrom(blocked)
+	}
+	return nil
 }
 
 // applyContactNoteToUserFull overlays the viewer-scoped contact note after the
