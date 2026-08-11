@@ -553,7 +553,13 @@ func tgChannelFull(view domain.ChannelView, publicBaseURL ...string) *tg.Channel
 		CanViewParticipants: channelMemberIsAdmin(view.Self) || !ch.MembersListAdminOnly(),
 		CanSetUsername:      view.Self.Role == domain.ChannelRoleCreator,
 		CanDeleteChannel:    view.Self.Role == domain.ChannelRoleCreator,
-		ID:                  ch.ID,
+		// TDesktop only exposes the Statistics entry after channelFull.can_view_stats.
+		// The stats RPCs enforce the same creator/admin boundary, so project the
+		// capability from the membership instead of leaving a reachable service
+		// hidden behind a permanently false wire flag. Monoforum is an internal
+		// direct-message container and has no independent statistics surface.
+		CanViewStats: !ch.Monoforum && channelMemberIsAdmin(view.Self),
+		ID:           ch.ID,
 		// Official clients render localized warnings from scam/fake flags.
 		// About remains the owner's unmodified description.
 		About:           ch.About,

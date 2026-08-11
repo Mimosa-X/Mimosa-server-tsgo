@@ -525,7 +525,7 @@ func TestChannelsCreateChannelUnsupportedOptionsReturnExplicitErrors(t *testing.
 	}
 }
 
-func TestChannelsGetFullChannelCanSetUsernameOnlyForCreator(t *testing.T) {
+func TestChannelsGetFullChannelProjectsManagementAndStatsCapabilities(t *testing.T) {
 	ctx := context.Background()
 	userStore := memory.NewUserStore()
 	owner, _ := userStore.Create(ctx, domain.User{AccessHash: 56, Phone: "15550002211", FirstName: "Owner"})
@@ -572,8 +572,8 @@ func TestChannelsGetFullChannelCanSetUsernameOnlyForCreator(t *testing.T) {
 				t.Fatalf("owner get full channel: %v", err)
 			}
 			ownerChannelFull := ownerFull.FullChat.(*tg.ChannelFull)
-			if !ownerChannelFull.CanSetUsername || !ownerChannelFull.CanDeleteChannel {
-				t.Fatalf("owner full flags can_set_username=%v can_delete_channel=%v, want both true", ownerChannelFull.CanSetUsername, ownerChannelFull.CanDeleteChannel)
+			if !ownerChannelFull.CanSetUsername || !ownerChannelFull.CanDeleteChannel || !ownerChannelFull.CanViewStats {
+				t.Fatalf("owner full flags can_set_username=%v can_delete_channel=%v can_view_stats=%v, want all true", ownerChannelFull.CanSetUsername, ownerChannelFull.CanDeleteChannel, ownerChannelFull.CanViewStats)
 			}
 
 			if _, err := r.onChannelsInviteToChannel(WithUserID(ctx, owner.ID), &tg.ChannelsInviteToChannelRequest{
@@ -587,8 +587,8 @@ func TestChannelsGetFullChannelCanSetUsernameOnlyForCreator(t *testing.T) {
 				t.Fatalf("member get full channel: %v", err)
 			}
 			memberChannelFull := memberFull.FullChat.(*tg.ChannelFull)
-			if memberChannelFull.CanSetUsername || memberChannelFull.CanDeleteChannel {
-				t.Fatalf("member full flags can_set_username=%v can_delete_channel=%v, want both false", memberChannelFull.CanSetUsername, memberChannelFull.CanDeleteChannel)
+			if memberChannelFull.CanSetUsername || memberChannelFull.CanDeleteChannel || memberChannelFull.CanViewStats {
+				t.Fatalf("member full flags can_set_username=%v can_delete_channel=%v can_view_stats=%v, want all false", memberChannelFull.CanSetUsername, memberChannelFull.CanDeleteChannel, memberChannelFull.CanViewStats)
 			}
 		})
 	}

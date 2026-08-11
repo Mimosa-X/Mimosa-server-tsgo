@@ -308,6 +308,7 @@ func requestMsgExpiredErr() error { return tgerr.New(400, "REQUEST_MSG_EXPIRED")
 func inputRequestInvalidErr() error { return tgerr.New(400, "INPUT_REQUEST_INVALID") }
 
 func inputRequestTooLongErr() error { return tgerr.New(400, "INPUT_REQUEST_TOO_LONG") }
+func dataTooLongErr() error         { return tgerr.New(400, "DATA_TOO_LONG") }
 
 func inputTextEmptyErr() error            { return tgerr.New(400, "INPUT_TEXT_EMPTY") }
 func inputTextTooLongErr() error          { return tgerr.New(400, "INPUT_TEXT_TOO_LONG") }

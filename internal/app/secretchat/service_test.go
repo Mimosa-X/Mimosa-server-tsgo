@@ -48,6 +48,7 @@ const (
 	partUser     = int64(2002)
 	adminAuthKey = int64(0x1111)
 	partAuthKey  = int64(0x2222)
+	otherAuthKey = int64(0x3333)
 	keyFP        = int64(0x0123456789abcdef)
 )
 
@@ -188,7 +189,7 @@ func TestDiscardEncryption(t *testing.T) {
 	svc, _ := newTestService()
 	ctx := context.Background()
 	chat, _ := svc.RequestEncryption(ctx, requestFixture())
-	got, already, err := svc.DiscardEncryption(ctx, chat.ID, adminUser, true)
+	got, already, err := svc.DiscardEncryption(ctx, chat.ID, adminUser, adminAuthKey, true)
 	if err != nil {
 		t.Fatalf("discard: %v", err)
 	}
@@ -199,7 +200,7 @@ func TestDiscardEncryption(t *testing.T) {
 		t.Fatalf("discarded chat = %+v", got)
 	}
 	// 幂等：再 discard 返回 already=true。
-	_, already, err = svc.DiscardEncryption(ctx, chat.ID, partUser, false)
+	_, already, err = svc.DiscardEncryption(ctx, chat.ID, partUser, partAuthKey, false)
 	if err != nil || !already {
 		t.Fatalf("idempotent discard: already=%v err=%v", already, err)
 	}
@@ -209,7 +210,7 @@ func TestDiscardEncryptionNonParticipant(t *testing.T) {
 	svc, _ := newTestService()
 	ctx := context.Background()
 	chat, _ := svc.RequestEncryption(ctx, requestFixture())
-	_, _, err := svc.DiscardEncryption(ctx, chat.ID, int64(9999), false)
+	_, _, err := svc.DiscardEncryption(ctx, chat.ID, int64(9999), int64(9999), false)
 	if !errors.Is(err, domain.ErrSecretChatNotFound) {
 		t.Fatalf("err = %v, want ErrSecretChatNotFound", err)
 	}
@@ -245,20 +246,20 @@ func TestSendEncryptedQtsAllocation(t *testing.T) {
 	chat := acceptedChat(t, svc)
 
 	// admin 发 → 投给 participant 设备（partAuthKey），qts 从 1 起。
-	_, m1, err := svc.SendEncrypted(ctx, chat.ID, adminUser, chat.AdminAccessHash, domain.SecretMessageDelivery{RandomID: 111, Bytes: []byte{1, 2, 3}, Date: 2000})
+	_, m1, err := svc.SendEncrypted(ctx, chat.ID, adminUser, adminAuthKey, chat.AdminAccessHash, domain.SecretMessageDelivery{RandomID: 111, Bytes: []byte{1, 2, 3}, Date: 2000})
 	if err != nil {
 		t.Fatalf("send 1: %v", err)
 	}
 	if m1.Qts != 1 || m1.ReceiverAuthKeyID != partAuthKey || m1.ReceiverUserID != partUser {
 		t.Fatalf("msg1 = %+v (want qts=1, receiver=participant device)", m1)
 	}
-	_, m2, err := svc.SendEncrypted(ctx, chat.ID, adminUser, chat.AdminAccessHash, domain.SecretMessageDelivery{RandomID: 222, Bytes: []byte{4}, Date: 2001})
+	_, m2, err := svc.SendEncrypted(ctx, chat.ID, adminUser, adminAuthKey, chat.AdminAccessHash, domain.SecretMessageDelivery{RandomID: 222, Bytes: []byte{4}, Date: 2001})
 	if err != nil || m2.Qts != 2 {
 		t.Fatalf("msg2 qts = %d err=%v, want 2", m2.Qts, err)
 	}
 
 	// 幂等重发同 random_id → 返回首次 qts/date，不分配新 qts。
-	_, dup, err := svc.SendEncrypted(ctx, chat.ID, adminUser, chat.AdminAccessHash, domain.SecretMessageDelivery{RandomID: 111, Bytes: []byte{1, 2, 3}, Date: 9999})
+	_, dup, err := svc.SendEncrypted(ctx, chat.ID, adminUser, adminAuthKey, chat.AdminAccessHash, domain.SecretMessageDelivery{RandomID: 111, Bytes: []byte{1, 2, 3}, Date: 9999})
 	if err != nil {
 		t.Fatalf("dup send: %v", err)
 	}
@@ -267,7 +268,7 @@ func TestSendEncryptedQtsAllocation(t *testing.T) {
 	}
 
 	// participant 发 → 投给 admin 设备（adminAuthKey），独立 qts 序列从 1 起。
-	_, pm, err := svc.SendEncrypted(ctx, chat.ID, partUser, chat.ParticipantAccessHash, domain.SecretMessageDelivery{RandomID: 333, Bytes: []byte{9}, Date: 2002})
+	_, pm, err := svc.SendEncrypted(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash, domain.SecretMessageDelivery{RandomID: 333, Bytes: []byte{9}, Date: 2002})
 	if err != nil {
 		t.Fatalf("participant send: %v", err)
 	}
@@ -280,9 +281,47 @@ func TestSendEncryptedWrongAccessHash(t *testing.T) {
 	svc, _ := newTestService()
 	ctx := context.Background()
 	chat := acceptedChat(t, svc)
-	_, _, err := svc.SendEncrypted(ctx, chat.ID, adminUser, chat.AdminAccessHash+1, domain.SecretMessageDelivery{RandomID: 1, Bytes: []byte{1}, Date: 2000})
+	_, _, err := svc.SendEncrypted(ctx, chat.ID, adminUser, adminAuthKey, chat.AdminAccessHash+1, domain.SecretMessageDelivery{RandomID: 1, Bytes: []byte{1}, Date: 2000})
 	if !errors.Is(err, domain.ErrSecretChatNotFound) {
 		t.Fatalf("err = %v, want ErrSecretChatNotFound", err)
+	}
+}
+
+func TestSendEncryptedRejectsUnboundAccountDevice(t *testing.T) {
+	svc, _ := newTestService()
+	ctx := context.Background()
+	chat := acceptedChat(t, svc)
+
+	for _, tc := range []struct {
+		name       string
+		userID     int64
+		accessHash int64
+	}{
+		{name: "admin", userID: adminUser, accessHash: chat.AdminAccessHash},
+		{name: "participant", userID: partUser, accessHash: chat.ParticipantAccessHash},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := svc.SendEncrypted(ctx, chat.ID, tc.userID, otherAuthKey, tc.accessHash, domain.SecretMessageDelivery{
+				RandomID: 991, Bytes: []byte{1}, Date: 2000,
+			})
+			if !errors.Is(err, domain.ErrSecretChatNotFound) {
+				t.Fatalf("err = %v, want ErrSecretChatNotFound", err)
+			}
+		})
+	}
+}
+
+func TestDiscardEncryptionRejectsUnboundAccountDeviceAfterAccept(t *testing.T) {
+	svc, st := newTestService()
+	ctx := context.Background()
+	chat := acceptedChat(t, svc)
+
+	if _, _, err := svc.DiscardEncryption(ctx, chat.ID, partUser, otherAuthKey, true); !errors.Is(err, domain.ErrSecretChatNotFound) {
+		t.Fatalf("unbound discard err = %v, want ErrSecretChatNotFound", err)
+	}
+	stored, ok, err := st.GetSecretChat(ctx, chat.ID)
+	if err != nil || !ok || stored.State != domain.SecretChatStateNormal {
+		t.Fatalf("chat after rejected discard = %+v ok=%v err=%v", stored, ok, err)
 	}
 }
 
@@ -290,7 +329,7 @@ func TestSendEncryptedNonNormal(t *testing.T) {
 	svc, _ := newTestService()
 	ctx := context.Background()
 	chat, _ := svc.RequestEncryption(ctx, requestFixture()) // requested, 未 accept
-	_, _, err := svc.SendEncrypted(ctx, chat.ID, adminUser, chat.AdminAccessHash, domain.SecretMessageDelivery{RandomID: 1, Bytes: []byte{1}, Date: 2000})
+	_, _, err := svc.SendEncrypted(ctx, chat.ID, adminUser, adminAuthKey, chat.AdminAccessHash, domain.SecretMessageDelivery{RandomID: 1, Bytes: []byte{1}, Date: 2000})
 	if !errors.Is(err, domain.ErrSecretChatNotFound) {
 		t.Fatalf("err = %v, want ErrSecretChatNotFound (未成型不能发)", err)
 	}
@@ -301,7 +340,7 @@ func TestListNewMessagesAndAck(t *testing.T) {
 	ctx := context.Background()
 	chat := acceptedChat(t, svc)
 	for i := 0; i < 3; i++ {
-		if _, _, err := svc.SendEncrypted(ctx, chat.ID, adminUser, chat.AdminAccessHash, domain.SecretMessageDelivery{RandomID: int64(1000 + i), Bytes: []byte{byte(i)}, Date: 2000 + i}); err != nil {
+		if _, _, err := svc.SendEncrypted(ctx, chat.ID, adminUser, adminAuthKey, chat.AdminAccessHash, domain.SecretMessageDelivery{RandomID: int64(1000 + i), Bytes: []byte{byte(i)}, Date: 2000 + i}); err != nil {
 			t.Fatalf("send %d: %v", i, err)
 		}
 	}
@@ -336,7 +375,7 @@ func TestAcceptAfterDiscard(t *testing.T) {
 	svc, _ := newTestService()
 	ctx := context.Background()
 	chat, _ := svc.RequestEncryption(ctx, requestFixture())
-	if _, _, err := svc.DiscardEncryption(ctx, chat.ID, adminUser, false); err != nil {
+	if _, _, err := svc.DiscardEncryption(ctx, chat.ID, adminUser, adminAuthKey, false); err != nil {
 		t.Fatalf("discard: %v", err)
 	}
 	_, err := svc.AcceptEncryption(ctx, chat.ID, partUser, partAuthKey, chat.ParticipantAccessHash, validGA(), keyFP)

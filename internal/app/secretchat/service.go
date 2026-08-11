@@ -132,15 +132,24 @@ func (s *Service) AcceptEncryption(ctx context.Context, chatID int, viewerUserID
 	return s.store.AcceptSecretChat(ctx, chatID, participantAuthKeyID, gbPadded, keyFingerprint)
 }
 
-// DiscardEncryption 受理 discardEncryption：定位 + 参与者校验 → 迁移到 discarded。
+// DiscardEncryption 受理 discardEncryption：定位 + 参与者/绑定设备校验 → 迁移到 discarded。
 // already=true 表示已是终态（幂等成功）。返回的密聊由 rpc 层投影为对端
 // encryptedChatDiscarded 推送。
-func (s *Service) DiscardEncryption(ctx context.Context, chatID int, viewerUserID int64, deleteHistory bool) (domain.SecretChat, bool, error) {
+func (s *Service) DiscardEncryption(ctx context.Context, chatID int, viewerUserID, viewerAuthKeyID int64, deleteHistory bool) (domain.SecretChat, bool, error) {
 	chat, ok, err := s.store.GetSecretChat(ctx, chatID)
 	if err != nil {
 		return domain.SecretChat{}, false, err
 	}
-	if !ok || !chat.HasParticipant(viewerUserID) {
+	if !ok || !chat.HasParticipant(viewerUserID) || viewerAuthKeyID == 0 {
+		return domain.SecretChat{}, false, domain.ErrSecretChatNotFound
+	}
+	// Admin 从 request 起即绑定；participant 在 accept 前尚无绑定，任一收到账号级邀请的
+	// participant 设备都可拒绝。accept 一旦完成，双方所有操作都必须来自各自绑定设备。
+	boundAuthKeyID := chat.AuthKeyOf(viewerUserID)
+	if boundAuthKeyID != 0 && boundAuthKeyID != viewerAuthKeyID {
+		return domain.SecretChat{}, false, domain.ErrSecretChatNotFound
+	}
+	if boundAuthKeyID == 0 && viewerUserID != chat.ParticipantUserID {
 		return domain.SecretChat{}, false, domain.ErrSecretChatNotFound
 	}
 	return s.store.DiscardSecretChat(ctx, chatID, deleteHistory)
@@ -180,16 +189,17 @@ func (s *Service) DiscardForAuthKey(ctx context.Context, authKeyID int64) ([]dom
 	return discarded, nil
 }
 
-// SendEncrypted 受理 sendEncrypted*：定位 + 发送方视角 access_hash 校验 + 态须 normal →
+// SendEncrypted 受理 sendEncrypted*：定位 + 发送方绑定设备/access_hash 校验 + 态须 normal →
 // 给【对端绑定设备】分配 qts 并把不透明 bytes 写入投递队列（幂等：同 chat+random_id 返既有
 // qts/date）。返回密聊快照 + 已落库消息（携 qts/date，rpc 层据此推 updateNewEncryptedMessage
 // 并回 SentEncryptedMessage{date}）。盲中継：不解密 bytes。
-func (s *Service) SendEncrypted(ctx context.Context, chatID int, viewerUserID, accessHash int64, delivery domain.SecretMessageDelivery) (domain.SecretChat, domain.SecretChatMessage, error) {
+func (s *Service) SendEncrypted(ctx context.Context, chatID int, viewerUserID, viewerAuthKeyID, accessHash int64, delivery domain.SecretMessageDelivery) (domain.SecretChat, domain.SecretChatMessage, error) {
 	chat, ok, err := s.store.GetSecretChat(ctx, chatID)
 	if err != nil {
 		return domain.SecretChat{}, domain.SecretChatMessage{}, err
 	}
-	if !ok || !chat.HasParticipant(viewerUserID) || chat.AccessHashFor(viewerUserID) != accessHash {
+	if !ok || !chat.HasParticipant(viewerUserID) || viewerAuthKeyID == 0 ||
+		chat.AuthKeyOf(viewerUserID) != viewerAuthKeyID || chat.AccessHashFor(viewerUserID) != accessHash {
 		return domain.SecretChat{}, domain.SecretChatMessage{}, domain.ErrSecretChatNotFound
 	}
 	if chat.State != domain.SecretChatStateNormal {

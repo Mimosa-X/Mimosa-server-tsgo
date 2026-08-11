@@ -108,6 +108,19 @@ func (c SecretChat) PeerAuthKeyOf(userID int64) int64 {
 	}
 }
 
+// AuthKeyOf 返回 userID 自身绑定的 permanent auth key；非参与者或尚未绑定返回 0。
+// 已建立密聊的所有读写授权必须同时匹配 user 与该 auth key，不能只依赖账号身份。
+func (c SecretChat) AuthKeyOf(userID int64) int64 {
+	switch userID {
+	case c.AdminUserID:
+		return c.AdminAuthKeyID
+	case c.ParticipantUserID:
+		return c.ParticipantAuthKeyID
+	default:
+		return 0
+	}
+}
+
 // AccessHashFor 返回 userID 视角的 access_hash（双方不同）；非参与者返回 0。
 func (c SecretChat) AccessHashFor(userID int64) int64 {
 	switch userID {
@@ -176,6 +189,12 @@ type SecretMessageDelivery struct {
 	File      *EncryptedFileRef
 	Date      int
 }
+
+// MaxSecretMessageDataBytes bounds the opaque encrypted DecryptedMessage payload persisted in
+// the device queue. Secret-chat media bytes travel through the file service, so a 1 MiB metadata
+// envelope is already well above the payload emitted by the supported clients while keeping one
+// request independent from the process-wide MTProto admission budget.
+const MaxSecretMessageDataBytes = 1 << 20
 
 // SecretChatRequest 是 requestEncryption 受理入参（隐私/拉黑/self/bot 校验在 rpc 层先行）。
 type SecretChatRequest struct {

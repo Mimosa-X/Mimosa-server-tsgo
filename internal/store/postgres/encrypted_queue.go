@@ -135,7 +135,8 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
 }
 
 func (s *EncryptedQueueStore) ListEncryptedMessagesSince(ctx context.Context, receiverAuthKeyID int64, sinceQts, limit int) ([]domain.SecretChatMessage, error) {
-	if limit <= 0 || limit > 1000 {
+	// RPC difference 以 1000 条为一页，并额外读取 1 条探测 hasMore。
+	if limit <= 0 || limit > 1001 {
 		limit = 1000
 	}
 	rows, err := s.db.Query(ctx,
@@ -206,7 +207,8 @@ RETURNING id`,
 }
 
 func (s *EncryptedQueueStore) ListUndeliveredStateEvents(ctx context.Context, targetUserID, deviceAuthKeyID int64, limit int) ([]domain.EncryptedStateEvent, error) {
-	if limit <= 0 || limit > 1000 {
+	// RPC difference 以 1000 条为一页，并额外读取 1 条探测 hasMore。
+	if limit <= 0 || limit > 1001 {
 		limit = 1000
 	}
 	rows, err := s.db.Query(ctx, `

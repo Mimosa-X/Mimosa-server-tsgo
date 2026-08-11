@@ -53,13 +53,15 @@ type encryptedFixture struct {
 }
 
 const (
-	encAdminSession = int64(301)
-	encPartSession  = int64(302)
+	encAdminSession     = int64(301)
+	encPartSession      = int64(302)
+	encPartOtherSession = int64(303)
 )
 
 var (
-	encAdminAuthKey = [8]byte{1, 0, 0, 0, 0, 0, 0, 0}
-	encPartAuthKey  = [8]byte{2, 0, 0, 0, 0, 0, 0, 0}
+	encAdminAuthKey     = [8]byte{1, 0, 0, 0, 0, 0, 0, 0}
+	encPartAuthKey      = [8]byte{2, 0, 0, 0, 0, 0, 0, 0}
+	encPartOtherAuthKey = [8]byte{3, 0, 0, 0, 0, 0, 0, 0}
 )
 
 func newEncryptedFixture(t *testing.T) *encryptedFixture {
@@ -95,6 +97,10 @@ func (f *encryptedFixture) adminCtx() context.Context {
 
 func (f *encryptedFixture) participantCtx() context.Context {
 	return WithAuthKeyID(WithSessionID(WithUserID(f.ctx, f.participant.ID), encPartSession), encPartAuthKey)
+}
+
+func (f *encryptedFixture) participantOtherCtx() context.Context {
+	return WithAuthKeyID(WithSessionID(WithUserID(f.ctx, f.participant.ID), encPartOtherSession), encPartOtherAuthKey)
 }
 
 // encChatPayload 从捕获的推送里取出 updateEncryption 载荷。
@@ -172,20 +178,38 @@ func TestEncryptedChatRPCHappyPath(t *testing.T) {
 	if partView.KeyFingerprint != fp {
 		t.Fatalf("key fingerprint = %x, want %x", partView.KeyFingerprint, fp)
 	}
-	// 推送给发起方：encryptedChat，GAOrB = g_b。
+	// 定向推送给发起设备 encryptedChat，并让 participant 其它设备收敛为 discarded。
 	recs = f.sessions.records()
-	if len(recs) != 1 || recs[0].userID != f.admin.ID {
-		t.Fatalf("accept push = %+v, want single push to admin %d", recs, f.admin.ID)
+	if len(recs) != 2 {
+		t.Fatalf("accept pushes = %+v, want admin accepted + participant loser discarded", recs)
 	}
-	adminView, ok := encChatPayload(t, recs[0]).(*tg.EncryptedChat)
+	var adminRec, loserRec *phonePushRecord
+	for i := range recs {
+		switch recs[i].userID {
+		case f.admin.ID:
+			adminRec = &recs[i]
+		case f.participant.ID:
+			loserRec = &recs[i]
+		}
+	}
+	if adminRec == nil || adminRec.rawAuthKeyID != encAdminAuthKey {
+		t.Fatalf("admin accept push = %+v, want target auth key %x", adminRec, encAdminAuthKey)
+	}
+	if loserRec == nil || loserRec.rawAuthKeyID != encPartAuthKey {
+		t.Fatalf("loser discard push = %+v, want exclusion auth key %x", loserRec, encPartAuthKey)
+	}
+	adminView, ok := encChatPayload(t, *adminRec).(*tg.EncryptedChat)
 	if !ok {
-		t.Fatalf("admin payload = %T, want EncryptedChat", encChatPayload(t, recs[0]))
+		t.Fatalf("admin payload = %T, want EncryptedChat", encChatPayload(t, *adminRec))
 	}
 	if string(adminView.GAOrB) != string(gb) {
 		t.Fatal("admin view GAOrB must be g_b")
 	}
 	if adminView.KeyFingerprint != fp {
 		t.Fatal("admin view key fingerprint not relayed byte-for-byte")
+	}
+	if discarded, ok := encChatPayload(t, *loserRec).(*tg.EncryptedChatDiscarded); !ok || !discarded.HistoryDeleted {
+		t.Fatalf("loser payload = %+v, want history-deleting EncryptedChatDiscarded", encChatPayload(t, *loserRec))
 	}
 
 	// --- discardEncryption（发起方） ---

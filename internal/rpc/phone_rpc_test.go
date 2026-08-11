@@ -63,6 +63,24 @@ func (s *phoneCaptureSessions) PushToUserExceptAuthKeySession(_ context.Context,
 	return 1, nil
 }
 
+func (s *phoneCaptureSessions) PushToUserAuthKey(_ context.Context, userID int64, businessAuthKeyID [8]byte, _ proto.MessageType, msg tg.UpdatesClass) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.log = append(s.log, phonePushRecord{userID: userID, rawAuthKeyID: businessAuthKeyID, msg: msg})
+	return 1, s.pushErr
+}
+
+func (s *phoneCaptureSessions) PushToUserAuthKeyTransient(ctx context.Context, userID int64, businessAuthKeyID [8]byte, t proto.MessageType, msg tg.UpdatesClass, _ time.Duration) (int, error) {
+	return s.PushToUserAuthKey(ctx, userID, businessAuthKeyID, t, msg)
+}
+
+func (s *phoneCaptureSessions) PushToUserExceptBusinessAuthKey(_ context.Context, userID int64, excludeBusinessAuthKeyID [8]byte, _ proto.MessageType, msg tg.UpdatesClass, _ time.Duration) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.log = append(s.log, phonePushRecord{userID: userID, rawAuthKeyID: excludeBusinessAuthKeyID, msg: msg})
+	return 1, s.pushErr
+}
+
 func (s *phoneCaptureSessions) records() []phonePushRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()

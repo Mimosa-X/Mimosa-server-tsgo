@@ -760,15 +760,11 @@ func (r *Router) registerMessages(d *tlprofile.Dispatcher) {
 				if err := r.validateInputPeerChannelAccess(ctx, userID, req.Peer, filter.Peer.ID); err != nil {
 					return nil, err
 				}
-				categories := mediaCategoriesForFilter(req.Filter)
-				mediaReq := domain.MediaSearchRequest{
-					Categories: categories,
-					OffsetID:   req.OffsetID,
-					AddOffset:  domain.ClampMessageHistoryAddOffset(req.AddOffset),
-					Limit:      req.Limit,
-					MaxID:      req.MaxID,
-					MinID:      req.MinID,
+				mediaReq, err := r.mediaSearchRequestFromMessagesSearch(ctx, userID, req, filter)
+				if err != nil {
+					return nil, err
 				}
+				categories := mediaReq.Categories
 				if mediaSearchCanReusePeerWideCount(req) {
 					counts, err := r.mediaCountsForPeer(ctx, userID, filter.Peer)
 					if err != nil {
@@ -845,15 +841,11 @@ func (r *Router) registerMessages(d *tlprofile.Dispatcher) {
 					Count: counts.CountAny(mediaCategoriesForFilter(req.Filter)),
 				}), nil
 			}
-			categories := mediaCategoriesForFilter(req.Filter)
-			mediaReq := domain.MediaSearchRequest{
-				Categories: categories,
-				OffsetID:   req.OffsetID,
-				AddOffset:  domain.ClampMessageHistoryAddOffset(req.AddOffset),
-				Limit:      req.Limit,
-				MaxID:      req.MaxID,
-				MinID:      req.MinID,
+			mediaReq, err := r.mediaSearchRequestFromMessagesSearch(ctx, userID, req, filter)
+			if err != nil {
+				return nil, err
 			}
+			categories := mediaReq.Categories
 			if mediaSearchCanReusePeerWideCount(req) {
 				counts, err := r.mediaCountsForPeer(ctx, userID, peer)
 				if err != nil {
