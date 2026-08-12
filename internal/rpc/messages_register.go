@@ -441,9 +441,11 @@ func (r *Router) registerMessages(d *tlprofile.Dispatcher) {
 			}
 			list = tdesktop.MergeInitialDialogsWithPinned(list, pinned)
 		}
-		if filter.Hash != 0 && r.deps.Communities == nil && list.Hash == filter.Hash {
-			return &tg.MessagesDialogsNotModified{Count: list.Count}, nil
-		}
+		// An unknown cache entry is also the invalidation signal for metadata that
+		// does not alter dialog ordering (for example verified/scam/fake flags).
+		// In that case the peer objects must be sent once even when the freshly
+		// computed list hash still equals the client's hash. The response warms the
+		// cache, so later identical requests retain the fast NotModified path above.
 		return r.tgMessagesDialogs(ctx, userID, r.withDialogListPresence(ctx, userID, list)), nil
 	})
 	registerRPC[*tg.MessagesGetPinnedDialogsRequest](d, tlprofile.SemanticMethodMessagesGetPinnedDialogs, func(ctx context.Context, layerRequest *tg.MessagesGetPinnedDialogsRequest) (any, error) {
@@ -714,6 +716,12 @@ func (r *Router) registerMessages(d *tlprofile.Dispatcher) {
 			if isLegacyInputPeerChat(req.Peer) {
 				return &tg.MessagesMessages{}, nil
 			}
+			// P2P calls are stored exclusively in private message boxes. Returning
+			// an empty result is important here: falling through to channel history
+			// would make ordinary channel posts appear in the Calls tab.
+			if filter.PhoneCallsOnly {
+				return &tg.MessagesMessages{}, nil
+			}
 			if messagesSearchFilterChatPhotos(req.Filter) {
 				view, err := r.resolveInputPeerChannelView(ctx, userID, req.Peer, filter.Peer.ID)
 				if err != nil {
@@ -752,15 +760,11 @@ func (r *Router) registerMessages(d *tlprofile.Dispatcher) {
 				if err := r.validateInputPeerChannelAccess(ctx, userID, req.Peer, filter.Peer.ID); err != nil {
 					return nil, err
 				}
-				categories := mediaCategoriesForFilter(req.Filter)
-				mediaReq := domain.MediaSearchRequest{
-					Categories: categories,
-					OffsetID:   req.OffsetID,
-					AddOffset:  domain.ClampMessageHistoryAddOffset(req.AddOffset),
-					Limit:      req.Limit,
-					MaxID:      req.MaxID,
-					MinID:      req.MinID,
+				mediaReq, err := r.mediaSearchRequestFromMessagesSearch(ctx, userID, req, filter)
+				if err != nil {
+					return nil, err
 				}
+				categories := mediaReq.Categories
 				if mediaSearchCanReusePeerWideCount(req) {
 					counts, err := r.mediaCountsForPeer(ctx, userID, filter.Peer)
 					if err != nil {
@@ -837,15 +841,11 @@ func (r *Router) registerMessages(d *tlprofile.Dispatcher) {
 					Count: counts.CountAny(mediaCategoriesForFilter(req.Filter)),
 				}), nil
 			}
-			categories := mediaCategoriesForFilter(req.Filter)
-			mediaReq := domain.MediaSearchRequest{
-				Categories: categories,
-				OffsetID:   req.OffsetID,
-				AddOffset:  domain.ClampMessageHistoryAddOffset(req.AddOffset),
-				Limit:      req.Limit,
-				MaxID:      req.MaxID,
-				MinID:      req.MinID,
+			mediaReq, err := r.mediaSearchRequestFromMessagesSearch(ctx, userID, req, filter)
+			if err != nil {
+				return nil, err
 			}
+			categories := mediaReq.Categories
 			if mediaSearchCanReusePeerWideCount(req) {
 				counts, err := r.mediaCountsForPeer(ctx, userID, peer)
 				if err != nil {

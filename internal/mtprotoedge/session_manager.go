@@ -1425,6 +1425,27 @@ func (m *SessionManager) PushToUserAuthKeyTransientAtLeastLayer(ctx context.Cont
 	return m.pushToBusinessAuthKeyBestEffort(ctx, userID, businessAuthKeyID, minLayer, t, msg, timeout)
 }
 
+// PushToUserExceptBusinessAuthKey 把 update 投给账号其它设备，精确排除同一 permanent
+// business auth key 下的所有 raw/temp/PFS 连接。密聊 accept 用它让输掉竞态的设备收敛为
+// discarded，同时保证获胜设备的其它连接不会误删刚建立的密聊。
+func (m *SessionManager) PushToUserExceptBusinessAuthKey(ctx context.Context, userID int64, excludeBusinessAuthKeyID [8]byte, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
+	getUpdates := onceLayerUpdatesFanout(ctx, msg)
+	return m.pushToUserWithSender(ctx, userID, nil, 0, &excludeBusinessAuthKeyID, 0, t, getUpdates, false, func(c *Conn) error {
+		if c.outbound == nil || c.outboundControl == nil {
+			return ErrConnClosed
+		}
+		updates, err := getUpdates()
+		if err != nil {
+			return err
+		}
+		encoded, err := updates.prepareForConn(ctx, c)
+		if err != nil {
+			return err
+		}
+		return c.SendBestEffortEncoded(ctx, t, encoded, timeout)
+	})
+}
+
 func (m *SessionManager) pushToBusinessAuthKeyBestEffort(ctx context.Context, userID int64, businessAuthKeyID [8]byte, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
 	if ctx != nil && ctx.Err() != nil {
 		return 0, ctx.Err()
@@ -1530,7 +1551,7 @@ func (m *SessionManager) pushToBusinessAuthKey(ctx context.Context, userID int64
 
 func (m *SessionManager) pushToUser(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass) (int, error) {
 	getUpdates := onceLayerUpdatesFanout(ctx, msg)
-	return m.pushToUserWithSender(ctx, userID, excludeAuthKeyID, excludeSessionID, 0, t, getUpdates, true, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, excludeAuthKeyID, excludeSessionID, nil, 0, t, getUpdates, true, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1553,7 +1574,7 @@ func (m *SessionManager) pushToUser(ctx context.Context, userID int64, excludeAu
 // 「durable 兜底」丢弃。走 best-effort 发送，不阻塞调用方。
 func (m *SessionManager) PushToUserTransientExceptAuthKeySession(ctx context.Context, userID int64, excludeAuthKeyID [8]byte, excludeSessionID int64, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
 	getUpdates := onceLayerUpdatesFanout(ctx, msg)
-	return m.pushToUserWithSender(ctx, userID, &excludeAuthKeyID, excludeSessionID, 0, t, getUpdates, false, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, &excludeAuthKeyID, excludeSessionID, nil, 0, t, getUpdates, false, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1571,7 +1592,7 @@ func (m *SessionManager) PushToUserTransientExceptAuthKeySession(ctx context.Con
 
 func (m *SessionManager) PushToUserTransientAtLeastLayer(ctx context.Context, userID int64, minLayer int, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error) {
 	getUpdates := onceLayerUpdatesFanout(ctx, msg)
-	return m.pushToUserWithSender(ctx, userID, nil, 0, minLayer, t, getUpdates, false, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, nil, 0, nil, minLayer, t, getUpdates, false, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1621,7 +1642,7 @@ func (m *SessionManager) pushToUserBestEffortAtLeastLayer(ctx context.Context, u
 		defer cancel()
 	}
 	getUpdates := onceLayerUpdatesFanout(sendCtx, msg)
-	return m.pushToUserWithSender(ctx, userID, excludeAuthKeyID, excludeSessionID, minLayer, t, getUpdates, true, func(c *Conn) error {
+	return m.pushToUserWithSender(ctx, userID, excludeAuthKeyID, excludeSessionID, nil, minLayer, t, getUpdates, true, func(c *Conn) error {
 		if c.outbound == nil || c.outboundControl == nil {
 			return ErrConnClosed
 		}
@@ -1668,7 +1689,7 @@ func onceLayerUpdatesFanout(ctx context.Context, msg tg.UpdatesClass) func() (*l
 	}
 }
 
-func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, minLayer int, t proto.MessageType, getUpdates func() (*layerUpdatesFanout, error), queueWhenNotReady bool, send func(*Conn) error) (int, error) {
+func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64, excludeAuthKeyID *[8]byte, excludeSessionID int64, excludeBusinessAuthKeyID *[8]byte, minLayer int, t proto.MessageType, getUpdates func() (*layerUpdatesFanout, error), queueWhenNotReady bool, send func(*Conn) error) (int, error) {
 	// push fan-out 是连接层最热路径之一：debug 日志的字段构造（含 auth_key hex 格式化）
 	// 在关闭 debug 时也会求值，先查级别一次、按需记日志。
 	debug := m.log.Core().Enabled(zapcore.DebugLevel)
@@ -1684,7 +1705,7 @@ func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64,
 	skipped := 0
 	needQueue := false
 	for _, c := range m.byUser[userID] {
-		if shouldExcludeSession(c, excludeAuthKeyID, excludeSessionID) {
+		if shouldExcludeSession(c, excludeAuthKeyID, excludeSessionID) || shouldExcludeBusinessAuthKey(c, excludeBusinessAuthKeyID) {
 			excluded++
 			continue
 		}
@@ -1716,7 +1737,7 @@ func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64,
 		m.mu.Lock()
 		total = len(m.byUser[userID])
 		for key, c := range m.byUser[userID] {
-			if shouldExcludeSession(c, excludeAuthKeyID, excludeSessionID) {
+			if shouldExcludeSession(c, excludeAuthKeyID, excludeSessionID) || shouldExcludeBusinessAuthKey(c, excludeBusinessAuthKeyID) {
 				excluded++
 				continue
 			}
@@ -1771,6 +1792,9 @@ func (m *SessionManager) pushToUserWithSender(ctx context.Context, userID int64,
 		// bindUserLocked 的 c.userID.Swap）。不复查会把本属于 userID 的 update 投递到
 		// 已易主的连接，构成跨账号泄露。与 AddUserChannelMembership 的同款防御一致。
 		if c.userID.Load() != userID {
+			continue
+		}
+		if shouldExcludeBusinessAuthKey(c, excludeBusinessAuthKeyID) {
 			continue
 		}
 		if err := send(c); err != nil {
@@ -2729,6 +2753,13 @@ func shouldExcludeSession(c *Conn, excludeAuthKeyID *[8]byte, excludeSessionID i
 		return true
 	}
 	return c.authKeyID == *excludeAuthKeyID
+}
+
+func shouldExcludeBusinessAuthKey(c *Conn, excludeBusinessAuthKeyID *[8]byte) bool {
+	if c == nil || excludeBusinessAuthKeyID == nil || *excludeBusinessAuthKeyID == ([8]byte{}) {
+		return false
+	}
+	return connUsesBusinessAuthKey(c, *excludeBusinessAuthKeyID)
 }
 
 func sessionSupportsMinimumLayer(c *Conn, minLayer int) bool {

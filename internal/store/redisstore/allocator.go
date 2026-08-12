@@ -25,11 +25,6 @@ type ChannelMessageIDAllocator struct {
 	counter counterAllocator
 }
 
-// SecretChatIDAllocator 用 Redis INCR 分配全局 secret chat id（int32 量级）。
-type SecretChatIDAllocator struct {
-	counter counterAllocator
-}
-
 type counterAllocator struct {
 	c      *redis.Client
 	source store.CounterSource
@@ -113,26 +108,12 @@ func NewChannelMessageIDAllocator(c *redis.Client, source store.CounterSource) *
 	}}
 }
 
-// NewSecretChatIDAllocator 创建 Redis-backed secret chat id allocator。
-func NewSecretChatIDAllocator(c *redis.Client, source store.CounterSource) *SecretChatIDAllocator {
-	return &SecretChatIDAllocator{counter: counterAllocator{
-		c:      c,
-		source: source,
-		key:    secretChatIDKey,
-		name:   "secret_chat_id",
-	}}
-}
-
 func boxIDKey(userID int64) string {
 	return fmt.Sprintf("counter:box_id:{%d}", userID)
 }
 
 func channelIDKey(_ int64) string {
 	return "counter:channel_id"
-}
-
-func secretChatIDKey(_ int64) string {
-	return "counter:secret_chat_id"
 }
 
 func channelMessageIDKey(channelID int64) string {
@@ -182,29 +163,6 @@ func (a *ChannelIDAllocator) NextChannelIDAtLeast(ctx context.Context, floor int
 
 func (a *ChannelIDAllocator) CurrentChannelID(ctx context.Context) (int64, error) {
 	return a.counter.current(ctx, 1)
-}
-
-func (a *SecretChatIDAllocator) NextSecretChatID(ctx context.Context) (int, error) {
-	v, err := a.counter.next(ctx, 1)
-	return int(v), err
-}
-
-// NextSecretChatIDAtLeast 把计数器至少顶到 floor 后再分配下一个 id（撞 chat_id
-// 主键自愈：Redis 快照回退或外部写库后计数器落后于 secret_chats 表最大 id）。
-func (a *SecretChatIDAllocator) NextSecretChatIDAtLeast(ctx context.Context, floor int) (int, error) {
-	if a.counter.c == nil {
-		return 0, fmt.Errorf("redis secret_chat_id counter: nil client")
-	}
-	v, err := counterNextAtLeastScript.Run(ctx, a.counter.c, []string{secretChatIDKey(1)}, floor).Int64()
-	if err != nil {
-		return 0, fmt.Errorf("redis next-at-least secret_chat_id counter: %w", err)
-	}
-	return int(v), nil
-}
-
-func (a *SecretChatIDAllocator) CurrentSecretChatID(ctx context.Context) (int, error) {
-	v, err := a.counter.current(ctx, 1)
-	return int(v), err
 }
 
 func (a *ChannelMessageIDAllocator) NextChannelMessageID(ctx context.Context, channelID int64) (int, error) {

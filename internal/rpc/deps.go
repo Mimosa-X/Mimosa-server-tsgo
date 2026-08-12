@@ -182,11 +182,12 @@ type TransientSessionBinder interface {
 }
 
 // AuthKeyTargetedSessionBinder 把 update 定向投递给某用户【绑定到具体 business auth_key
-// 这台设备】的就绪连接（密聊设备级投递）。SessionManager 实现；测试替身/未装配时
-// rpc 层回退账号级推送。未就绪连接跳过、不进 pending（密聊离线靠 getDifference 补）。
+// 这台设备】的就绪连接（密聊设备级投递）。SessionManager 实现；密聊启用时必须装配，
+// 缺失时 fail-closed，严禁回退账号级推送。未就绪连接跳过、不进 pending（离线靠 difference 补）。
 type AuthKeyTargetedSessionBinder interface {
 	PushToUserAuthKey(ctx context.Context, userID int64, businessAuthKeyID [8]byte, t proto.MessageType, msg tg.UpdatesClass) (int, error)
 	PushToUserAuthKeyTransient(ctx context.Context, userID int64, businessAuthKeyID [8]byte, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
+	PushToUserExceptBusinessAuthKey(ctx context.Context, userID int64, excludeBusinessAuthKeyID [8]byte, t proto.MessageType, msg tg.UpdatesClass, timeout time.Duration) (int, error)
 }
 
 // ExactLayerTransientSessionBinder is the admission boundary for updates whose
@@ -780,6 +781,9 @@ type ChannelsService interface {
 	GetHistory(ctx context.Context, userID int64, filter domain.ChannelHistoryFilter) (domain.ChannelHistory, error)
 	SearchChannelMedia(ctx context.Context, userID, channelID int64, req domain.MediaSearchRequest) (domain.ChannelHistory, error)
 	CountChannelMediaCategories(ctx context.Context, userID, channelID int64) (domain.MediaCategoryCounts, error)
+	GetStats(ctx context.Context, userID int64, req domain.ChannelStatsRequest) (domain.ChannelStats, error)
+	GetMessageStats(ctx context.Context, userID int64, req domain.ChannelMessageStatsRequest) (domain.ChannelMessageStats, error)
+	ListMessagePublicForwards(ctx context.Context, userID int64, req domain.ChannelMessagePublicForwardListRequest) (domain.ChannelMessagePublicForwardList, error)
 	SearchPosts(ctx context.Context, userID int64, req domain.ChannelSearchPostsRequest) (domain.ChannelHistory, error)
 	SearchJoinedMessages(ctx context.Context, userID int64, req domain.ChannelGlobalSearchRequest) (domain.ChannelHistory, error)
 	GetMessages(ctx context.Context, userID, channelID int64, ids []int) (domain.ChannelHistory, error)
@@ -1214,12 +1218,12 @@ type PremiumService interface {
 type SecretChatService interface {
 	RequestEncryption(ctx context.Context, req domain.SecretChatRequest) (domain.SecretChat, error)
 	AcceptEncryption(ctx context.Context, chatID int, viewerUserID, participantAuthKeyID, accessHash int64, gb []byte, keyFingerprint int64) (domain.SecretChat, error)
-	DiscardEncryption(ctx context.Context, chatID int, viewerUserID int64, deleteHistory bool) (domain.SecretChat, bool, error)
+	DiscardEncryption(ctx context.Context, chatID int, viewerUserID, viewerAuthKeyID int64, deleteHistory bool) (domain.SecretChat, bool, error)
 	// DiscardForAuthKey 级联 discard 绑定该 perm auth_key 的全部活跃密聊（设备登出/授权撤销），
 	// 返回实际迁移到 discarded 的密聊供通知对端。
 	DiscardForAuthKey(ctx context.Context, authKeyID int64) ([]domain.SecretChat, error)
 	GetSecretChat(ctx context.Context, chatID int) (domain.SecretChat, bool, error)
-	SendEncrypted(ctx context.Context, chatID int, viewerUserID, accessHash int64, delivery domain.SecretMessageDelivery) (domain.SecretChat, domain.SecretChatMessage, error)
+	SendEncrypted(ctx context.Context, chatID int, viewerUserID, viewerAuthKeyID, accessHash int64, delivery domain.SecretMessageDelivery) (domain.SecretChat, domain.SecretChatMessage, error)
 	ListNewMessages(ctx context.Context, deviceAuthKeyID int64, sinceQts, limit int) ([]domain.SecretChatMessage, error)
 	DeviceReservedQts(ctx context.Context, deviceAuthKeyID int64) (int, error)
 	AckQueue(ctx context.Context, deviceAuthKeyID int64, maxQts int) error

@@ -702,7 +702,6 @@ func run(logger *zap.Logger) error {
 	boxIDAllocator := redisstore.NewBoxIDAllocator(rdb, postgres.NewMessageBoxCounterSource(pool))
 	channelIDAllocator := redisstore.NewChannelIDAllocator(rdb, postgres.NewChannelIDCounterSource(pool))
 	channelMessageIDAllocator := redisstore.NewChannelMessageIDAllocator(rdb, postgres.NewChannelMessageIDCounterSource(pool))
-	secretChatIDAllocator := redisstore.NewSecretChatIDAllocator(rdb, postgres.NewSecretChatIDCounterSource(pool))
 	contactStore := userprojection.NewCachedContactStore(postgres.NewContactStore(pool), 0)
 	dialogStore := postgres.NewDialogStore(pool)
 	chatlistStore := postgres.NewChatlistStore(pool)
@@ -1057,7 +1056,7 @@ func run(logger *zap.Logger) error {
 	// 私聊端对端加密（Secret Chat）握手状态机 + qts 投递队列（盲中继）。
 	secretChatStore := postgres.NewSecretChatStore(pool)
 	encryptedQueueStore := postgres.NewEncryptedQueueStore(pool)
-	secretChatService := secretchatapp.NewService(secretChatStore, encryptedQueueStore, secretChatIDAllocator)
+	secretChatService := secretchatapp.NewService(secretChatStore, encryptedQueueStore)
 	starsStore := postgres.NewStarsStore(pool)
 	starsPurchaseStore := postgres.NewStarsPurchaseStore(pool, messageStore, channelStore)
 	starsService := stars.NewService(starsStore,

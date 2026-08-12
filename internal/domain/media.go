@@ -712,23 +712,24 @@ type MessageGiftStarsAction struct {
 // MessageStarGiftAction 是 messageActionStarGift 的协议中立载荷：内嵌礼物快照（贴纸/星价）
 // 使收礼人无需额外拉取即可渲染。PeerUserID/PeerChannelID 为收礼方；NameHidden 时下发不暴露 from。
 type MessageStarGiftAction struct {
-	GiftID             int64     `json:"gift_id"`
-	Stars              int64     `json:"stars"`
-	ConvertStars       int64     `json:"convert_stars,omitempty"`
-	Title              string    `json:"title,omitempty"`
-	Sticker            *Document `json:"sticker,omitempty"`
-	Message            string    `json:"message,omitempty"`
-	FromUserID         int64     `json:"from_user_id,omitempty"`
-	PeerUserID         int64     `json:"peer_user_id,omitempty"`
-	PeerChannelID      int64     `json:"peer_channel_id,omitempty"`
-	SavedID            int64     `json:"saved_id,omitempty"`
-	NameHidden         bool      `json:"name_hidden,omitempty"`
-	Saved              bool      `json:"saved,omitempty"`
-	Converted          bool      `json:"converted,omitempty"`
-	CanUpgrade         bool      `json:"can_upgrade,omitempty"`
-	PrepaidUpgrade     bool      `json:"prepaid_upgrade,omitempty"`
-	PrepaidUpgradeHash string    `json:"prepaid_upgrade_hash,omitempty"`
-	UpgradeSeparate    bool      `json:"upgrade_separate,omitempty"`
+	GiftID             int64           `json:"gift_id"`
+	Stars              int64           `json:"stars"`
+	ConvertStars       int64           `json:"convert_stars,omitempty"`
+	Title              string          `json:"title,omitempty"`
+	Sticker            *Document       `json:"sticker,omitempty"`
+	Message            string          `json:"message,omitempty"`
+	MessageEntities    []MessageEntity `json:"message_entities,omitempty"`
+	FromUserID         int64           `json:"from_user_id,omitempty"`
+	PeerUserID         int64           `json:"peer_user_id,omitempty"`
+	PeerChannelID      int64           `json:"peer_channel_id,omitempty"`
+	SavedID            int64           `json:"saved_id,omitempty"`
+	NameHidden         bool            `json:"name_hidden,omitempty"`
+	Saved              bool            `json:"saved,omitempty"`
+	Converted          bool            `json:"converted,omitempty"`
+	CanUpgrade         bool            `json:"can_upgrade,omitempty"`
+	PrepaidUpgrade     bool            `json:"prepaid_upgrade,omitempty"`
+	PrepaidUpgradeHash string          `json:"prepaid_upgrade_hash,omitempty"`
+	UpgradeSeparate    bool            `json:"upgrade_separate,omitempty"`
 	// UpgradePriceStars belongs to the inner StarGift.upgrade_stars field and
 	// is the price of a normal paid upgrade. UpgradeStars below belongs to the
 	// outer messageActionStarGift and is only the amount already prepaid by the

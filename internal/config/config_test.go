@@ -379,6 +379,18 @@ func TestLoadStrictDCCheck(t *testing.T) {
 	})
 }
 
+func TestLoadRejectsNonPositiveCanonicalDC(t *testing.T) {
+	for _, value := range []string{"0", "-2", "2147483648"} {
+		t.Run(value, func(t *testing.T) {
+			disableDefaultConfigFile(t)
+			t.Setenv("TELESRV_DC", value)
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load accepted TELESRV_DC=%s", value)
+			}
+		})
+	}
+}
+
 func TestLoadMTProtoAdmissionAndRPCBudgets(t *testing.T) {
 	disableDefaultConfigFile(t)
 	t.Setenv("TELESRV_MTPROTO_MAX_CONNECTIONS", "12345")

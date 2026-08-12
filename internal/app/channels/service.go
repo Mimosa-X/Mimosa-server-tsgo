@@ -31,6 +31,15 @@ type SendPermissionChecker interface {
 	CanSendMessages(ctx context.Context, userID int64) error
 }
 
+// channelStatsStore is an optional capability kept out of the broad
+// store.ChannelStore contract.  It lets focused test stores stay small while
+// both production backends expose the complete bounded stats read model.
+type channelStatsStore interface {
+	GetChannelStats(ctx context.Context, req domain.ChannelStatsRequest) (domain.ChannelStats, error)
+	GetChannelMessageStats(ctx context.Context, req domain.ChannelMessageStatsRequest) (domain.ChannelMessageStats, error)
+	ListChannelMessagePublicForwards(ctx context.Context, req domain.ChannelMessagePublicForwardListRequest) (domain.ChannelMessagePublicForwardList, error)
+}
+
 // NewService creates a channel service.
 func NewService(channels store.ChannelStore, opts ...Option) *Service {
 	s := &Service{
@@ -188,6 +197,51 @@ func (s *Service) CountChannelMediaCategories(ctx context.Context, userID, chann
 		return domain.MediaCategoryCounts{}, domain.ErrChannelInvalid
 	}
 	return s.cachedChannelMediaCounts(ctx, userID, channelID)
+}
+
+// GetStats returns bounded aggregates derived from durable channel facts.
+func (s *Service) GetStats(ctx context.Context, userID int64, req domain.ChannelStatsRequest) (domain.ChannelStats, error) {
+	if s == nil || s.channels == nil || userID == 0 || req.ChannelID == 0 || !req.Period.Valid() {
+		return domain.ChannelStats{}, domain.ErrChannelInvalid
+	}
+	provider, ok := s.channels.(channelStatsStore)
+	if !ok {
+		return domain.ChannelStats{}, domain.ErrChannelInvalid
+	}
+	req.ViewerUserID = userID
+	return provider.GetChannelStats(ctx, req)
+}
+
+// GetMessageStats returns view/reaction event buckets for one exact post.
+func (s *Service) GetMessageStats(ctx context.Context, userID int64, req domain.ChannelMessageStatsRequest) (domain.ChannelMessageStats, error) {
+	if s == nil || s.channels == nil || userID == 0 || req.ChannelID == 0 || req.MessageID <= 0 ||
+		req.MessageID > domain.MaxMessageBoxID || !req.Period.Valid() {
+		return domain.ChannelMessageStats{}, domain.ErrMessageIDInvalid
+	}
+	provider, ok := s.channels.(channelStatsStore)
+	if !ok {
+		return domain.ChannelMessageStats{}, domain.ErrChannelInvalid
+	}
+	req.ViewerUserID = userID
+	return provider.GetChannelMessageStats(ctx, req)
+}
+
+// ListMessagePublicForwards returns only public destination posts with a
+// validated seek cursor; private forwards never cross this boundary.
+func (s *Service) ListMessagePublicForwards(ctx context.Context, userID int64, req domain.ChannelMessagePublicForwardListRequest) (domain.ChannelMessagePublicForwardList, error) {
+	if s == nil || s.channels == nil || userID == 0 || req.ChannelID == 0 || req.MessageID <= 0 ||
+		req.MessageID > domain.MaxMessageBoxID || req.Limit <= 0 || req.Limit > domain.MaxChannelMessagePublicForwards {
+		return domain.ChannelMessagePublicForwardList{}, domain.ErrChannelInvalid
+	}
+	if _, err := domain.ParseChannelMessagePublicForwardCursor(req.Offset); err != nil {
+		return domain.ChannelMessagePublicForwardList{}, err
+	}
+	provider, ok := s.channels.(channelStatsStore)
+	if !ok {
+		return domain.ChannelMessagePublicForwardList{}, domain.ErrChannelInvalid
+	}
+	req.ViewerUserID = userID
+	return provider.ListChannelMessagePublicForwards(ctx, req)
 }
 
 // GetChannels returns channel data personalized for userID, ordered by the first occurrence in channelIDs.

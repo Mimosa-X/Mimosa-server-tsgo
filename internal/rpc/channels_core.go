@@ -39,10 +39,30 @@ func (r *Router) onChannelsCreateChannel(ctx context.Context, req *tg.ChannelsCr
 		return nil, channelInvalidErr(err)
 	}
 	r.addOnlineChannelMemberships(res.Channel.ID, channelMemberUserIDs(res.Members)...)
-	updates := r.channelOperationUpdates(ctx, userID, res)
+	updates, err := r.channelCreationResponseUpdates(ctx, userID, res)
+	if err != nil {
+		return nil, err
+	}
 	r.pushChannelUpdates(ctx, userID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
 		return r.channelOperationUpdates(ctx, viewerUserID, res)
 	})
+	return updates, nil
+}
+
+// channelCreationResponseUpdates adds the response-only message mapping TDLib
+// requires to recognize a channels.createChannel result. The mapping is never
+// reused by fan-out or difference; the create service message remains the sole
+// durable, PTS-bearing fact.
+func (r *Router) channelCreationResponseUpdates(ctx context.Context, viewerUserID int64, res domain.CreateChannelResult) (*tg.Updates, error) {
+	if res.Message.ID <= 0 || res.Message.Action == nil || res.Message.Action.Type != domain.ChannelActionCreate {
+		return nil, internalErr()
+	}
+	updates := r.channelOperationUpdates(ctx, viewerUserID, res)
+	if updates == nil {
+		return nil, internalErr()
+	}
+	mapping := &tg.UpdateMessageID{ID: res.Message.ID, RandomID: randomNonZeroInt64()}
+	updates.Updates = append([]tg.UpdateClass{mapping}, updates.Updates...)
 	return updates, nil
 }
 
@@ -192,6 +212,7 @@ func (r *Router) onChannelsGetFullChannel(ctx context.Context, input tg.InputCha
 		return nil, err
 	}
 	full := tgChannelFull(view, r.cfg.PublicBaseURL)
+	r.applyChannelStatsCapability(full)
 	r.applyStarGiftsCountToChannelFull(ctx, view.Channel.ID, full)
 	userIDs := []int64{view.Channel.CreatorUserID, view.Self.UserID}
 	// 注：Bots 过滤实际会返回群内 bot（TestGroupBotRPCShape 覆盖），这里据此富化 full.BotInfo。

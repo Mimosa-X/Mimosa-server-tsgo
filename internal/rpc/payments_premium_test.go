@@ -348,6 +348,32 @@ func TestPremiumGiftInvoiceRespectsRecipientGiftPrivacy(t *testing.T) {
 	}
 }
 
+func TestPremiumGiftInvoiceRejectsActiveRecipient(t *testing.T) {
+	r, _, users, buyer, recipient := premiumRPCTestRouter(t)
+	const premiumUntil = 1_800_086_400
+	if _, err := users.SetPremiumUntil(context.Background(), recipient.ID, premiumUntil); err != nil {
+		t.Fatalf("set recipient Premium: %v", err)
+	}
+	ctx := WithUserID(context.Background(), buyer.ID)
+	_, err := r.onPaymentsGetPaymentForm(ctx, &tg.PaymentsGetPaymentFormRequest{
+		Invoice: &tg.InputInvoicePremiumGiftStars{
+			UserID: &tg.InputUser{UserID: recipient.ID, AccessHash: recipient.AccessHash},
+			Months: 3,
+		},
+	})
+	want := "PREMIUM_SUB_ACTIVE_UNTIL"
+	if !tgerr.Is(err, want) {
+		t.Fatalf("active Premium recipient err=%v, want %s", err, want)
+	}
+	if !tgerr.IsCode(err, 420) {
+		t.Fatalf("active Premium recipient err=%v, want code 420", err)
+	}
+	rpcErr, ok := tgerr.As(err)
+	if !ok || rpcErr.Argument != premiumUntil {
+		t.Fatalf("active Premium recipient err=%v, want expiry argument %d", err, premiumUntil)
+	}
+}
+
 func TestPremiumLayer228ConstructorIDsAndGiftActionFlags(t *testing.T) {
 	ids := map[string]struct {
 		got, want uint32

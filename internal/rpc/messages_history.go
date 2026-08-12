@@ -460,14 +460,8 @@ func (r *Router) onMessagesGetMessages(ctx context.Context, ids []tg.InputMessag
 	}
 
 	out := make([]tg.MessageClass, 0, len(ids))
-	requestedIDs := make([]int, 0, len(ids))
-	for _, input := range ids {
-		id, ok := inputMessageBoxID(input)
-		if !ok || id <= 0 || id > domain.MaxMessageBoxID {
-			continue
-		}
-		requestedIDs = append(requestedIDs, id)
-	}
+	trace := newGetMessagesInputTrace(ids)
+	requestedIDs := trace.lookupIDs
 	list, err := r.deps.Messages.GetMessages(ctx, userID, requestedIDs)
 	if err != nil {
 		return nil, internalErr()
@@ -491,6 +485,7 @@ func (r *Router) onMessagesGetMessages(ctx context.Context, ids []tg.InputMessag
 		found = append(found, msg)
 		out = append(out, tgMessage(msg))
 	}
+	r.maybeEnqueueExpiredPrivateWebPageResolves(found)
 	chats := r.chatsForMessageUpdates(ctx, userID, found)
 	result := &tg.MessagesMessages{
 		Messages: out,
@@ -498,6 +493,7 @@ func (r *Router) onMessagesGetMessages(ctx context.Context, ids []tg.InputMessag
 		Chats:    chats,
 	}
 	r.applyPeerReadModelsToMessages(ctx, userID, result)
+	r.logPrivateGetMessagesTrace(ctx, trace, found, result)
 	return result, nil
 }
 
@@ -627,8 +623,7 @@ func (r *Router) onMessagesSearchGlobal(ctx context.Context, req *tg.MessagesSea
 		}
 	}
 	if req.UsersOnly || r.deps.Channels == nil {
-		result := appendCommunitySearchChat(tgMessagesMessages(userID, r.enrichMessageList(ctx, userID, limitMessageList(private, limit))), communityView)
-		r.applyPeerReadModelsToMessages(ctx, userID, result)
+		result := appendCommunitySearchChat(r.tgMessagesMessages(ctx, userID, r.enrichMessageList(ctx, userID, limitMessageList(private, limit))), communityView)
 		return result, nil
 	}
 	channelHistory, err := r.deps.Channels.SearchJoinedMessages(ctx, userID, domain.ChannelGlobalSearchRequest{
@@ -809,6 +804,10 @@ func (r *Router) messageFilterFromSearchRequest(ctx context.Context, userID int6
 		MusicOnly:      messagesSearchFilterMusic(req.Filter),
 		NeedTotalCount: req.OffsetID == 0 && req.MinDate == 0 && req.MaxDate == 0 && req.AddOffset >= 0 && req.Hash == 0,
 	}
+	if phoneCalls, ok := req.Filter.(*tg.InputMessagesFilterPhoneCalls); ok {
+		filter.PhoneCallsOnly = true
+		filter.MissedPhoneCallsOnly = phoneCalls.Missed
+	}
 	if peer, ok := r.domainPeerFromInputPeer(userID, req.Peer); ok {
 		filter.HasPeer = true
 		filter.Peer = peer
@@ -911,7 +910,7 @@ func messagesSearchFilterChatPhotos(filter tg.MessagesFilterClass) bool {
 
 func searchFilterNeedsMediaStore(filter tg.MessagesFilterClass) bool {
 	switch filter.(type) {
-	case nil, *tg.InputMessagesFilterEmpty:
+	case nil, *tg.InputMessagesFilterEmpty, *tg.InputMessagesFilterPhoneCalls:
 		return false
 	case *tg.InputMessagesFilterPhotos,
 		*tg.InputMessagesFilterVideo,

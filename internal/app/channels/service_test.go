@@ -872,8 +872,8 @@ func TestCreateChatCreatesMegagroupWithChannelPts(t *testing.T) {
 	if !created.Channel.Megagroup || created.Channel.Broadcast {
 		t.Fatalf("channel flags = megagroup:%v broadcast:%v, want megagroup only", created.Channel.Megagroup, created.Channel.Broadcast)
 	}
-	if created.Channel.Pts != 1 || created.Message.ID != 1 || created.Event.PtsCount != 1 {
-		t.Fatalf("created pts/message/event = %+v/%+v/%+v, want initial pts=1 message id=1", created.Channel, created.Message, created.Event)
+	if created.Channel.Pts != domain.FirstChannelEventPts || created.Message.ID != 1 || created.Event.Pts != domain.FirstChannelEventPts || created.Event.PtsCount != 1 {
+		t.Fatalf("created pts/message/event = %+v/%+v/%+v, want initial event pts=2 message id=1", created.Channel, created.Message, created.Event)
 	}
 	if created.Message.Action == nil || created.Message.Action.Type != domain.ChannelActionCreate {
 		t.Fatalf("create service action = %+v, want channel create", created.Message.Action)
@@ -889,8 +889,8 @@ func TestCreateChatCreatesMegagroupWithChannelPts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendMessage: %v", err)
 	}
-	if sent.Message.ID != 2 || sent.Message.Pts != 2 || sent.Event.Pts != 2 || sent.Event.PtsCount != 1 {
-		t.Fatalf("sent = %+v event=%+v, want message id/pts=2", sent.Message, sent.Event)
+	if sent.Message.ID != 2 || sent.Message.Pts != 3 || sent.Event.Pts != 3 || sent.Event.PtsCount != 1 {
+		t.Fatalf("sent = %+v event=%+v, want message id=2 pts=3", sent.Message, sent.Event)
 	}
 	if sent.Message.ViaBotID != 1003 || sent.Event.Message.ViaBotID != 1003 {
 		t.Fatalf("sent via_bot_id = msg %d event %d, want 1003", sent.Message.ViaBotID, sent.Event.Message.ViaBotID)
@@ -924,12 +924,12 @@ func TestCreateChatCreatesMegagroupWithChannelPts(t *testing.T) {
 		t.Fatalf("history via_bot_id = %d, want 1003", history.Messages[0].ViaBotID)
 	}
 
-	diff, err := service.GetDifference(ctx, 1002, domain.ChannelDifferenceRequest{ChannelID: created.Channel.ID, Pts: 1, Limit: 10})
+	diff, err := service.GetDifference(ctx, 1002, domain.ChannelDifferenceRequest{ChannelID: created.Channel.ID, Pts: created.Event.Pts, Limit: 10})
 	if err != nil {
 		t.Fatalf("GetDifference: %v", err)
 	}
-	if !diff.Final || diff.Pts != 2 || len(diff.NewMessages) != 1 || diff.NewMessages[0].Body != "hello" {
-		t.Fatalf("diff = %+v, want single new channel message at pts=2", diff)
+	if !diff.Final || diff.Pts != 3 || len(diff.NewMessages) != 1 || diff.NewMessages[0].Body != "hello" {
+		t.Fatalf("diff = %+v, want single new channel message at pts=3", diff)
 	}
 	if diff.NewMessages[0].ViaBotID != 1003 {
 		t.Fatalf("diff via_bot_id = %d, want 1003", diff.NewMessages[0].ViaBotID)
@@ -2116,8 +2116,8 @@ func TestChannelEditDeleteAndLocalClearUseChannelPts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EditMessage: %v", err)
 	}
-	if edited.Event.Type != domain.ChannelUpdateEditMessage || edited.Event.Pts != 4 || edited.Event.PtsCount != 1 {
-		t.Fatalf("edit event = %+v, want channel edit pts=4 count=1", edited.Event)
+	if edited.Event.Type != domain.ChannelUpdateEditMessage || edited.Event.Pts != 5 || edited.Event.PtsCount != 1 {
+		t.Fatalf("edit event = %+v, want channel edit pts=5 count=1", edited.Event)
 	}
 	duplicate, err := service.SendMessage(ctx, 1002, domain.SendChannelMessageRequest{ChannelID: created.Channel.ID, RandomID: 2, Message: "two", Date: 13})
 	if err != nil {
@@ -2135,14 +2135,14 @@ func TestChannelEditDeleteAndLocalClearUseChannelPts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeleteMessages: %v", err)
 	}
-	if deleted.Event.Type != domain.ChannelUpdateDeleteMessages || deleted.Event.Pts != 6 || deleted.Event.PtsCount != 2 {
+	if deleted.Event.Type != domain.ChannelUpdateDeleteMessages || deleted.Event.Pts != 7 || deleted.Event.PtsCount != 2 {
 		t.Fatalf("delete event = %+v, want pts advanced by deleted id count", deleted.Event)
 	}
-	diff, err := service.GetDifference(ctx, 1002, domain.ChannelDifferenceRequest{ChannelID: created.Channel.ID, Pts: 3, Limit: 10})
+	diff, err := service.GetDifference(ctx, 1002, domain.ChannelDifferenceRequest{ChannelID: created.Channel.ID, Pts: second.Event.Pts, Limit: 10})
 	if err != nil {
 		t.Fatalf("GetDifference: %v", err)
 	}
-	if len(diff.OtherUpdates) != 2 || diff.OtherUpdates[1].Type != domain.ChannelUpdateDeleteMessages || diff.Pts != 6 {
+	if len(diff.OtherUpdates) != 2 || diff.OtherUpdates[1].Type != domain.ChannelUpdateDeleteMessages || diff.Pts != 7 {
 		t.Fatalf("diff after edit/delete = %+v, want edit then delete through channel pts", diff)
 	}
 
