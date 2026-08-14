@@ -17,6 +17,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+    "net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -28,8 +29,10 @@ import (
 	"github.com/iamxvbaba/td/bin"
 	"github.com/iamxvbaba/td/telegram"
 	"github.com/iamxvbaba/td/telegram/downloader"
+    "github.com/iamxvbaba/td/telegram/dcs"
 	"github.com/iamxvbaba/td/tg"
 	"golang.org/x/sync/errgroup"
+    "golang.org/x/net/proxy"
 
 	"telesrv/internal/app/stargifts"
 )
@@ -219,9 +222,25 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Hour)
 	defer cancel()
-	client := telegram.NewClient(apiID, apiHash, telegram.Options{
+
+	opts := telegram.Options{
 		SessionStorage: &telegram.FileSessionStorage{Path: session},
-	})
+	}
+	if socksProxy := strings.TrimSpace(os.Getenv("SOCKS5_PROXY")); socksProxy != "" {
+		dialer, err := proxy.SOCKS5("tcp", socksProxy, nil, proxy.Direct)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: invalid SOCKS5_PROXY: %v\n", err)
+			os.Exit(2)
+		}
+		opts.Resolver = dcs.Plain(dcs.PlainOptions{
+			Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.Dial(network, addr)
+			},
+		})
+	}
+
+	client := telegram.NewClient(apiID, apiHash, opts)
+
 	if err := client.Run(ctx, func(ctx context.Context) error {
 		status, err := client.Auth().Status(ctx)
 		if err != nil {
@@ -613,7 +632,9 @@ func fetchDocument(ctx context.Context, api *tg.Client, dl *downloader.Downloade
 	}
 	if !reused {
 		fmt.Printf("[network fetch] document=%d resource=document expected_size=%d part_size=%d\n", doc.ID, doc.Size, downloadPartSize(doc.Size))
-		data, err = download(ctx, api, dl, doc, "", doc.Size, maxBytes)
+		data, err = retryOnTimeout(ctx, fmt.Sprintf("document %d", doc.ID), func() ([]byte, error) {
+            return download(ctx, api, dl, doc, "", doc.Size, maxBytes)
+        })
 		if err != nil {
 			return documentManifest{}, fmt.Errorf("download document %d: %w", doc.ID, err)
 		}
@@ -697,7 +718,9 @@ func fetchThumbs(ctx context.Context, api *tg.Client, dl *downloader.Downloader,
 			if err == nil && !reused {
 				downloadAttempted = true
 				fmt.Printf("[network fetch] document=%d resource=photo-thumb type=%s expected_size=%d part_size=%d\n", doc.ID, thumbType, expectedSize, downloadPartSize(expectedSize))
-				data, err = download(ctx, api, dl, doc, thumbType, expectedSize, maxBytes)
+				data, err = retryOnTimeout(ctx, fmt.Sprintf("photo-thumb %d (%s)", doc.ID, thumbType), func() ([]byte, error) {
+                    return download(ctx, api, dl, doc, thumbType, expectedSize, maxBytes)
+                })
 			}
 		case *tg.PhotoSizeProgressive:
 			if len(value.Sizes) == 0 {
@@ -713,7 +736,9 @@ func fetchThumbs(ctx context.Context, api *tg.Client, dl *downloader.Downloader,
 			if err == nil && !reused {
 				downloadAttempted = true
 				fmt.Printf("[network fetch] document=%d resource=photo-thumb-progressive type=%s expected_size=%d part_size=%d\n", doc.ID, thumbType, expectedSize, downloadPartSize(expectedSize))
-				data, err = download(ctx, api, dl, doc, thumbType, expectedSize, maxBytes)
+				data, err = retryOnTimeout(ctx, fmt.Sprintf("progressive-thumb %d (%s)", doc.ID, thumbType), func() ([]byte, error) {
+                    return download(ctx, api, dl, doc, thumbType, expectedSize, maxBytes)
+                })
 			}
 		default:
 			continue
@@ -755,7 +780,9 @@ func fetchThumbs(ctx context.Context, api *tg.Client, dl *downloader.Downloader,
 		if err == nil && !reused {
 			downloadAttempted = true
 			fmt.Printf("[network fetch] document=%d resource=video-thumb type=%s expected_size=%d part_size=%d\n", doc.ID, value.Type, value.Size, downloadPartSize(int64(value.Size)))
-			data, err = download(ctx, api, dl, doc, value.Type, int64(value.Size), maxBytes)
+			data, err = retryOnTimeout(ctx, fmt.Sprintf("video-thumb %d (%s)", doc.ID, value.Type), func() ([]byte, error) {
+                return download(ctx, api, dl, doc, value.Type, int64(value.Size), maxBytes)
+            })
 		}
 		if err != nil {
 			if downloadAttempted && missingThumbAllowed(allowedMissingThumbs, doc.ID, "video", value.Type) {
@@ -784,6 +811,41 @@ func fetchThumbs(ctx context.Context, api *tg.Client, dl *downloader.Downloader,
 		return missing[i].Type < missing[j].Type
 	})
 	return artifacts, missing, nil
+}
+
+func isRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "-503") ||
+		strings.Contains(msg, "Timeout") ||
+		strings.Contains(msg, "FLOOD_WAIT") ||
+		strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "connection reset by peer")
+}
+
+func retryOnTimeout(ctx context.Context, desc string, op func() ([]byte, error)) ([]byte, error) {
+	const maxRetries = 6
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		data, err := op()
+		if err == nil {
+			return data, nil
+		}
+		lastErr = err
+		if !isRetryable(err) {
+			return nil, err
+		}
+		backoff := time.Duration(attempt*2) * time.Second
+		fmt.Printf("[retry %d/%d] %s: %v (waiting %v)\n", attempt, maxRetries, desc, err, backoff)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+	return nil, fmt.Errorf("failed after %d attempts: %w", maxRetries, lastErr)
 }
 
 func download(ctx context.Context, api *tg.Client, dl *downloader.Downloader, doc *tg.Document, thumbType string, expectedSize, maxBytes int64) ([]byte, error) {
