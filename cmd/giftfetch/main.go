@@ -17,7 +17,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-    "net"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -28,11 +29,11 @@ import (
 
 	"github.com/iamxvbaba/td/bin"
 	"github.com/iamxvbaba/td/telegram"
+	"github.com/iamxvbaba/td/telegram/dcs"
 	"github.com/iamxvbaba/td/telegram/downloader"
-    "github.com/iamxvbaba/td/telegram/dcs"
 	"github.com/iamxvbaba/td/tg"
+	"golang.org/x/net/proxy"
 	"golang.org/x/sync/errgroup"
-    "golang.org/x/net/proxy"
 
 	"telesrv/internal/app/stargifts"
 )
@@ -68,6 +69,11 @@ type catalogManifest struct {
 	Documents                []documentManifest            `json:"documents"`
 	TotalBytes               int64                         `json:"total_document_bytes"`
 	BoundaryNote             string                        `json:"boundary_note"`
+}
+
+type socks5ProxyConfig struct {
+	Address string
+	Auth    *proxy.Auth
 }
 
 type giftManifest struct {
@@ -227,7 +233,12 @@ func main() {
 		SessionStorage: &telegram.FileSessionStorage{Path: session},
 	}
 	if socksProxy := strings.TrimSpace(os.Getenv("SOCKS5_PROXY")); socksProxy != "" {
-		dialer, err := proxy.SOCKS5("tcp", socksProxy, nil, proxy.Direct)
+		proxyConfig, err := parseSOCKS5Proxy(socksProxy)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: invalid SOCKS5_PROXY: %v\n", err)
+			os.Exit(2)
+		}
+		dialer, err := proxy.SOCKS5("tcp", proxyConfig.Address, proxyConfig.Auth, proxy.Direct)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: invalid SOCKS5_PROXY: %v\n", err)
 			os.Exit(2)
@@ -255,6 +266,54 @@ func main() {
 		fmt.Fprintln(os.Stderr, "ERROR:", err)
 		os.Exit(1)
 	}
+}
+
+func parseSOCKS5Proxy(raw string) (socks5ProxyConfig, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return socks5ProxyConfig{}, errors.New("must not be empty")
+	}
+	if strings.Contains(raw, "://") {
+		parsed, err := url.Parse(raw)
+		if err != nil {
+			return socks5ProxyConfig{}, err
+		}
+		if parsed.Scheme != "socks5" {
+			return socks5ProxyConfig{}, fmt.Errorf("scheme must be socks5, got %q", parsed.Scheme)
+		}
+		if parsed.Host == "" {
+			return socks5ProxyConfig{}, errors.New("missing proxy host")
+		}
+		if (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return socks5ProxyConfig{}, errors.New("must not include path, query, or fragment")
+		}
+		address, err := normalizeProxyAddress(parsed.Host)
+		if err != nil {
+			return socks5ProxyConfig{}, err
+		}
+		var auth *proxy.Auth
+		if parsed.User != nil {
+			password, _ := parsed.User.Password()
+			auth = &proxy.Auth{User: parsed.User.Username(), Password: password}
+		}
+		return socks5ProxyConfig{Address: address, Auth: auth}, nil
+	}
+	address, err := normalizeProxyAddress(raw)
+	if err != nil {
+		return socks5ProxyConfig{}, err
+	}
+	return socks5ProxyConfig{Address: address}, nil
+}
+
+func normalizeProxyAddress(raw string) (string, error) {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(raw))
+	if err != nil {
+		return "", fmt.Errorf("must be host:port or socks5://host:port: %w", err)
+	}
+	if strings.TrimSpace(host) == "" || strings.TrimSpace(port) == "" {
+		return "", errors.New("host and port are required")
+	}
+	return net.JoinHostPort(host, port), nil
 }
 
 func fetchCatalog(ctx context.Context, api *tg.Client, outDir string, maxDocBytes int64, skipThumbs bool, workers int, reuseMetadata bool, allowedMissingThumbs map[string]struct{}) error {
@@ -633,8 +692,8 @@ func fetchDocument(ctx context.Context, api *tg.Client, dl *downloader.Downloade
 	if !reused {
 		fmt.Printf("[network fetch] document=%d resource=document expected_size=%d part_size=%d\n", doc.ID, doc.Size, downloadPartSize(doc.Size))
 		data, err = retryOnTimeout(ctx, fmt.Sprintf("document %d", doc.ID), func() ([]byte, error) {
-            return download(ctx, api, dl, doc, "", doc.Size, maxBytes)
-        })
+			return download(ctx, api, dl, doc, "", doc.Size, maxBytes)
+		})
 		if err != nil {
 			return documentManifest{}, fmt.Errorf("download document %d: %w", doc.ID, err)
 		}
@@ -719,8 +778,8 @@ func fetchThumbs(ctx context.Context, api *tg.Client, dl *downloader.Downloader,
 				downloadAttempted = true
 				fmt.Printf("[network fetch] document=%d resource=photo-thumb type=%s expected_size=%d part_size=%d\n", doc.ID, thumbType, expectedSize, downloadPartSize(expectedSize))
 				data, err = retryOnTimeout(ctx, fmt.Sprintf("photo-thumb %d (%s)", doc.ID, thumbType), func() ([]byte, error) {
-                    return download(ctx, api, dl, doc, thumbType, expectedSize, maxBytes)
-                })
+					return download(ctx, api, dl, doc, thumbType, expectedSize, maxBytes)
+				})
 			}
 		case *tg.PhotoSizeProgressive:
 			if len(value.Sizes) == 0 {
@@ -737,8 +796,8 @@ func fetchThumbs(ctx context.Context, api *tg.Client, dl *downloader.Downloader,
 				downloadAttempted = true
 				fmt.Printf("[network fetch] document=%d resource=photo-thumb-progressive type=%s expected_size=%d part_size=%d\n", doc.ID, thumbType, expectedSize, downloadPartSize(expectedSize))
 				data, err = retryOnTimeout(ctx, fmt.Sprintf("progressive-thumb %d (%s)", doc.ID, thumbType), func() ([]byte, error) {
-                    return download(ctx, api, dl, doc, thumbType, expectedSize, maxBytes)
-                })
+					return download(ctx, api, dl, doc, thumbType, expectedSize, maxBytes)
+				})
 			}
 		default:
 			continue
@@ -781,8 +840,8 @@ func fetchThumbs(ctx context.Context, api *tg.Client, dl *downloader.Downloader,
 			downloadAttempted = true
 			fmt.Printf("[network fetch] document=%d resource=video-thumb type=%s expected_size=%d part_size=%d\n", doc.ID, value.Type, value.Size, downloadPartSize(int64(value.Size)))
 			data, err = retryOnTimeout(ctx, fmt.Sprintf("video-thumb %d (%s)", doc.ID, value.Type), func() ([]byte, error) {
-                return download(ctx, api, dl, doc, value.Type, int64(value.Size), maxBytes)
-            })
+				return download(ctx, api, dl, doc, value.Type, int64(value.Size), maxBytes)
+			})
 		}
 		if err != nil {
 			if downloadAttempted && missingThumbAllowed(allowedMissingThumbs, doc.ID, "video", value.Type) {

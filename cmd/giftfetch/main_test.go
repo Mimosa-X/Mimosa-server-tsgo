@@ -112,6 +112,57 @@ func TestParseAllowedMissingThumbs(t *testing.T) {
 	}
 }
 
+func TestParseSOCKS5Proxy(t *testing.T) {
+	tests := []struct {
+		name     string
+		raw      string
+		address  string
+		authUser string
+		authPass string
+	}{
+		{name: "bare host port", raw: "127.0.0.1:1080", address: "127.0.0.1:1080"},
+		{name: "url host port", raw: "socks5://proxy.example:1080", address: "proxy.example:1080"},
+		{name: "url trailing slash", raw: "socks5://proxy.example:1080/", address: "proxy.example:1080"},
+		{name: "url ipv6", raw: "socks5://[2001:db8::1]:1080", address: "[2001:db8::1]:1080"},
+		{name: "url auth", raw: "socks5://user:pass@proxy.example:1080", address: "proxy.example:1080", authUser: "user", authPass: "pass"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseSOCKS5Proxy(test.raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Address != test.address {
+				t.Fatalf("address = %q, want %q", got.Address, test.address)
+			}
+			if test.authUser == "" {
+				if got.Auth != nil {
+					t.Fatalf("auth = %+v, want nil", got.Auth)
+				}
+				return
+			}
+			if got.Auth == nil || got.Auth.User != test.authUser || got.Auth.Password != test.authPass {
+				t.Fatalf("auth = %+v, want %q/%q", got.Auth, test.authUser, test.authPass)
+			}
+		})
+	}
+
+	for _, raw := range []string{
+		"",
+		"127.0.0.1",
+		"socks5://127.0.0.1",
+		"http://127.0.0.1:1080",
+		"socks5://127.0.0.1:1080/path",
+		"socks5://127.0.0.1:1080?debug=true",
+	} {
+		t.Run("invalid "+raw, func(t *testing.T) {
+			if _, err := parseSOCKS5Proxy(raw); err == nil {
+				t.Fatalf("parseSOCKS5Proxy(%q) succeeded", raw)
+			}
+		})
+	}
+}
+
 func TestExistingArtifact(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "resource.bin"), []byte("gift"), 0o644); err != nil {
