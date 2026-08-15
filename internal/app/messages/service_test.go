@@ -129,6 +129,40 @@ func TestServiceProjectsMessageUsersForViewerContacts(t *testing.T) {
 	}
 }
 
+func TestSendPrivateTextWithoutBusinessAutomationSkipsDialogAndContactReads(t *testing.T) {
+	ctx := context.Background()
+	const ownerID int64 = 2001
+	const customerID int64 = 2002
+
+	dialogs := memory.NewDialogStore()
+	messages := memory.NewMessageStore(dialogs)
+	business := &countingBusinessAutomationStore{BusinessAutomationStore: memory.NewPasswordStore()}
+	countingDialogs := &countingBusinessDialogStore{DialogStore: dialogs}
+	countingContacts := &countingBusinessContactStore{ContactStore: memory.NewContactStore()}
+	svc := NewService(
+		messages,
+		countingDialogs,
+		WithBusinessAutomation(business),
+		WithContactStore(countingContacts),
+	)
+
+	if _, err := svc.SendPrivateText(ctx, customerID, domain.SendPrivateTextRequest{
+		SenderUserID:    customerID,
+		RecipientUserID: ownerID,
+		RandomID:        9001,
+		Message:         "ordinary message",
+		Date:            1_700_000_000,
+	}); err != nil {
+		t.Fatalf("SendPrivateText: %v", err)
+	}
+	if business.hasCalls != 1 {
+		t.Fatalf("HasBusinessAutomation calls = %d, want one lightweight gate", business.hasCalls)
+	}
+	if countingDialogs.listByPeersCalls != 0 || countingContacts.getCalls != 0 {
+		t.Fatalf("business detail reads dialogs/contacts = %d/%d, want 0/0 without automation", countingDialogs.listByPeersCalls, countingContacts.getCalls)
+	}
+}
+
 func TestBusinessAutomationGreetingSendsQuickReplyWithoutLoop(t *testing.T) {
 	ctx := context.Background()
 	const ownerID int64 = 2001
@@ -565,6 +599,36 @@ func (o businessAutomationOnline) IsUserOnline(userID int64) bool {
 
 type staticBusinessAutomationProvider struct {
 	message string
+}
+
+type countingBusinessAutomationStore struct {
+	store.BusinessAutomationStore
+	hasCalls int
+}
+
+func (s *countingBusinessAutomationStore) HasBusinessAutomation(ctx context.Context, userID int64) (bool, error) {
+	s.hasCalls++
+	return s.BusinessAutomationStore.HasBusinessAutomation(ctx, userID)
+}
+
+type countingBusinessDialogStore struct {
+	store.DialogStore
+	listByPeersCalls int
+}
+
+func (s *countingBusinessDialogStore) ListByPeers(ctx context.Context, userID int64, peers []domain.Peer) (domain.DialogList, error) {
+	s.listByPeersCalls++
+	return s.DialogStore.ListByPeers(ctx, userID, peers)
+}
+
+type countingBusinessContactStore struct {
+	store.ContactStore
+	getCalls int
+}
+
+func (s *countingBusinessContactStore) Get(ctx context.Context, userID, contactUserID int64) (domain.Contact, bool, error) {
+	s.getCalls++
+	return s.ContactStore.Get(ctx, userID, contactUserID)
 }
 
 func (p staticBusinessAutomationProvider) BusinessAutomationReplies(context.Context, BusinessAutomationReplyInput) ([]domain.QuickReplyMessage, error) {

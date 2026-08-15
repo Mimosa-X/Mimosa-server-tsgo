@@ -14,10 +14,11 @@ import (
 
 type countingDialogStore struct {
 	store.DialogStore
-	listByUserCalls    int
-	listByPeersCalls   int
-	listByPeersBatches [][]domain.Peer
-	listDraftsCalls    int
+	listByUserCalls          int
+	listByPeersCalls         int
+	listByPeersBatches       [][]domain.Peer
+	listDraftsByPeersCalls   int
+	listDraftsByPeersBatches [][]domain.Peer
 }
 
 func (s *countingDialogStore) ListByUser(ctx context.Context, userID int64, filter domain.DialogFilter) (domain.DialogList, error) {
@@ -31,9 +32,10 @@ func (s *countingDialogStore) ListByPeers(ctx context.Context, userID int64, pee
 	return s.DialogStore.ListByPeers(ctx, userID, peers)
 }
 
-func (s *countingDialogStore) ListDrafts(ctx context.Context, userID int64, limit int) ([]domain.DialogDraft, error) {
-	s.listDraftsCalls++
-	return s.DialogStore.ListDrafts(ctx, userID, limit)
+func (s *countingDialogStore) ListDraftsByPeers(ctx context.Context, userID int64, peers []domain.Peer) ([]domain.DialogDraft, error) {
+	s.listDraftsByPeersCalls++
+	s.listDraftsByPeersBatches = append(s.listDraftsByPeersBatches, append([]domain.Peer(nil), peers...))
+	return s.DialogStore.ListDraftsByPeers(ctx, userID, peers)
 }
 
 type fakeDialogReadModelVersions struct {
@@ -179,6 +181,51 @@ func TestSaveDraftNoopsWhenOnlyDateChanges(t *testing.T) {
 	}
 }
 
+func TestGetDialogsLoadsDraftsOnlyForCurrentPage(t *testing.T) {
+	ctx := context.Background()
+	const ownerID int64 = 1001
+	firstPeer := domain.Peer{Type: domain.PeerTypeUser, ID: 1002}
+	secondPeer := domain.Peer{Type: domain.PeerTypeUser, ID: 1003}
+	base := memory.NewDialogStore()
+	if err := base.SaveList(ctx, ownerID, domain.DialogList{
+		Dialogs: []domain.Dialog{
+			{Peer: firstPeer, TopMessage: 11, TopMessageDate: 200},
+			{Peer: secondPeer, TopMessage: 12, TopMessageDate: 100},
+		},
+		Messages: []domain.Message{
+			{ID: 11, OwnerUserID: ownerID, Peer: firstPeer, From: firstPeer, Date: 200, Body: "first"},
+			{ID: 12, OwnerUserID: ownerID, Peer: secondPeer, From: secondPeer, Date: 100, Body: "second"},
+		},
+		Users: []domain.User{
+			{ID: firstPeer.ID, FirstName: "First"},
+			{ID: secondPeer.ID, FirstName: "Second"},
+		},
+	}); err != nil {
+		t.Fatalf("SaveList: %v", err)
+	}
+	if err := base.SaveDraft(ctx, ownerID, domain.DialogDraft{Peer: firstPeer, Date: 201, Message: "first draft"}); err != nil {
+		t.Fatalf("save first draft: %v", err)
+	}
+	if err := base.SaveDraft(ctx, ownerID, domain.DialogDraft{Peer: secondPeer, Date: 202, Message: "second draft"}); err != nil {
+		t.Fatalf("save second draft: %v", err)
+	}
+	counting := &countingDialogStore{DialogStore: base}
+
+	list, err := NewService(counting).GetDialogs(ctx, ownerID, domain.DialogFilter{Limit: 1})
+	if err != nil {
+		t.Fatalf("GetDialogs: %v", err)
+	}
+	if len(list.Dialogs) != 1 || list.Dialogs[0].Peer != firstPeer || list.Dialogs[0].Draft == nil || list.Dialogs[0].Draft.Message != "first draft" {
+		t.Fatalf("dialogs = %+v, want first page with its draft", list.Dialogs)
+	}
+	if counting.listDraftsByPeersCalls != 1 || len(counting.listDraftsByPeersBatches) != 1 {
+		t.Fatalf("ListDraftsByPeers calls/batches = %d/%d, want 1/1", counting.listDraftsByPeersCalls, len(counting.listDraftsByPeersBatches))
+	}
+	if got := counting.listDraftsByPeersBatches[0]; len(got) != 1 || got[0] != firstPeer {
+		t.Fatalf("draft peer batch = %+v, want current-page peer %+v", got, firstPeer)
+	}
+}
+
 func TestGetPeerDialogsCachesPrivatePeerReadModelByHash(t *testing.T) {
 	ctx := context.Background()
 	const ownerID int64 = 1001
@@ -226,16 +273,19 @@ func TestGetPeerDialogsCachesPrivatePeerReadModelByHash(t *testing.T) {
 	if len(second.Dialogs) != 1 || second.Dialogs[0].TopMessage != 7 {
 		t.Fatalf("second dialog = %+v, want cached top message", second.Dialogs)
 	}
-	if counting.listByPeersCalls != 1 || counting.listDraftsCalls != 1 {
-		t.Fatalf("store calls ListByPeers/ListDrafts = %d/%d, want 1/1 after cache hit", counting.listByPeersCalls, counting.listDraftsCalls)
+	if counting.listByPeersCalls != 1 || counting.listDraftsByPeersCalls != 1 {
+		t.Fatalf("store calls ListByPeers/ListDraftsByPeers = %d/%d, want 1/1 after cache hit", counting.listByPeersCalls, counting.listDraftsByPeersCalls)
+	}
+	if got := counting.listDraftsByPeersBatches[0]; len(got) != 1 || got[0] != peer {
+		t.Fatalf("draft peer batch = %+v, want only %+v", got, peer)
 	}
 
 	versions.hashes[store.ReadModelKey{Model: dialogLightReadModel, OwnerUserID: ownerID, PeerType: peer.Type, PeerID: peer.ID}] = 202
 	if _, err := dialogs.GetPeerDialogs(ctx, ownerID, []domain.Peer{peer}); err != nil {
 		t.Fatalf("third GetPeerDialogs after hash bump: %v", err)
 	}
-	if counting.listByPeersCalls != 2 || counting.listDraftsCalls != 2 {
-		t.Fatalf("store calls after hash bump = %d/%d, want 2/2", counting.listByPeersCalls, counting.listDraftsCalls)
+	if counting.listByPeersCalls != 2 || counting.listDraftsByPeersCalls != 2 {
+		t.Fatalf("store calls after hash bump = %d/%d, want 2/2", counting.listByPeersCalls, counting.listDraftsByPeersCalls)
 	}
 
 	if _, err := dialogs.SaveDraft(ctx, ownerID, domain.DialogDraft{Peer: peer, Date: 72, Message: "new draft"}); err != nil {
@@ -244,8 +294,8 @@ func TestGetPeerDialogsCachesPrivatePeerReadModelByHash(t *testing.T) {
 	if _, err := dialogs.GetPeerDialogs(ctx, ownerID, []domain.Peer{peer}); err != nil {
 		t.Fatalf("GetPeerDialogs after service invalidation: %v", err)
 	}
-	if counting.listByPeersCalls != 3 || counting.listDraftsCalls != 3 {
-		t.Fatalf("store calls after explicit invalidation = %d/%d, want 3/3", counting.listByPeersCalls, counting.listDraftsCalls)
+	if counting.listByPeersCalls != 3 || counting.listDraftsByPeersCalls != 3 {
+		t.Fatalf("store calls after explicit invalidation = %d/%d, want 3/3", counting.listByPeersCalls, counting.listDraftsByPeersCalls)
 	}
 }
 
@@ -339,18 +389,18 @@ func TestGetPeerDialogsCachesChannelPeerReadModelByCompositeHash(t *testing.T) {
 	if _, err := dialogs.GetPeerDialogs(ctx, ownerID, []domain.Peer{peer}); err != nil {
 		t.Fatalf("second GetPeerDialogs: %v", err)
 	}
-	if channelStore.getChannelDialogsCalls != 1 || dialogStore.listDraftsCalls != 1 {
-		t.Fatalf("store calls GetChannelDialogs/ListDrafts = %d/%d, want 1/1 after channel cache hit",
-			channelStore.getChannelDialogsCalls, dialogStore.listDraftsCalls)
+	if channelStore.getChannelDialogsCalls != 1 || dialogStore.listDraftsByPeersCalls != 1 {
+		t.Fatalf("store calls GetChannelDialogs/ListDraftsByPeers = %d/%d, want 1/1 after channel cache hit",
+			channelStore.getChannelDialogsCalls, dialogStore.listDraftsByPeersCalls)
 	}
 
 	versions.hashes[store.ReadModelKey{Model: channelMemberReadModel, OwnerUserID: ownerID, PeerType: peer.Type, PeerID: peer.ID}] = 44
 	if _, err := dialogs.GetPeerDialogs(ctx, ownerID, []domain.Peer{peer}); err != nil {
 		t.Fatalf("third GetPeerDialogs after member hash bump: %v", err)
 	}
-	if channelStore.getChannelDialogsCalls != 2 || dialogStore.listDraftsCalls != 2 {
+	if channelStore.getChannelDialogsCalls != 2 || dialogStore.listDraftsByPeersCalls != 2 {
 		t.Fatalf("store calls after member hash bump = %d/%d, want 2/2",
-			channelStore.getChannelDialogsCalls, dialogStore.listDraftsCalls)
+			channelStore.getChannelDialogsCalls, dialogStore.listDraftsByPeersCalls)
 	}
 
 	if _, err := dialogs.SaveDraft(ctx, ownerID, domain.DialogDraft{Peer: peer, Date: 1700003220, Message: "channel draft"}); err != nil {
@@ -359,9 +409,9 @@ func TestGetPeerDialogsCachesChannelPeerReadModelByCompositeHash(t *testing.T) {
 	if _, err := dialogs.GetPeerDialogs(ctx, ownerID, []domain.Peer{peer}); err != nil {
 		t.Fatalf("GetPeerDialogs after draft invalidation: %v", err)
 	}
-	if channelStore.getChannelDialogsCalls != 3 || dialogStore.listDraftsCalls != 3 {
+	if channelStore.getChannelDialogsCalls != 3 || dialogStore.listDraftsByPeersCalls != 3 {
 		t.Fatalf("store calls after draft invalidation = %d/%d, want 3/3",
-			channelStore.getChannelDialogsCalls, dialogStore.listDraftsCalls)
+			channelStore.getChannelDialogsCalls, dialogStore.listDraftsByPeersCalls)
 	}
 }
 

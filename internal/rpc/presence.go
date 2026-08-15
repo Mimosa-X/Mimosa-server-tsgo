@@ -555,6 +555,24 @@ func (r *Router) withDialogListPresence(ctx context.Context, viewerUserID int64,
 	for _, msg := range list.ChannelMessages {
 		collectChannelMessagePeerRefs(msg, msg.ChannelID, userIDs, channelIDs)
 	}
+	// Dialog/application projections already contain the ordinary peer envelope.
+	// Only resolve nested message references that are still absent (forward author,
+	// via bot, poll voter, linked giveaway channel, and similar fields).
+	for _, user := range list.Users {
+		delete(userIDs, user.ID)
+	}
+	for _, channel := range list.Channels {
+		delete(channelIDs, channel.ID)
+	}
+	for _, community := range list.Communities {
+		delete(channelIDs, community.Community.ID)
+		for _, user := range community.Users {
+			delete(userIDs, user.ID)
+		}
+		for _, channel := range community.Channels {
+			delete(channelIDs, channel.ID)
+		}
+	}
 	cache := newViewerPeerCache(r)
 	list.Users = r.withUsersPresence(mergeDomainUsers(list.Users, cache.usersForIDs(ctx, viewerUserID, mapKeys(userIDs))...))
 	list.Channels = mergeDomainChannels(list.Channels, cache.channelsForIDs(ctx, viewerUserID, mapKeys(channelIDs))...)

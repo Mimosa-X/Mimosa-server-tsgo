@@ -217,6 +217,27 @@ func (s *DialogStore) ListDrafts(_ context.Context, userID int64, limit int) ([]
 	return out, nil
 }
 
+func (s *DialogStore) ListDraftsByPeers(_ context.Context, userID int64, peers []domain.Peer) ([]domain.DialogDraft, error) {
+	s.mu.RLock()
+	items := s.drafts[userID]
+	out := make([]domain.DialogDraft, 0, len(peers))
+	seen := make(map[domain.Peer]struct{}, len(peers))
+	for _, peer := range peers {
+		if peer.ID == 0 {
+			continue
+		}
+		if _, ok := seen[peer]; ok {
+			continue
+		}
+		seen[peer] = struct{}{}
+		if draft, ok := items[draftKey(peer, 0)]; ok {
+			out = append(out, cloneDialogDraft(draft))
+		}
+	}
+	s.mu.RUnlock()
+	return out, nil
+}
+
 func (s *DialogStore) ClearDrafts(_ context.Context, userID int64, limit int) ([]domain.DialogDraft, error) {
 	if limit <= 0 || limit > domain.MaxDialogDraftsPerUser {
 		limit = domain.MaxDialogDraftsPerUser

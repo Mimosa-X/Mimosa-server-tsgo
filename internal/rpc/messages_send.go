@@ -698,51 +698,18 @@ func tgPrivateSendResultUpdates(res domain.SendPrivateTextResult, randomID int64
 }
 
 func (r *Router) usersForMessageUpdate(ctx context.Context, ownerUserID int64, msg domain.Message) []tg.UserClass {
-	seen := make(map[int64]struct{}, 2)
-	users := make([]tg.UserClass, 0, 2)
-	add := func(id int64) {
-		if id == 0 {
-			return
-		}
-		if _, ok := seen[id]; ok {
-			return
-		}
-		seen[id] = struct{}{}
-		switch {
-		case isSystemUserID(id):
-			if u, ok := domain.SystemUserByID(id); ok {
-				users = append(users, r.tgUser(u))
-			}
-		case id == ownerUserID:
-			if r.deps.Users == nil {
-				return
-			}
-			u, err := r.deps.Users.Self(ctx, ownerUserID)
-			if err == nil && u.ID != 0 {
-				users = append(users, r.tgSelfUser(u))
-			}
-		default:
-			if r.deps.Users == nil {
-				return
-			}
-			u, found, err := r.deps.Users.ByID(ctx, ownerUserID, id)
-			if err == nil && found {
-				users = append(users, r.tgUser(u))
-			}
-		}
-	}
-	ids := appendMessageUserIDs(nil, make(map[int64]struct{}), msg)
-	for _, id := range ids {
-		add(id)
-	}
-	// A non-min User replaces the cached peer on iOS. Keep the complete
-	// username vector on synchronous message echoes instead of letting this
-	// response regress a previously hydrated profile to the legacy scalar.
-	r.applyUsernamesToPeerObjects(ctx, users, nil)
-	return users
+	return r.usersForMessageUpdates(ctx, ownerUserID, []domain.Message{msg})
+}
+
+func (r *Router) usersForMessageUpdateWithPreloaded(ctx context.Context, ownerUserID int64, msg domain.Message, preloaded []domain.User) []tg.UserClass {
+	return r.usersForMessageUpdatesWithPreloaded(ctx, ownerUserID, []domain.Message{msg}, preloaded)
 }
 
 func (r *Router) usersForMessageUpdates(ctx context.Context, ownerUserID int64, messages []domain.Message) []tg.UserClass {
+	return r.usersForMessageUpdatesWithPreloaded(ctx, ownerUserID, messages, nil)
+}
+
+func (r *Router) usersForMessageUpdatesWithPreloaded(ctx context.Context, ownerUserID int64, messages []domain.Message, preloaded []domain.User) []tg.UserClass {
 	seen := make(map[int64]struct{}, len(messages)*2)
 	ids := make([]int64, 0, len(messages)*2)
 	addID := func(id int64) {
@@ -764,8 +731,22 @@ func (r *Router) usersForMessageUpdates(ctx context.Context, ownerUserID int64, 
 		return nil
 	}
 	loaded := make(map[int64]domain.User, len(ids))
-	if r.deps.Users != nil {
-		if users, err := r.deps.Users.ByIDs(ctx, ownerUserID, ids); err == nil {
+	for _, user := range preloaded {
+		if user.ID != 0 {
+			loaded[user.ID] = user
+		}
+	}
+	missing := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if isSystemUserID(id) {
+			continue
+		}
+		if _, ok := loaded[id]; !ok {
+			missing = append(missing, id)
+		}
+	}
+	if r.deps.Users != nil && len(missing) > 0 {
+		if users, err := r.deps.Users.ByIDs(ctx, ownerUserID, missing); err == nil {
 			for _, user := range users {
 				loaded[user.ID] = user
 			}
