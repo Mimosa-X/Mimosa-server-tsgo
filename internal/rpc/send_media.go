@@ -134,10 +134,21 @@ func (r *Router) sendOutgoing(ctx context.Context, userID int64, peer domain.Pee
 	if err := r.ensureVoiceMessagesAllowed(ctx, userID, peer, p.media != nil && p.media.HasUnreadPayload()); err != nil {
 		return nil, false, err
 	}
-	if r.deps.Users != nil && peer.ID != userID {
-		if _, found, err := r.deps.Users.ByID(ctx, userID, peer.ID); err != nil {
+	var projectedUsers []domain.User
+	if r.deps.Users != nil {
+		loaded, err := r.deps.Users.ByIDs(ctx, userID, []int64{userID, peer.ID})
+		if err != nil {
 			return nil, false, internalErr()
-		} else if !found {
+		}
+		projectedUsers = loaded
+		peerFound := peer.ID == userID
+		for _, user := range projectedUsers {
+			if user.ID == peer.ID {
+				peerFound = true
+				break
+			}
+		}
+		if !peerFound {
 			return nil, false, peerIDInvalidErr()
 		}
 	}
@@ -199,11 +210,11 @@ func (r *Router) sendOutgoing(ctx context.Context, userID int64, peer domain.Pee
 	var users []tg.UserClass
 	var chats []tg.ChatClass
 	if !res.Duplicate {
-		users = r.usersForMessageUpdate(ctx, userID, res.SenderMessage)
+		users = r.usersForMessageUpdateWithPreloaded(ctx, userID, res.SenderMessage, projectedUsers)
 		chats = r.chatsForMessageUpdate(ctx, userID, res.SenderMessage)
 	}
 	if p.clearDraft && !res.Duplicate {
-		r.clearDraftAfterSend(ctx, userID, peer, replyTo)
+		r.clearDraftAfterSendWithPeerObjects(ctx, userID, peer, replyTo, users, chats)
 	}
 	if !res.Duplicate {
 		// 链接预览 pending 占位：带外解析并就地替换（异步，不阻塞发送 echo）。

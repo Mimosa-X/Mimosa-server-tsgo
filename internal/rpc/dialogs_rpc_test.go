@@ -1089,8 +1089,17 @@ func TestMessagesGetDialogsTDesktopInitialPageMergesPinnedHeader(t *testing.T) {
 	if dialogs.getDialogsCalls != 2 || len(dialogs.filters) != 2 {
 		t.Fatalf("GetDialogs calls = %d filters %+v, want normal + pinned", dialogs.getDialogsCalls, dialogs.filters)
 	}
-	if !dialogs.filters[0].ExcludePinned || !dialogs.filters[1].PinnedOnly {
-		t.Fatalf("filters = %+v, want exclude-pinned then pinned-only", dialogs.filters)
+	var excludePinnedCalls, pinnedOnlyCalls int
+	for _, filter := range dialogs.filters {
+		if filter.ExcludePinned {
+			excludePinnedCalls++
+		}
+		if filter.PinnedOnly {
+			pinnedOnlyCalls++
+		}
+	}
+	if excludePinnedCalls != 1 || pinnedOnlyCalls != 1 {
+		t.Fatalf("filters = %+v, want one exclude-pinned and one pinned-only load", dialogs.filters)
 	}
 	if len(out.Dialogs) != 4 {
 		t.Fatalf("dialogs = %d, want archive + two pinned + normal", len(out.Dialogs))
@@ -1200,11 +1209,13 @@ func TestPinnedDialogsListSingleflightsConcurrentStartupLoads(t *testing.T) {
 		entered: make(chan struct{}),
 		release: make(chan struct{}),
 	}
-	r := New(Config{}, Deps{Dialogs: dialogs}, zaptest.NewLogger(t), clock.System)
+	communities := &countingPinnedCommunities{}
+	r := New(Config{}, Deps{Dialogs: dialogs, Communities: communities}, zaptest.NewLogger(t), clock.System)
+	ctx := WithLayer(context.Background(), communitiesLayer)
 	errs := make(chan error, 2)
 	results := make(chan domain.DialogList, 2)
 	call := func() {
-		list, err := r.pinnedDialogsList(context.Background(), userID, domain.DialogMainFolderID)
+		list, err := r.pinnedDialogsList(ctx, userID, domain.DialogMainFolderID)
 		errs <- err
 		results <- list
 	}
@@ -1224,6 +1235,28 @@ func TestPinnedDialogsListSingleflightsConcurrentStartupLoads(t *testing.T) {
 	if calls := dialogs.pinnedCalls(); calls != 1 {
 		t.Fatalf("pinned GetDialogs calls = %d, want singleflight to share one in-flight load", calls)
 	}
+	if calls := communities.listJoinedCalls(); calls != 1 {
+		t.Fatalf("pinned community ListJoined calls = %d, want projected singleflight to share one aggregate load", calls)
+	}
+}
+
+type countingPinnedCommunities struct {
+	CommunitiesService
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *countingPinnedCommunities) ListJoined(context.Context, int64) ([]domain.CommunityView, error) {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	return nil, nil
+}
+
+func (s *countingPinnedCommunities) listJoinedCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
 }
 
 type blockingPinnedDialogs struct {

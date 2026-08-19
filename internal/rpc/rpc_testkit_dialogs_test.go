@@ -2,10 +2,12 @@ package rpc
 
 import (
 	"context"
+	"sync"
 	"telesrv/internal/domain"
 )
 
 type captureDialogs struct {
+	mu              sync.Mutex
 	list            domain.DialogList
 	pinnedList      domain.DialogList
 	hasPinnedList   bool
@@ -52,6 +54,8 @@ func (s *captureDialogs) GetDialogsHash(_ context.Context, _ int64, filter domai
 }
 
 func (s *captureDialogs) GetDialogs(_ context.Context, _ int64, filter domain.DialogFilter) (domain.DialogList, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.getDialogsCalls++
 	s.filter = filter
 	s.filters = append(s.filters, filter)

@@ -121,11 +121,15 @@ func TestChannelInputAccessHashIsValidatedRPC(t *testing.T) {
 	if got := len(mixedChats.(*tg.MessagesChats).Chats); got != 2 {
 		t.Fatalf("get channels mixed access_hash chats = %d, want two good refs", got)
 	}
-	if _, err := r.dialogFilterFromRequest(WithUserID(ctx, owner.ID), owner.ID, &tg.MessagesGetDialogsRequest{
+	dialogFilter, err := r.dialogFilterFromRequest(WithUserID(ctx, owner.ID), owner.ID, &tg.MessagesGetDialogsRequest{
 		OffsetPeer: &tg.InputPeerChannel{ChannelID: channel.ID, AccessHash: badHash},
 		Limit:      20,
-	}); err == nil || !strings.Contains(err.Error(), "CHANNEL_PRIVATE") {
-		t.Fatalf("get dialogs offset bad access_hash err = %v, want CHANNEL_PRIVATE", err)
+	})
+	if err != nil {
+		t.Fatalf("get dialogs cursor with stale access_hash: %v", err)
+	}
+	if !dialogFilter.HasOffsetPeer || dialogFilter.OffsetPeer != (domain.Peer{Type: domain.PeerTypeChannel, ID: channel.ID}) {
+		t.Fatalf("get dialogs cursor = %+v, want channel id without content authorization", dialogFilter)
 	}
 	if _, err := r.onMessagesSaveDraft(WithUserID(ctx, owner.ID), &tg.MessagesSaveDraftRequest{
 		Peer:    &tg.InputPeerChannel{ChannelID: channel.ID, AccessHash: badHash},

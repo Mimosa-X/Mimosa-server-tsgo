@@ -135,6 +135,7 @@ type Router struct {
 	authUserSF                 singleflight.Group
 	mediaCountSF               singleflight.Group
 	dialogsPinnedSF            singleflight.Group
+	dialogsPinnedListSF        singleflight.Group
 	channelFullBotSF           singleflight.Group
 	presence                   *presenceTracker
 	callbacks                  *callbackRegistry

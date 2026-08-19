@@ -842,7 +842,13 @@ func (s *Service) attachDrafts(ctx context.Context, userID int64, list *domain.D
 	if s == nil || s.dialogs == nil || userID == 0 || list == nil || len(list.Dialogs) == 0 {
 		return nil
 	}
-	drafts, err := s.dialogs.ListDrafts(ctx, userID, domain.MaxDialogDraftsPerUser)
+	peers := make([]domain.Peer, 0, len(list.Dialogs))
+	for _, dialog := range list.Dialogs {
+		if dialog.Peer.ID != 0 {
+			peers = append(peers, dialog.Peer)
+		}
+	}
+	drafts, err := s.dialogs.ListDraftsByPeers(ctx, userID, peers)
 	if err != nil {
 		return err
 	}

@@ -634,6 +634,35 @@ func (s *DialogStore) ListUnreadMarked(ctx context.Context, userID int64) ([]dom
 	return out, nil
 }
 
+func (s *DialogStore) ListDraftsByPeers(ctx context.Context, userID int64, peers []domain.Peer) ([]domain.DialogDraft, error) {
+	peerTypes := make([]string, 0, len(peers))
+	peerIDs := make([]int64, 0, len(peers))
+	seen := make(map[domain.Peer]struct{}, len(peers))
+	for _, peer := range peers {
+		if peer.ID == 0 {
+			continue
+		}
+		if _, ok := seen[peer]; ok {
+			continue
+		}
+		seen[peer] = struct{}{}
+		peerTypes = append(peerTypes, string(peer.Type))
+		peerIDs = append(peerIDs, peer.ID)
+	}
+	if len(peerIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := s.q.ListDialogDraftsByPeers(ctx, sqlcgen.ListDialogDraftsByPeersParams{
+		UserID:    userID,
+		PeerTypes: peerTypes,
+		PeerIds:   peerIDs,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list dialog drafts by peers: %w", err)
+	}
+	return decodeDialogDrafts(rows)
+}
+
 func (s *DialogStore) SetChatTheme(ctx context.Context, userID int64, peer domain.Peer, emoticon string) (bool, error) {
 	if userID == 0 || peer.Type == "" || peer.ID == 0 {
 		return false, nil

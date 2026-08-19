@@ -2,11 +2,13 @@ package rpc
 
 import (
 	"context"
+	"unicode/utf8"
+
 	"github.com/iamxvbaba/td/tg"
 	"github.com/iamxvbaba/td/tlprofile"
+
 	"telesrv/internal/compat/tdesktop"
 	"telesrv/internal/domain"
-	"unicode/utf8"
 )
 
 // registerMessages 注册 messages.* RPC handler。
@@ -426,6 +428,21 @@ func (r *Router) registerMessages(d *tlprofile.Dispatcher) {
 				return &tg.MessagesDialogsNotModified{Count: hashCheck.Count}, nil
 			}
 		}
+		type pinnedLoadResult struct {
+			list domain.DialogList
+			err  error
+		}
+		var pinnedLoad <-chan pinnedLoadResult
+		if ClientTypeFrom(ctx) == ClientTypeTDesktop && tdesktop.ShouldMergePinnedIntoInitialDialogs(filter) {
+			pinnedCtx, cancelPinned := context.WithCancel(ctx)
+			defer cancelPinned()
+			results := make(chan pinnedLoadResult, 1)
+			pinnedLoad = results
+			go func() {
+				list, err := r.pinnedDialogsList(pinnedCtx, userID, domain.DialogMainFolderID)
+				results <- pinnedLoadResult{list: list, err: err}
+			}()
+		}
 		list, err := r.deps.Dialogs.GetDialogs(ctx, userID, filter)
 		if err != nil {
 			return nil, internalErr()
@@ -434,12 +451,12 @@ func (r *Router) registerMessages(d *tlprofile.Dispatcher) {
 		if err != nil {
 			return nil, communityErr(err)
 		}
-		if ClientTypeFrom(ctx) == ClientTypeTDesktop && tdesktop.ShouldMergePinnedIntoInitialDialogs(filter) {
-			pinned, err := r.pinnedDialogsList(ctx, userID, domain.DialogMainFolderID)
-			if err != nil {
+		if pinnedLoad != nil {
+			pinned := <-pinnedLoad
+			if pinned.err != nil {
 				return nil, internalErr()
 			}
-			list = tdesktop.MergeInitialDialogsWithPinned(list, pinned)
+			list = tdesktop.MergeInitialDialogsWithPinned(list, pinned.list)
 		}
 		// An unknown cache entry is also the invalidation signal for metadata that
 		// does not alter dialog ordering (for example verified/scam/fake flags).
